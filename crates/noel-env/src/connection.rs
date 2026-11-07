@@ -734,37 +734,53 @@ impl Connection {
                 .await
                 .map_err(|message| RemoteError::with("spawn_error", &message, true))?,
         };
-        if lock(&self.inner.state).closed {
-            return Err(closed());
-        }
         let Some((program, args)) = command.split_first() else {
             return Err(RemoteError::with("spawn_error", "No daemon command", false));
         };
         let token = random_token();
-        let mut child = Command::new(program)
+        let (writer, frames) = mpsc::unbounded_channel();
+        // The session is published before the daemon is spawned, under the
+        // same lock as the `closed` check (#151): a `close` either comes
+        // first, and nothing starts, or finds the session and tears it
+        // down, and the spawn below sees that.
+        let session = {
+            let mut state = lock(&self.inner.state);
+            if state.closed {
+                return Err(closed());
+            }
+            state.sessions += 1;
+            let session = Arc::new(Session {
+                id: state.sessions,
+                token: token.clone(),
+                liveness: Mutex::default(),
+                writer: Mutex::new(Some(writer)),
+                pending: Mutex::default(),
+                last_seen: Mutex::new(Instant::now()),
+                kill: Notify::new(),
+            });
+            state.session = Some(session.clone());
+            session
+        };
+        let spawned = Command::new(program)
             .args(args)
             .args(["serve", "--token", &token])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| RemoteError::with("spawn_error", &error.to_string(), true))?;
-        let (writer, frames) = mpsc::unbounded_channel();
-        let session = Arc::new(Session {
-            id: {
-                let mut state = lock(&self.inner.state);
-                state.sessions += 1;
-                state.sessions
-            },
-            token,
-            liveness: Mutex::default(),
-            writer: Mutex::new(Some(writer)),
-            pending: Mutex::default(),
-            last_seen: Mutex::new(Instant::now()),
-            kill: Notify::new(),
-        });
-        lock(&self.inner.state).session = Some(session.clone());
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(error) => {
+                let error = RemoteError::with("spawn_error", &error.to_string(), true);
+                self.inner.teardown(&session, error.clone());
+                return Err(error);
+            }
+        };
+        if !session.is_live() {
+            // Closed while it spawned: the child is killed as it drops.
+            return Err(closed());
+        }
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(write_frames(child.stdin.take(), frames));
         if let Some(stdout) = child.stdout.take() {

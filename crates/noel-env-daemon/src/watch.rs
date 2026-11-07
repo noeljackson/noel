@@ -246,7 +246,12 @@ struct FileWatcher<'a> {
     events_sender: Sender<notify::Result<Event>>,
     installed: HashMap<String, Installed>,
     events: HashSet<String>,
+    /// Native mode: when the next rescan after FSEvents settles is due.
     settle_at: Option<Instant>,
+    /// Native mode: when the debounced rescan for events is due.
+    flush_at: Option<Instant>,
+    /// Polling mode: when the next snapshot is due.
+    poll_at: Instant,
 }
 
 impl FileWatcher<'_> {
@@ -576,6 +581,9 @@ impl FileWatcher<'_> {
         added
     }
 
+    /// Leaves native mode for good, with its state (#154): no rescan stays
+    /// due from it, events its watcher queued are dropped (the overflow
+    /// covers them), and the first poll is one interval away.
     fn switch_to_polling(&mut self) {
         if self.mode == Mode::Polling {
             return;
@@ -583,6 +591,10 @@ impl FileWatcher<'_> {
         self.mode = Mode::Polling;
         self.native = None;
         self.installed.clear();
+        self.events.clear();
+        self.settle_at = None;
+        self.flush_at = None;
+        self.poll_at = Instant::now() + self.poll_interval;
         self.send(json!({ "kind": "change", "overflow": true, "mode": "polling" }));
     }
 
@@ -627,6 +639,10 @@ impl FileWatcher<'_> {
 
     /// Note a native event; returns whether it calls for a rescan.
     fn on_event(&mut self, event: notify::Result<Event>) -> bool {
+        // Queued by a native watcher that was dropped since.
+        if self.mode == Mode::Polling {
+            return false;
+        }
         let event = match event {
             Ok(event) => event,
             Err(error) => {
@@ -734,27 +750,28 @@ pub fn run(id: u32, json: &Value, output: &Output, control: &Control) -> Result<
         installed: HashMap::new(),
         events: HashSet::new(),
         settle_at: None,
+        flush_at: None,
+        poll_at: Instant::now(),
     };
     watcher.sync(false).map_err(|error| error.failure())?;
     watcher.send(json!({ "kind": "ready", "mode": watcher.mode.name() }));
-    let mut flush_at: Option<Instant> = None;
-    let mut poll_at = Instant::now() + watcher.poll_interval;
+    watcher.poll_at = Instant::now() + watcher.poll_interval;
     loop {
         if watcher.cancelled() {
             return Ok(json!({}));
         }
         let now = Instant::now();
         let mut wake = now + CANCEL_POLL;
-        for at in [flush_at, watcher.settle_at].into_iter().flatten() {
+        for at in [watcher.flush_at, watcher.settle_at].into_iter().flatten() {
             wake = wake.min(at);
         }
         if watcher.mode == Mode::Polling {
-            wake = wake.min(poll_at);
+            wake = wake.min(watcher.poll_at);
         }
         match events.recv_timeout(wake.saturating_duration_since(now)) {
             Ok(event) => {
-                if watcher.on_event(event) && flush_at.is_none() && watcher.mode == Mode::Native {
-                    flush_at = Some(Instant::now() + DEBOUNCE);
+                if watcher.on_event(event) && watcher.flush_at.is_none() {
+                    watcher.flush_at = Some(Instant::now() + DEBOUNCE);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -762,10 +779,10 @@ pub fn run(id: u32, json: &Value, output: &Output, control: &Control) -> Result<
         }
         let now = Instant::now();
         let due = |at: Option<Instant>| at.is_some_and(|at| at <= now);
-        let polling_due = watcher.mode == Mode::Polling && poll_at <= now;
-        if due(flush_at) || due(watcher.settle_at) || polling_due {
-            if due(flush_at) {
-                flush_at = None;
+        let polling_due = watcher.mode == Mode::Polling && watcher.poll_at <= now;
+        if due(watcher.flush_at) || due(watcher.settle_at) || polling_due {
+            if due(watcher.flush_at) {
+                watcher.flush_at = None;
             }
             if due(watcher.settle_at) {
                 watcher.settle_at = None;
@@ -774,8 +791,48 @@ pub fn run(id: u32, json: &Value, output: &Output, control: &Control) -> Result<
                 return Ok(json!({}));
             }
             if polling_due {
-                poll_at = Instant::now() + watcher.poll_interval;
+                watcher.poll_at = Instant::now() + watcher.poll_interval;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #154: leaving native mode leaves nothing of it due: no settle or
+    /// debounce rescan, no queued native events, and the first poll one
+    /// interval away rather than at once.
+    #[test]
+    fn switching_to_polling_drops_the_native_state() {
+        let (output, control) = (Output::default(), Control::default());
+        let (events_sender, _events) = mpsc::channel();
+        let past = Instant::now();
+        let mut watcher = FileWatcher {
+            id: 1,
+            output: &output,
+            control: &control,
+            targets: Vec::new(),
+            mode: Mode::Native,
+            poll_interval: Duration::from_secs(60),
+            max_directories: DEFAULT_MAX_DIRECTORIES,
+            snapshot: Snapshot::new(),
+            native: None,
+            events_sender,
+            installed: HashMap::new(),
+            events: ["/tmp/a".to_owned()].into(),
+            settle_at: Some(past),
+            flush_at: Some(past),
+            poll_at: past,
+        };
+        watcher.switch_to_polling();
+        assert!(watcher.mode == Mode::Polling);
+        assert!(watcher.events.is_empty());
+        assert_eq!((watcher.settle_at, watcher.flush_at), (None, None));
+        assert!(watcher.poll_at > Instant::now() + Duration::from_secs(30));
+        // An event the dropped native watcher queued asks for no rescan.
+        let event = Event::new(EventKind::Create(notify::event::CreateKind::File));
+        assert!(!watcher.on_event(Ok(event)));
     }
 }
