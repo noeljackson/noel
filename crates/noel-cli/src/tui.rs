@@ -75,6 +75,54 @@ pub(crate) struct TuiSelectorState {
     pub(crate) parent: Option<Box<TuiSelectorState>>,
     /// Provider filter for the model layer (e.g. "zai-coding").
     pub(crate) provider_filter: Option<String>,
+    /// A tree selector's rows by value (/tree's branches, #108): each row's
+    /// parent, whether it is named, and its label before fold markers.
+    /// Empty for a flat list.
+    pub(crate) tree: BTreeMap<String, TreeRow>,
+    /// Rows whose descendants are hidden.
+    pub(crate) folded: BTreeSet<String>,
+    pub(crate) tree_filter: TreeFilter,
+}
+
+/// One row of a tree selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeRow {
+    pub(crate) parent: Option<String>,
+    pub(crate) named: bool,
+    pub(crate) label: String,
+}
+
+/// Which rows a tree selector shows (upstream's `treeFilterMode`; a branch
+/// here is a session, so "labeled" means a named session).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TreeFilter {
+    #[default]
+    All,
+    Named,
+}
+
+impl TreeFilter {
+    /// The `treeFilterMode` setting's value.
+    pub(crate) fn setting(self) -> &'static str {
+        match self {
+            TreeFilter::All => "default",
+            TreeFilter::Named => "labeled-only",
+        }
+    }
+
+    pub(crate) fn from_setting(value: Option<&str>) -> Self {
+        match value {
+            Some("labeled-only") => TreeFilter::Named,
+            _ => TreeFilter::All,
+        }
+    }
+
+    pub(crate) fn next(self) -> Self {
+        match self {
+            TreeFilter::All => TreeFilter::Named,
+            TreeFilter::Named => TreeFilter::All,
+        }
+    }
 }
 
 impl TuiSelectorState {
@@ -85,12 +133,25 @@ impl TuiSelectorState {
             value: item["value"].as_str().unwrap_or_default().to_owned(),
             active: item["active"] == true,
         });
-        Some(Self::new(
+        let mut state = Self::new(
             value["kind"].as_str()?,
             Selector::new(value["title"].as_str().unwrap_or_default(), items.collect()),
             value["query"].as_str().unwrap_or_default(),
             None,
-        ))
+        );
+        if let Some(rows) = value["tree"].as_object() {
+            let rows = rows.iter().map(|(row, data)| {
+                (
+                    row.clone(),
+                    (
+                        data["parent"].as_str().map(str::to_owned),
+                        data["named"] == true,
+                    ),
+                )
+            });
+            state.set_tree(rows.collect());
+        }
+        Some(state)
     }
 
     /// The selector as a worker sends it to a client: its kind, title,
@@ -99,12 +160,144 @@ impl TuiSelectorState {
         let items = self.items.iter().map(|item| {
             serde_json::json!({"label": item.label, "value": item.value, "active": item.active})
         });
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "kind": self.kind,
             "title": self.title,
             "query": self.query,
             "items": items.collect::<Vec<_>>(),
-        })
+        });
+        if !self.tree.is_empty() {
+            let rows = self.tree.iter().map(|(row, data)| {
+                (
+                    row.clone(),
+                    serde_json::json!({"parent": data.parent, "named": data.named}),
+                )
+            });
+            value["tree"] = serde_json::Value::Object(rows.collect());
+        }
+        value
+    }
+
+    /// Makes the selector a tree: each row's parent and whether it is named,
+    /// by value. Labels as they are now are the rows' own.
+    pub(crate) fn set_tree(&mut self, rows: BTreeMap<String, (Option<String>, bool)>) {
+        self.tree = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                let (parent, named) = rows.get(&item.value)?.clone();
+                Some((
+                    item.value.clone(),
+                    TreeRow {
+                        parent,
+                        named,
+                        label: item.label.clone(),
+                    },
+                ))
+            })
+            .collect();
+        self.refresh_filter();
+    }
+
+    fn has_children(&self, value: &str) -> bool {
+        self.tree
+            .values()
+            .any(|row| row.parent.as_deref() == Some(value))
+    }
+
+    /// Whether a tree row shows: the filter admits it and no ancestor is
+    /// folded.
+    fn tree_shows(&self, value: &str) -> bool {
+        let Some(row) = self.tree.get(value) else {
+            return true;
+        };
+        if self.tree_filter == TreeFilter::Named && !row.named {
+            return false;
+        }
+        let mut parent = row.parent.as_deref();
+        while let Some(ancestor) = parent {
+            if self.folded.contains(ancestor) {
+                return false;
+            }
+            parent = self
+                .tree
+                .get(ancestor)
+                .and_then(|row| row.parent.as_deref());
+        }
+        true
+    }
+
+    /// Selects the row `value` if it shows.
+    fn select_value(&mut self, value: &str) {
+        let shown = self
+            .filtered_indices
+            .iter()
+            .position(|index| self.items[*index].value == value);
+        if let Some(position) = shown {
+            self.selected = position;
+        }
+    }
+
+    /// Folds the selected row's branch, or moves to its parent (upstream's
+    /// `foldOrUp`).
+    pub(crate) fn fold_or_up(&mut self) {
+        let Some(value) = self.selected_item().map(|item| item.value.clone()) else {
+            return;
+        };
+        if self.has_children(&value) && !self.folded.contains(&value) {
+            self.folded.insert(value.clone());
+            self.refresh_filter();
+            self.select_value(&value);
+        } else if let Some(parent) = self.tree.get(&value).and_then(|row| row.parent.clone()) {
+            self.select_value(&parent);
+        }
+    }
+
+    /// Unfolds the selected row's branch, or moves to its first child
+    /// (upstream's `unfoldOrDown`).
+    pub(crate) fn unfold_or_down(&mut self) {
+        let Some(value) = self.selected_item().map(|item| item.value.clone()) else {
+            return;
+        };
+        if self.folded.remove(&value) {
+            self.refresh_filter();
+            self.select_value(&value);
+            return;
+        }
+        let child = self
+            .items
+            .iter()
+            .find(|item| {
+                self.tree
+                    .get(&item.value)
+                    .and_then(|row| row.parent.as_deref())
+                    == Some(value.as_str())
+            })
+            .map(|item| item.value.clone());
+        if let Some(child) = child {
+            self.select_value(&child);
+        }
+    }
+
+    /// Shows the rows `filter` admits, keeping the selection where it can.
+    pub(crate) fn set_tree_filter(&mut self, filter: TreeFilter) {
+        let selected = self.selected_item().map(|item| item.value.clone());
+        // The title says when a filter hides rows.
+        const NAMED: &str = " · named only";
+        let base = self
+            .title
+            .strip_suffix(NAMED)
+            .unwrap_or(&self.title)
+            .to_owned();
+        self.title = match filter {
+            TreeFilter::All => base,
+            TreeFilter::Named => format!("{base}{NAMED}"),
+        };
+        self.tree_filter = filter;
+        self.refresh_filter();
+        if let Some(selected) = selected {
+            self.select_value(&selected);
+        }
     }
 }
 
@@ -126,6 +319,9 @@ impl TuiSelectorState {
             model_thinking: BTreeMap::new(),
             parent: None,
             provider_filter: None,
+            tree: BTreeMap::new(),
+            folded: BTreeSet::new(),
+            tree_filter: TreeFilter::All,
         };
         state.refresh_filter();
         state
@@ -177,22 +373,30 @@ impl TuiSelectorState {
     }
 
     pub(crate) fn refresh_filter(&mut self) {
+        // A folded tree row says so after its label.
+        for index in 0..self.items.len() {
+            let value = self.items[index].value.clone();
+            if let Some(row) = self.tree.get(&value) {
+                let marker = match (self.has_children(&value), self.folded.contains(&value)) {
+                    (true, true) => " [+]",
+                    _ => "",
+                };
+                self.items[index].label = format!("{}{marker}", row.label);
+            }
+        }
         let query = self.query.to_lowercase();
-        self.filtered_indices = self
+        let filtered = self
             .items
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
-                if query.is_empty()
+                let matches = query.is_empty()
                     || item.label.to_lowercase().contains(&query)
-                    || item.value.to_lowercase().contains(&query)
-                {
-                    Some(index)
-                } else {
-                    None
-                }
+                    || item.value.to_lowercase().contains(&query);
+                (matches && self.tree_shows(&item.value)).then_some(index)
             })
             .collect();
+        self.filtered_indices = filtered;
         if self.selected >= self.filtered_indices.len() {
             self.selected = self.filtered_indices.len().saturating_sub(1);
         }
@@ -275,8 +479,10 @@ pub(crate) struct TuiApp {
     pub(crate) quit_armed_since: Option<Instant>,
     pub(crate) editor_state: EditorState,
     pub(crate) last_shell_command: Option<String>,
-    pub(crate) multiline: Option<Vec<String>>,
-    pub(crate) selector: Option<TuiSelectorState>,
+    /// The overlay open over the input, at most one (#175).
+    pub(crate) overlay: Overlay,
+    /// The filter a tree selector opens on (`treeFilterMode`).
+    pub(crate) tree_filter: TreeFilter,
     pub(crate) header_line: String,
     /// The session's workspace on another machine, which the footer shows
     /// with its connection state in place of the directory.
@@ -302,7 +508,79 @@ pub(crate) struct TuiApp {
     /// has no interior round boundary, so ctrl+s steering only lands after
     /// the response finishes and the hint must not promise a boundary.
     pub(crate) turn_saw_tools: bool,
-    pub(crate) diff_panel: Option<DiffPanelState>,
+}
+
+/// What covers the input: a multiline prompt being typed, a selector, or
+/// the diff panel. Opening one closes another.
+#[derive(Debug, Default)]
+pub(crate) enum Overlay {
+    #[default]
+    None,
+    Multiline(Vec<String>),
+    Selector(TuiSelectorState),
+    DiffPanel(DiffPanelState),
+}
+
+impl TuiApp {
+    pub(crate) fn multiline(&self) -> Option<&Vec<String>> {
+        match &self.overlay {
+            Overlay::Multiline(lines) => Some(lines),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn multiline_mut(&mut self) -> Option<&mut Vec<String>> {
+        match &mut self.overlay {
+            Overlay::Multiline(lines) => Some(lines),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn selector(&self) -> Option<&TuiSelectorState> {
+        match &self.overlay {
+            Overlay::Selector(selector) => Some(selector),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn selector_mut(&mut self) -> Option<&mut TuiSelectorState> {
+        match &mut self.overlay {
+            Overlay::Selector(selector) => Some(selector),
+            _ => None,
+        }
+    }
+
+    /// The selector, closed.
+    pub(crate) fn take_selector(&mut self) -> Option<TuiSelectorState> {
+        match std::mem::take(&mut self.overlay) {
+            Overlay::Selector(selector) => Some(selector),
+            other => {
+                self.overlay = other;
+                None
+            }
+        }
+    }
+
+    pub(crate) fn diff_panel(&self) -> Option<&DiffPanelState> {
+        match &self.overlay {
+            Overlay::DiffPanel(panel) => Some(panel),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn diff_panel_mut(&mut self) -> Option<&mut DiffPanelState> {
+        match &mut self.overlay {
+            Overlay::DiffPanel(panel) => Some(panel),
+            _ => None,
+        }
+    }
+
+    /// Closes the overlay `is` matches; another stays open.
+    pub(crate) fn close_overlay(&mut self, is: fn(&Overlay) -> bool) {
+        if is(&self.overlay) {
+            self.overlay = Overlay::None;
+        }
+    }
 }
 
 // Paste ranges refer to the full input, never to marker text. Submission,
@@ -481,7 +759,6 @@ impl TuiApp {
         self.reset_history_navigation();
     }
 
-    #[cfg(test)]
     pub(crate) fn set_input(&mut self, value: impl Into<String>) {
         self.input = value.into();
         self.input_cursor = self.input.len();
@@ -607,8 +884,9 @@ impl TuiApp {
         self.transcript_scrollback = TranscriptScrollback::default();
         self.transcript_view.get_mut().reset();
         self.clear_input();
-        self.multiline = None;
-        self.selector = None;
+        self.close_overlay(|overlay| {
+            matches!(overlay, Overlay::Multiline(_) | Overlay::Selector(_))
+        });
         self.live_entry_index = None;
         self.live_thinking_index = None;
         self.live_tool_indices.clear();
@@ -1009,7 +1287,8 @@ pub(crate) fn transcript_overflow(
 ) -> Vec<Line<'static>> {
     // Overlays and narrower diff views are temporary: do not irreversibly
     // archive transcript text merely because a panel covers it.
-    if area.width == 0 || area.height == 0 || app.selector.is_some() || app.diff_panel.is_some() {
+    if area.width == 0 || area.height == 0 || app.selector().is_some() || app.diff_panel().is_some()
+    {
         return Vec::new();
     }
     app.transcript_scrollback
@@ -1347,7 +1626,7 @@ pub(crate) fn tui_layout(frame_area: Rect, app: &TuiApp, config: &LoadedConfig) 
 }
 
 pub(crate) fn transcript_area(area: Rect, app: &TuiApp) -> Rect {
-    if app.diff_panel.is_some() {
+    if app.diff_panel().is_some() {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(40), Constraint::Length(DIFF_PANEL_WIDTH)])
@@ -1363,7 +1642,7 @@ pub(crate) fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfi
     let root = tui_layout(frame.area(), app, config);
     let slash_matches = slash_command_matches(config, app);
     let transcript_area = transcript_area(root[0], app);
-    if app.diff_panel.is_some() {
+    if app.diff_panel().is_some() {
         let diff_area = Rect::new(
             transcript_area.right(),
             root[0].y,
@@ -1634,7 +1913,7 @@ pub(crate) fn draw_diff_panel(
     app: &TuiApp,
     palette: &ThemePalette,
 ) {
-    let Some(panel) = app.diff_panel.as_ref() else {
+    let Some(panel) = app.diff_panel() else {
         return;
     };
     if area.height == 0 || area.width == 0 {
@@ -1710,7 +1989,7 @@ pub(crate) fn input_desired_height(app: &TuiApp, width: u16) -> u16 {
         .len()
         .min(MAX_INPUT_ROWS)
         + 2
-        + usize::from(app.multiline.is_some())
+        + usize::from(app.multiline().is_some())
         + usize::from(!app.input_media.is_empty())) as u16
 }
 
@@ -2167,7 +2446,7 @@ pub(crate) fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, palett
 }
 
 pub(crate) fn input_prompt(app: &TuiApp) -> &'static str {
-    if app.multiline.is_some() {
+    if app.multiline().is_some() {
         "multi> "
     } else {
         "> "
@@ -2218,7 +2497,7 @@ pub(crate) fn render_input_lines(
             prompt_style,
         )));
     }
-    if app.multiline.is_some() && lines.len() < area.height as usize {
+    if app.multiline().is_some() && lines.len() < area.height as usize {
         lines.push(Line::from(Span::styled(
             clip_width("submit with . on its own line", area.width as usize),
             prompt_style,
@@ -2338,7 +2617,7 @@ pub(crate) fn input_visible_rows(app: &TuiApp, area_height: usize) -> usize {
     } else {
         area_height
             .saturating_sub(
-                usize::from(app.multiline.is_some()) + usize::from(!app.input_media.is_empty()),
+                usize::from(app.multiline().is_some()) + usize::from(!app.input_media.is_empty()),
             )
             .max(1)
     }
@@ -2372,7 +2651,7 @@ pub(crate) const SLASH_MATCH_LIMIT: usize = 6;
 pub(crate) const SELECTOR_PAGE_STEP: usize = 10;
 
 pub(crate) fn slash_command_matches(config: &LoadedConfig, app: &TuiApp) -> Vec<String> {
-    if app.selector.is_some() || app.multiline.is_some() || app.input.contains('\n') {
+    if app.selector().is_some() || app.multiline().is_some() || app.input.contains('\n') {
         return Vec::new();
     }
     let input = app.input.trim();
@@ -2409,7 +2688,7 @@ pub(crate) fn draw_slash_matches(
 }
 
 pub(crate) fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp, palette: &ThemePalette) {
-    let Some(selector) = &app.selector else {
+    let Some(selector) = app.selector() else {
         return;
     };
     let area = centered_rect(frame.area(), 82, 68);
@@ -2471,6 +2750,13 @@ pub(crate) fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp, palette
             Span::styled("  left/right to adjust", palette.secondary()),
         ]));
     }
+    if !selector.tree.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "ctrl+left/right fold · ctrl+l named only · ctrl+o cycle · shift+L label",
+            palette.secondary(),
+        )));
+    }
     let action = if selector.kind == "settings" {
         "enter toggle"
     } else {
@@ -2495,7 +2781,7 @@ pub(crate) fn set_tui_cursor(frame: &mut Frame<'_>, input_area: Rect, app: &TuiA
     if !app.show_hardware_cursor {
         return;
     }
-    if let Some(selector) = &app.selector {
+    if let Some(selector) = app.selector() {
         let area = centered_rect(frame.area(), 82, 68);
         let filter_prefix_width = 7;
         let max_x = area.right().saturating_sub(2);
@@ -2589,7 +2875,7 @@ pub(crate) fn handle_transcript_key(key: &KeyEvent, app: &mut TuiApp) -> bool {
 }
 
 pub(crate) fn handle_transcript_mouse(mouse: MouseEvent, app: &mut TuiApp) -> bool {
-    if !app.owned_screen || app.selector.is_some() {
+    if !app.owned_screen || app.selector().is_some() {
         return false;
     }
     let view = app.transcript_view.get_mut();

@@ -1478,7 +1478,9 @@ fn diff_panel_key(
     app: &mut TuiApp,
     detail: impl Fn(&DiffFileEntry) -> DiffDetail,
 ) -> bool {
-    let Some(panel) = app.diff_panel.as_mut() else {
+    let (input_empty, owned_screen) = (app.input.trim().is_empty(), app.owned_screen);
+    let esc_closes = owned_screen || app.input.is_empty();
+    let Some(panel) = app.diff_panel_mut() else {
         return false;
     };
     if let Some(detail) = panel.detail.as_mut() {
@@ -1501,13 +1503,13 @@ fn diff_panel_key(
         KeyCode::Down => {
             panel.selected = (panel.selected + 1).min(panel.files.len().saturating_sub(1));
         }
-        KeyCode::Enter if key.modifiers.is_empty() && app.input.trim().is_empty() => {
+        KeyCode::Enter if key.modifiers.is_empty() && input_empty => {
             let detail = panel.files.get(panel.selected).map(&detail);
             if let Some(detail) = detail {
                 panel.detail = Some(detail);
             }
         }
-        KeyCode::Esc if app.owned_screen || app.input.is_empty() => app.diff_panel = None,
+        KeyCode::Esc if esc_closes => app.close_overlay(|o| matches!(o, Overlay::DiffPanel(_))),
         _ => return false,
     }
     true
@@ -2202,6 +2204,28 @@ fn session_tree_items(config: &LoadedConfig, current: Option<&str>) -> Result<Ve
         session_tree_row(root, &children, current, "", false, &mut items);
     }
     Ok(items)
+}
+
+/// Each listed session's parent in the tree (one that is listed) and
+/// whether it is named: what the branch navigator folds and filters by.
+pub(crate) fn session_tree_rows(
+    config: &LoadedConfig,
+) -> Result<BTreeMap<String, (Option<String>, bool)>> {
+    let sessions = SessionStore::list(&config.paths.session_dir)?;
+    let listed: BTreeSet<&str> = sessions
+        .iter()
+        .map(|session| session.session_id.as_str())
+        .collect();
+    Ok(sessions
+        .iter()
+        .map(|session| {
+            let parent = session
+                .parent_session_id
+                .clone()
+                .filter(|parent| listed.contains(parent.as_str()));
+            (session.session_id.clone(), (parent, session.name.is_some()))
+        })
+        .collect())
 }
 
 /// One row of the tree selector: the label /tree shows, with the session id

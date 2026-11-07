@@ -44,8 +44,9 @@ pub(crate) struct OutputAccumulator {
     /// An incomplete UTF-8 sequence at the end of the last chunk.
     undecoded: Vec<u8>,
     decoded_any: bool,
-    /// Everything received, until the temp file takes over.
-    raw: Vec<u8>,
+    /// Where everything received goes (#175: memory or the temp file,
+    /// never both).
+    sink: Sink,
     tail: String,
     tail_starts_at_line_boundary: bool,
     total_raw_bytes: usize,
@@ -53,7 +54,13 @@ pub(crate) struct OutputAccumulator {
     completed_lines: usize,
     current_line_bytes: usize,
     has_open_line: bool,
-    file: Option<(PathBuf, File)>,
+}
+
+/// Where the raw output is kept: in memory until it exceeds the limits,
+/// then in a temp file that holds all of it.
+enum Sink {
+    Memory(Vec<u8>),
+    File(PathBuf, File),
 }
 
 /// The decoded tail is trimmed back to this size once it doubles it.
@@ -65,7 +72,7 @@ impl OutputAccumulator {
             file_prefix,
             undecoded: Vec::new(),
             decoded_any: false,
-            raw: Vec::new(),
+            sink: Sink::Memory(Vec::new()),
             tail: String::new(),
             tail_starts_at_line_boundary: true,
             total_raw_bytes: 0,
@@ -73,7 +80,6 @@ impl OutputAccumulator {
             completed_lines: 0,
             current_line_bytes: 0,
             has_open_line: false,
-            file: None,
         }
     }
 
@@ -102,11 +108,13 @@ impl OutputAccumulator {
                 }
             }
         }
-        if self.file.is_some() || self.exceeds_limits() {
-            self.file_mut()?.write_all(data)
-        } else {
-            self.raw.extend_from_slice(data);
-            Ok(())
+        let exceeds = self.exceeds_limits();
+        match &mut self.sink {
+            Sink::Memory(raw) if !exceeds => {
+                raw.extend_from_slice(data);
+                Ok(())
+            }
+            _ => self.file_mut()?.write_all(data),
         }
     }
 
@@ -154,7 +162,10 @@ impl OutputAccumulator {
         Ok(OutputSnapshot {
             truncation,
             last_line_bytes: self.current_line_bytes,
-            full_output_path: self.file.map(|(path, _)| path),
+            full_output_path: match self.sink {
+                Sink::File(path, _) => Some(path),
+                Sink::Memory(_) => None,
+            },
         })
     }
 
@@ -198,12 +209,15 @@ impl OutputAccumulator {
 
     /// The temp file, created on first use with everything received so far.
     fn file_mut(&mut self) -> io::Result<&mut File> {
-        if self.file.is_none() {
+        if let Sink::Memory(raw) = &mut self.sink {
             let (path, mut file) = create_output_file(self.file_prefix)?;
-            file.write_all(&std::mem::take(&mut self.raw))?;
-            self.file = Some((path, file));
+            file.write_all(raw)?;
+            self.sink = Sink::File(path, file);
         }
-        Ok(&mut self.file.as_mut().expect("output file").1)
+        match &mut self.sink {
+            Sink::File(_, file) => Ok(file),
+            Sink::Memory(_) => unreachable!("the sink is a file now"),
+        }
     }
 }
 

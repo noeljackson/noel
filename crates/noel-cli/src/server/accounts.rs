@@ -58,11 +58,27 @@ type Outcome = Option<Result<bool, String>>;
 struct Login {
     provider: String,
     account: String,
-    /// What the person hands over: a pasted code or an API key.
-    input: Option<std::sync::mpsc::Sender<String>>,
-    key: bool,
+    /// What the person hands over, if anything (#175: one value, not an
+    /// optional sender and a flag).
+    input: LoginInput,
     done: watch::Receiver<Outcome>,
+    started: std::time::Instant,
 }
+
+/// What `finishLogin` passes to a login.
+#[derive(Clone)]
+enum LoginInput {
+    /// A device login: nothing is handed over.
+    None,
+    /// The code an authorization page shows, pasted.
+    Code(std::sync::mpsc::Sender<String>),
+    /// An API key.
+    Key(std::sync::mpsc::Sender<String>),
+}
+
+/// How long a login that ended is kept for its `finishLogin` before it is
+/// forgotten: past the longest a login may wait for its person.
+const ENDED_LOGIN_KEPT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 pub(crate) struct Accounts {
     auth_path: PathBuf,
@@ -70,6 +86,13 @@ pub(crate) struct Accounts {
     endpoints: Endpoints,
     cell: Cell,
     logins: Mutex<HashMap<String, Login>>,
+}
+
+/// Forgets the logins that ended long ago and were never finished (#175).
+fn prune_logins(logins: &mut HashMap<String, Login>, now: std::time::Instant) {
+    logins.retain(|_, login| {
+        login.done.borrow().is_none() || now.duration_since(login.started) < ENDED_LOGIN_KEPT
+    });
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -164,9 +187,9 @@ impl Accounts {
         let mut login = Login {
             provider: provider.clone(),
             account: account.clone(),
-            input: None,
-            key: false,
+            input: LoginInput::None,
             done,
+            started: std::time::Instant::now(),
         };
         let endpoints = self.endpoints.clone();
         let auth_path = self.auth_path.clone();
@@ -208,7 +231,7 @@ impl Accounts {
             }
             "anthropic" => {
                 let (input, pasted) = std::sync::mpsc::channel::<String>();
-                login.input = Some(input);
+                login.input = LoginInput::Code(input);
                 // The flow reads the pasted code synchronously: it runs on a
                 // thread of its own, which waits for `finishLogin`.
                 std::thread::spawn(move || {
@@ -254,8 +277,7 @@ impl Accounts {
             }
             _ => {
                 let (input, key) = std::sync::mpsc::channel::<String>();
-                login.input = Some(input);
-                login.key = true;
+                login.input = LoginInput::Key(input);
                 let _ = shown_tx.send(Ok(json!({"kind": "key"})));
                 tokio::task::spawn_blocking(move || {
                     let outcome = key
@@ -266,7 +288,11 @@ impl Accounts {
                 });
             }
         }
-        lock(&self.logins).insert(id.clone(), login);
+        {
+            let mut logins = lock(&self.logins);
+            prune_logins(&mut logins, std::time::Instant::now());
+            logins.insert(id.clone(), login);
+        }
         self.publish();
         let mut shown = shown
             .await
@@ -282,26 +308,31 @@ impl Accounts {
             .get("loginId")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let (input, key, mut done, provider, account) = {
+        let (input, mut done, provider, account) = {
             let logins = lock(&self.logins);
             let login = logins
                 .get(id)
                 .ok_or_else(|| refused("login", format!("no login {id}")))?;
             (
                 login.input.clone(),
-                login.key,
                 login.done.clone(),
                 login.provider.clone(),
                 login.account.clone(),
             )
         };
-        let given = if key {
-            args.get("key")
-        } else {
-            args.get("code")
-        };
-        if let (Some(input), Some(given)) = (input, given.and_then(Value::as_str)) {
-            let _ = input.send(given.to_owned());
+        let given = |name: &str| args.get(name).and_then(Value::as_str).map(str::to_owned);
+        match input {
+            LoginInput::None => {}
+            LoginInput::Code(input) => {
+                if let Some(code) = given("code") {
+                    let _ = input.send(code);
+                }
+            }
+            LoginInput::Key(input) => {
+                if let Some(key) = given("key") {
+                    let _ = input.send(key);
+                }
+            }
         }
         let outcome = loop {
             if let Some(outcome) = done.borrow().clone() {
@@ -517,6 +548,34 @@ pub(crate) fn serve_settings(host: &Host, settings: Arc<Settings>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #175: a login that ended and was never finished is forgotten once
+    /// it is old; one still under way, or recent, stays.
+    #[test]
+    fn ended_logins_are_forgotten_once_old() {
+        let now = std::time::Instant::now();
+        let login = |ended: bool, age: u64| {
+            let (tx, done) = watch::channel(None);
+            if ended {
+                let _ = tx.send(Some(Ok(false)));
+            }
+            Login {
+                provider: "p".into(),
+                account: "a".into(),
+                input: LoginInput::None,
+                done,
+                started: now - std::time::Duration::from_secs(age),
+            }
+        };
+        let mut logins = HashMap::new();
+        logins.insert("old-ended".to_owned(), login(true, 3600));
+        logins.insert("old-running".to_owned(), login(false, 3600));
+        logins.insert("new-ended".to_owned(), login(true, 10));
+        prune_logins(&mut logins, now);
+        let mut kept: Vec<&str> = logins.keys().map(String::as_str).collect();
+        kept.sort();
+        assert_eq!(kept, ["new-ended", "old-running"]);
+    }
     use crate::oauth_login::tests::{fake_jwt, spawn_stub};
 
     fn accounts(name: &str, endpoints: Endpoints) -> (Arc<Accounts>, PathBuf) {
