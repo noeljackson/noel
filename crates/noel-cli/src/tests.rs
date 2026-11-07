@@ -2655,7 +2655,7 @@ fn temporary_panels_do_not_commit_hidden_transcript_rows() {
     let mut app = TuiApp::default();
     app.push(TuiEntryKind::Assistant, "long answer\n".repeat(50));
     let mut terminal = scrollback_test_terminal(40, 20);
-    app.selector = Some(TuiSelectorState::new(
+    app.overlay = Overlay::Selector(TuiSelectorState::new(
         "model",
         Selector::new("model", vec![]),
         "",
@@ -2663,15 +2663,15 @@ fn temporary_panels_do_not_commit_hidden_transcript_rows() {
     ));
     redraw_tui(&mut terminal, &mut app, &config).unwrap();
     terminal.backend().assert_scrollback_empty();
-    app.selector = None;
-    app.diff_panel = Some(DiffPanelState {
+    app.close_overlay(|o| matches!(o, Overlay::Selector(_)));
+    app.overlay = Overlay::DiffPanel(DiffPanelState {
         files: vec![],
         selected: 0,
         detail: None,
     });
     redraw_tui(&mut terminal, &mut app, &config).unwrap();
     terminal.backend().assert_scrollback_empty();
-    app.diff_panel = None;
+    app.close_overlay(|o| matches!(o, Overlay::DiffPanel(_)));
     redraw_tui(&mut terminal, &mut app, &config).unwrap();
     assert!(terminal.backend().scrollback().area.height > 0);
 }
@@ -3199,7 +3199,7 @@ fn buffer_rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
 #[test]
 fn clear_visible_resets_transient_tui_state_only() {
     let mut app = TuiApp {
-        multiline: Some(vec!["one".to_string()]),
+        overlay: Overlay::Multiline(vec!["one".to_string()]),
         live_entry_index: Some(0),
         ..TuiApp::default()
     };
@@ -3212,8 +3212,8 @@ fn clear_visible_resets_transient_tui_state_only() {
 
     assert!(app.entries.is_empty());
     assert!(app.input.is_empty());
-    assert!(app.multiline.is_none());
-    assert!(app.selector.is_none());
+    assert!(app.multiline().is_none());
+    assert!(app.selector().is_none());
     assert!(app.live_entry_index.is_none());
     assert_eq!(input_layout(&app, 76).rows.len(), 1);
     assert_eq!(app.editor_state.history(), ["old prompt"]);
@@ -4275,7 +4275,7 @@ fn tiny_frames_and_multiline_drafts_never_place_cursor_on_editor_border() {
     assert!(rows[2].starts_with("│   second"));
     assert!(rows[3].starts_with("│   third"));
     terminal.backend_mut().assert_cursor_position((9, 3));
-    app.multiline = Some(Vec::new());
+    app.overlay = Overlay::Multiline(Vec::new());
     app.clear_input();
     assert_eq!(input_desired_height(&app, 40), 4);
     let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
