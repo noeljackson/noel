@@ -195,11 +195,12 @@ pub fn saved_state(path: &Path, provider: &str) -> SavedProvider {
 }
 
 /// Applies `change` to what `path` holds for `provider`, drops rate limits
-/// that have ended, and writes the file back. Processes write it without a
-/// lock: one that writes between another's read and write undoes that
-/// change, which costs at most one request to an account the provider then
-/// refuses again.
+/// that have ended, and writes the file back, holding the file's lock from
+/// the read to the write (#147), so a process writing at the same time does
+/// not undo the change. Should the lock not come in time, it writes anyway:
+/// a lost change costs at most one request the provider refuses again.
 fn save_state(path: &Path, provider: &str, now: i64, change: impl FnOnce(&mut SavedProvider)) {
+    let _lock = noel_config::AuthFileLock::acquire(path).ok();
     let mut state = read_state(path);
     change(state.providers.entry(provider.to_string()).or_default());
     for saved in state.providers.values_mut() {
@@ -590,10 +591,13 @@ impl Provider for FailoverProvider {
         request: ProviderRequest,
         on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
     ) -> Result<(), ProviderError> {
-        let now_ms = epoch_ms();
-        let now = (now_ms / 1000) as i64;
         let mut answers: Vec<String> = Vec::new();
+        let mut now = (epoch_ms() / 1000) as i64;
         for _ in 0..self.providers.len() {
+            // Each attempt reads the clock: the one before may have waited
+            // long for its answer.
+            let now_ms = epoch_ms();
+            now = (now_ms / 1000) as i64;
             let Some(choice) = self.choose(now_ms) else {
                 break;
             };
@@ -685,6 +689,32 @@ mod tests {
             },
         );
         cache
+    }
+
+    /// #147: processes saving the state at once keep each other's
+    /// changes: the lock spans the read and the write.
+    #[test]
+    fn concurrent_saves_keep_every_change() {
+        let path = state_path("concurrent");
+        let threads = (0..8)
+            .map(|thread| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for round in 0..20 {
+                        save_state(&path, "test", 0, |saved| {
+                            saved
+                                .limited_until
+                                .insert(format!("{thread}-{round}"), i64::MAX / 2);
+                        });
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(saved_state(&path, "test").limited_until.len(), 8 * 20);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

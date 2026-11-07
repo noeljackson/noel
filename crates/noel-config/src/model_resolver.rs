@@ -27,17 +27,86 @@ pub struct ModelScope {
     pub diagnostics: Vec<String>,
 }
 
-/// What `--model` (with `--provider` and `--thinking`) resolves to.
+/// What `--model` (with `--provider` and `--thinking`) resolves to (#155:
+/// one case, not fields whose combinations only construction kept apart).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CliModel {
-    /// The model, when there is no `error`. With `custom` it is not one of
-    /// the known models: its id was built onto the provider's default model.
-    pub model: Option<ModelDefinition>,
-    pub custom: bool,
-    /// The level a `:<thinking>` suffix named.
-    pub thinking_level: Option<&'static str>,
-    pub warning: Option<String>,
-    pub error: Option<String>,
+pub enum CliModel {
+    /// No `--model`.
+    #[default]
+    Empty,
+    /// One of the known models; `thinking_level` is the level a
+    /// `:<thinking>` suffix named.
+    Found {
+        model: ModelDefinition,
+        thinking_level: Option<&'static str>,
+        warning: Option<String>,
+    },
+    /// Not one of the known models: its id was built onto the provider's
+    /// default model, which the warning says.
+    Custom {
+        model: ModelDefinition,
+        thinking_level: Option<&'static str>,
+        warning: String,
+    },
+    /// Nothing it names; upstream prints a pattern's warning before the
+    /// error.
+    Error {
+        message: String,
+        warning: Option<String>,
+    },
+}
+
+impl CliModel {
+    fn found(model: &ModelDefinition) -> Self {
+        Self::Found {
+            model: model.clone(),
+            thinking_level: None,
+            warning: None,
+        }
+    }
+
+    fn failed(message: String) -> Self {
+        Self::Error {
+            message,
+            warning: None,
+        }
+    }
+
+    /// The model, found or custom.
+    pub fn model(&self) -> Option<&ModelDefinition> {
+        match self {
+            Self::Found { model, .. } | Self::Custom { model, .. } => Some(model),
+            Self::Empty | Self::Error { .. } => None,
+        }
+    }
+
+    pub fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom { .. })
+    }
+
+    pub fn thinking_level(&self) -> Option<&'static str> {
+        match self {
+            Self::Found { thinking_level, .. } | Self::Custom { thinking_level, .. } => {
+                *thinking_level
+            }
+            Self::Empty | Self::Error { .. } => None,
+        }
+    }
+
+    pub fn warning(&self) -> Option<&str> {
+        match self {
+            Self::Found { warning, .. } | Self::Error { warning, .. } => warning.as_deref(),
+            Self::Custom { warning, .. } => Some(warning),
+            Self::Empty => None,
+        }
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            Self::Error { message, .. } => Some(message),
+            _ => None,
+        }
+    }
 }
 
 /// Upstream `isAlias`: an id without a `-YYYYMMDD` date suffix, or one
@@ -342,6 +411,24 @@ pub fn custom_model(
     })
 }
 
+/// Where the provider of `--model` came from: `--provider`, a known
+/// provider's `name/` prefix, or nowhere.
+#[derive(Clone, Copy)]
+enum ProviderHint<'a> {
+    None,
+    Explicit(&'a str),
+    Inferred(&'a str),
+}
+
+impl<'a> ProviderHint<'a> {
+    fn provider(self) -> Option<&'a str> {
+        match self {
+            Self::Explicit(provider) | Self::Inferred(provider) => Some(provider),
+            Self::None => None,
+        }
+    }
+}
+
 /// Upstream `resolveCliModel`: the model `--model` names, among all models
 /// (not only those with credentials, so `--api-key` works on first use).
 ///
@@ -358,16 +445,10 @@ pub fn resolve_cli_model(
     has_auth: &dyn Fn(&str) -> bool,
 ) -> CliModel {
     if cli_model.is_empty() {
-        return CliModel::default();
+        return CliModel::Empty;
     }
-    let error = |error: String| CliModel {
-        error: Some(error),
-        ..CliModel::default()
-    };
-    let found = |model: &ModelDefinition| CliModel {
-        model: Some(model.clone()),
-        ..CliModel::default()
-    };
+    let error = CliModel::failed;
+    let found = CliModel::found;
     if models.is_empty() {
         return error(
             "No models available. Check your installation or add models to models.json."
@@ -390,31 +471,32 @@ pub fn resolve_cli_model(
             || format!("{}/{}", model.provider, model.id).to_lowercase() == lower
     };
 
-    let mut provider = match cli_provider {
+    let mut pattern = cli_model;
+    let hint = match cli_provider {
         Some(name) => match canonical_provider(name) {
-            Some(provider) => Some(provider),
+            Some(provider) => ProviderHint::Explicit(provider),
             None => {
                 return error(format!(
                 "Unknown provider \"{name}\". Use --list-models to see available providers/models."
             ))
             }
         },
-        None => None,
+        None => match cli_model.split_once('/') {
+            Some((prefix, rest)) => match canonical_provider(prefix) {
+                Some(provider) => {
+                    pattern = rest;
+                    ProviderHint::Inferred(provider)
+                }
+                None => ProviderHint::None,
+            },
+            None => ProviderHint::None,
+        },
     };
-    let mut pattern = cli_model;
-    let mut inferred_provider = false;
-    if provider.is_none() {
-        if let Some((prefix, rest)) = cli_model.split_once('/') {
-            if let Some(canonical) = canonical_provider(prefix) {
-                provider = Some(canonical);
-                pattern = rest;
-                inferred_provider = true;
-            }
-        }
-    }
+    let provider = hint.provider();
+    let inferred_provider = matches!(hint, ProviderHint::Inferred(_));
     // No provider: an exact id or `provider/id`. Several providers may have
     // the id; only credentials can choose between them.
-    if provider.is_none() {
+    if let ProviderHint::None = hint {
         let exact = all.iter().copied().filter(is_exact).collect::<Vec<_>>();
         if let [model] = exact[..] {
             return found(model);
@@ -444,7 +526,7 @@ pub fn resolve_cli_model(
             ));
         }
     }
-    if let (Some(_), Some(provider)) = (cli_provider, provider) {
+    if let ProviderHint::Explicit(provider) = hint {
         // `--provider p --model p/pattern` is tolerated.
         let prefix = format!("{provider}/");
         if cli_model
@@ -477,12 +559,10 @@ pub fn resolve_cli_model(
                 return found(other);
             }
         }
-        return CliModel {
-            model: Some(model.clone()),
-            custom: false,
+        return CliModel::Found {
+            model: model.clone(),
             thinking_level: parsed.thinking_level,
             warning: parsed.warning,
-            error: None,
         };
     }
     // Nothing under the inferred provider: the whole text may be an id
@@ -493,12 +573,10 @@ pub fn resolve_cli_model(
         }
         let fallback = parse_model_pattern(cli_model, &all, false, has_auth);
         if let Some(model) = fallback.model {
-            return CliModel {
-                model: Some(model.clone()),
-                custom: false,
+            return CliModel::Found {
+                model: model.clone(),
                 thinking_level: fallback.thinking_level,
                 warning: fallback.warning,
-                error: None,
             };
         }
     }
@@ -521,15 +599,13 @@ pub fn resolve_cli_model(
             let not_found = format!(
                 "Model \"{id}\" not found for provider \"{provider}\". Using custom model id."
             );
-            return CliModel {
-                model: Some(model),
-                custom: true,
+            return CliModel::Custom {
+                model,
                 thinking_level: suffix_level,
-                warning: Some(match parsed.warning {
+                warning: match parsed.warning {
                     Some(warning) => format!("{warning} {not_found}"),
                     None => not_found,
-                }),
-                error: None,
+                },
             };
         }
     }
@@ -537,11 +613,11 @@ pub fn resolve_cli_model(
         Some(provider) => format!("{provider}/{pattern}"),
         None => cli_model.to_string(),
     };
-    CliModel {
-        warning: parsed.warning,
-        ..error(format!(
+    CliModel::Error {
+        message: format!(
             "Model \"{display}\" not found. Use --list-models to see available models."
-        ))
+        ),
+        warning: parsed.warning,
     }
 }
 
@@ -877,13 +953,13 @@ mod tests {
                 &|provider| authenticated.iter().any(|name| name == provider),
             );
             let mut actual = json!({
-                "model": model_ref(resolved.model.as_ref()),
-                "thinkingLevel": resolved.thinking_level,
-                "warning": resolved.warning,
-                "error": resolved.error,
+                "model": model_ref(resolved.model()),
+                "thinkingLevel": resolved.thinking_level(),
+                "warning": resolved.warning(),
+                "error": resolved.error(),
             });
-            if resolved.custom {
-                actual["custom"] = model_fields(resolved.model.as_ref().expect("custom model"));
+            if resolved.is_custom() {
+                actual["custom"] = model_fields(resolved.model().expect("custom model"));
             }
             assert_eq!(actual, case["expected"], "{input}");
         }

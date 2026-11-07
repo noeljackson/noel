@@ -221,24 +221,44 @@ fn persist_tokens(
     Ok(())
 }
 
-fn tokens_to_auth(
-    provider: &str,
-    previous: &ResolvedAuth,
-    tokens: &RefreshedTokens,
-) -> ResolvedAuth {
-    let account_id = account_id_of(previous);
-    match provider {
-        "anthropic" => ResolvedAuth::ClaudeCodeOAuth {
+/// The refreshed credential, of the kind the refreshed one was (#148: not
+/// guessed from the provider's name).
+fn tokens_to_auth(previous: &ResolvedAuth, tokens: &RefreshedTokens) -> ResolvedAuth {
+    match previous {
+        ResolvedAuth::ChatGptOAuth { account_id, .. } => ResolvedAuth::ChatGptOAuth {
             access_token: tokens.access_token.clone(),
             refresh_token: Some(tokens.refresh_token.clone()),
             expires: tokens.expires,
+            account_id: account_id.clone(),
         },
-        _ => ResolvedAuth::ChatGptOAuth {
-            access_token: tokens.access_token.clone(),
-            refresh_token: Some(tokens.refresh_token.clone()),
-            expires: tokens.expires,
-            account_id,
-        },
+        // Only OAuth credentials refresh; an API key has no refresh token.
+        ResolvedAuth::ClaudeCodeOAuth { .. } | ResolvedAuth::ApiKey(_) => {
+            ResolvedAuth::ClaudeCodeOAuth {
+                access_token: tokens.access_token.clone(),
+                refresh_token: Some(tokens.refresh_token.clone()),
+                expires: tokens.expires,
+            }
+        }
+    }
+}
+
+/// What a refresh did with a stored credential that exists (#148).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// Not within the window: left as it was.
+    Fresh(ResolvedAuth),
+    /// Refreshed, and saved.
+    Refreshed(ResolvedAuth),
+    /// Within the window but not refreshed, and still valid: no refresh
+    /// token or endpoint, or the refresh failed (`reason`).
+    Kept { auth: ResolvedAuth, reason: String },
+}
+
+impl RefreshOutcome {
+    pub fn into_auth(self) -> ResolvedAuth {
+        match self {
+            Self::Fresh(auth) | Self::Refreshed(auth) | Self::Kept { auth, .. } => auth,
+        }
     }
 }
 
@@ -258,7 +278,7 @@ pub async fn refresh_expiring_auth(
     endpoint_override: Option<(&str, &str)>,
     now: u64,
 ) -> Result<Option<ResolvedAuth>> {
-    refresh_auth_expiring_within(
+    let outcome = refresh_auth_expiring_within(
         client,
         auth_path,
         auth,
@@ -268,7 +288,8 @@ pub async fn refresh_expiring_auth(
         now,
         REFRESH_WINDOW_SECONDS,
     )
-    .await
+    .await?;
+    Ok(outcome.map(RefreshOutcome::into_auth))
 }
 
 /// [`refresh_expiring_auth`] for callers that need more remaining lifetime
@@ -283,12 +304,12 @@ pub async fn refresh_auth_expiring_within(
     endpoint_override: Option<(&str, &str)>,
     now: u64,
     window_seconds: u64,
-) -> Result<Option<ResolvedAuth>> {
+) -> Result<Option<RefreshOutcome>> {
     let Some(resolved) = auth_for_provider(auth, provider, account) else {
         return Ok(None);
     };
     if !expires_within(resolved.expires(), now, window_seconds) {
-        return Ok(Some(resolved));
+        return Ok(Some(RefreshOutcome::Fresh(resolved)));
     }
     let account = persisted_account_name(auth, provider, account);
     let lock = refresh_lock(provider, &account);
@@ -305,7 +326,8 @@ pub async fn refresh_auth_expiring_within(
         .and_then(|_| auth_for_provider(&stored, provider, Some(&account)))
         .unwrap_or(resolved);
     if !expires_within(resolved.expires(), now, window_seconds) {
-        return Ok(Some(resolved));
+        // Another refresh got there first.
+        return Ok(Some(RefreshOutcome::Fresh(resolved)));
     }
     if !needs_refresh(&resolved, now, window_seconds) {
         if is_expired(resolved.expires(), now) {
@@ -315,11 +337,17 @@ pub async fn refresh_auth_expiring_within(
                 "no refresh token is stored",
             ));
         }
-        return Ok(Some(resolved));
+        return Ok(Some(RefreshOutcome::Kept {
+            auth: resolved,
+            reason: "no refresh token is stored".to_owned(),
+        }));
     }
     let Some((token_url, client_id)) = endpoint_override.or_else(|| token_endpoint(provider))
     else {
-        return Ok(Some(resolved));
+        return Ok(Some(RefreshOutcome::Kept {
+            auth: resolved,
+            reason: format!("{provider} has no token endpoint"),
+        }));
     };
 
     let fallback_url = (token_url == CLAUDE_TOKEN_URL).then_some(CLAUDE_TOKEN_FALLBACK_URL);
@@ -341,12 +369,17 @@ pub async fn refresh_auth_expiring_within(
                 &tokens,
                 account_id_of(&resolved),
             )?;
-            Ok(Some(tokens_to_auth(provider, &resolved, &tokens)))
+            Ok(Some(RefreshOutcome::Refreshed(tokens_to_auth(
+                &resolved, &tokens,
+            ))))
         }
         Err(error) if is_expired(resolved.expires(), now) => {
             Err(refresh_failure(&account, provider, &error.to_string()))
         }
-        Err(_) => Ok(Some(resolved)),
+        Err(error) => Ok(Some(RefreshOutcome::Kept {
+            auth: resolved,
+            reason: error.to_string(),
+        })),
     }
 }
 
@@ -905,7 +938,8 @@ mod tests {
         .await
         .expect("windowed refresh")
         .expect("auth");
-        assert_eq!(extended.expires(), 1_000 + 7200);
+        assert!(matches!(extended, RefreshOutcome::Refreshed(_)));
+        assert_eq!(extended.into_auth().expires(), 1_000 + 7200);
         assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
 
         let _ = std::fs::remove_dir_all(root);
@@ -982,6 +1016,27 @@ mod tests {
             }
         );
         assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
+
+        // #148: the outcome says the refresh failed and why, unlike a fresh
+        // or a refreshed token.
+        let outcome = refresh_auth_expiring_within(
+            &client,
+            &auth_path,
+            &auth,
+            "anthropic",
+            None,
+            Some((&stub.url, "test-client")),
+            1_000,
+            REFRESH_WINDOW_SECONDS,
+        )
+        .await
+        .expect("soft failure")
+        .expect("auth");
+        assert!(
+            matches!(&outcome, RefreshOutcome::Kept { reason, .. } if reason.contains("500")),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.into_auth(), resolved);
 
         let _ = std::fs::remove_dir_all(root);
     }
