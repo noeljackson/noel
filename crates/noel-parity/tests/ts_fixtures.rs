@@ -322,15 +322,18 @@ fn provider_request_headers_are_redacted() {
 fn committed_fixtures_are_referenced_by_rust_parity_tests() {
     let expected = [
         ("agent-tool-loop.json", "crates/noel-core/src/lib.rs"),
-        ("anthropic-api-key.json", "crates/noel-ai/src/lib.rs"),
+        ("anthropic-api-key.json", "crates/noel-ai/src/tests.rs"),
         (
             "anthropic-claude-code-oauth.json",
-            "crates/noel-ai/src/lib.rs",
+            "crates/noel-ai/src/tests.rs",
         ),
-        ("anthropic-tools.json", "crates/noel-ai/src/lib.rs"),
+        ("anthropic-tools.json", "crates/noel-ai/src/tests.rs"),
         ("auth-discovery.json", "crates/noel-config/src/lib.rs"),
-        ("bedrock-claude-opus-4.6.json", "crates/noel-ai/src/lib.rs"),
-        ("bedrock-tools.json", "crates/noel-ai/src/lib.rs"),
+        (
+            "bedrock-claude-opus-4.6.json",
+            "crates/noel-ai/src/tests.rs",
+        ),
+        ("bedrock-tools.json", "crates/noel-ai/src/tests.rs"),
         (
             "chord-delta.json",
             "crates/noel-chord/tests/chord_delta_parity.rs",
@@ -346,31 +349,31 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("cli-contract.json", "crates/noel-cli/src/main.rs"),
         (
             "cloudflare-ai-gateway-kimi.json",
-            "crates/noel-ai/src/lib.rs",
+            "crates/noel-ai/src/tests.rs",
         ),
         (
             "codemode-declarations.json",
             "crates/noel-codemode/src/declarations.rs",
         ),
-        ("error-classification.json", "crates/noel-ai/src/lib.rs"),
+        ("error-classification.json", "crates/noel-ai/src/tests.rs"),
         (
             "github-copilot-gpt-6.1-sol.json",
-            "crates/noel-ai/src/lib.rs",
+            "crates/noel-ai/src/tests.rs",
         ),
-        ("google-gemini-2.5-pro.json", "crates/noel-ai/src/lib.rs"),
+        ("google-gemini-2.5-pro.json", "crates/noel-ai/src/tests.rs"),
         (
             "google-tool-image-routing.json",
-            "crates/noel-ai/src/lib.rs",
+            "crates/noel-ai/src/tests.rs",
         ),
-        ("google-tools.json", "crates/noel-ai/src/lib.rs"),
+        ("google-tools.json", "crates/noel-ai/src/tests.rs"),
         (
             "local-env.json",
             "crates/noel-env/tests/local_env_conformance.rs",
         ),
         ("local-tools.json", "crates/noel-tools/src/lib.rs"),
-        ("mistral-devstral.json", "crates/noel-ai/src/lib.rs"),
-        ("mistral-tool-id.json", "crates/noel-ai/src/lib.rs"),
-        ("mistral-tools.json", "crates/noel-ai/src/lib.rs"),
+        ("mistral-devstral.json", "crates/noel-ai/src/tests.rs"),
+        ("mistral-tool-id.json", "crates/noel-ai/src/tests.rs"),
+        ("mistral-tools.json", "crates/noel-ai/src/tests.rs"),
         ("model-catalog.json", "crates/noel-ai/src/catalog.rs"),
         (
             "model-resolution.json",
@@ -379,11 +382,14 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("model-thinking.json", "crates/noel-ai/src/catalog.rs"),
         (
             "openai-codex-chatgpt-oauth.json",
-            "crates/noel-ai/src/lib.rs",
+            "crates/noel-ai/src/tests.rs",
         ),
-        ("openai-responses-tool-id.json", "crates/noel-ai/src/lib.rs"),
-        ("openai-responses-tools.json", "crates/noel-ai/src/lib.rs"),
-        ("openrouter-kimi.json", "crates/noel-ai/src/lib.rs"),
+        (
+            "openai-responses-tool-id.json",
+            "crates/noel-ai/src/tests.rs",
+        ),
+        ("openai-responses-tools.json", "crates/noel-ai/src/tests.rs"),
+        ("openrouter-kimi.json", "crates/noel-ai/src/tests.rs"),
         (
             "pi-env-ssh.json",
             "crates/noel-env-daemon/tests/ssh_deploy.rs",
