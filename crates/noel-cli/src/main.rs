@@ -353,9 +353,12 @@ fn main() -> std::process::ExitCode {
     // starts: a generic one naming the agent, and its own, which noel sets
     // under its name and under pi's for what was written for pi. Set before
     // any other thread exists, because the environment is process-wide.
-    std::env::set_var("AI_AGENT", PRODUCT_NAME);
-    std::env::set_var("NOEL_CODING_AGENT", "true");
-    std::env::set_var("PI_CODING_AGENT", "true");
+    // SAFETY: no other thread exists yet: the runtime is built below.
+    unsafe {
+        std::env::set_var("AI_AGENT", PRODUCT_NAME);
+        std::env::set_var("NOEL_CODING_AGENT", "true");
+        std::env::set_var("PI_CODING_AGENT", "true");
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build();
@@ -456,10 +459,11 @@ async fn run() -> Result<()> {
     };
     let resources = resource_commands::resource_options(&cli);
     let mut config = load_config_with_resources(paths, project_trusted, &resources)?;
-    if cli.session_dir.is_none() && std::env::var_os(ENV_SESSION_DIR).is_none() {
-        if let Some(session_dir) = &config.settings.session_dir {
-            config.paths = config.paths.with_session_dir(session_dir)?;
-        }
+    if cli.session_dir.is_none()
+        && std::env::var_os(ENV_SESSION_DIR).is_none()
+        && let Some(session_dir) = &config.settings.session_dir
+    {
+        config.paths = config.paths.with_session_dir(session_dir)?;
     }
     apply_cli_overrides(&cli, &cwd, &mut config)?;
     let _ = CONFIG_SOURCE.set(ConfigSource {
@@ -470,6 +474,20 @@ async fn run() -> Result<()> {
     if cli.verbose {
         eprintln!("agent dir: {}", config.paths.agent_dir.display());
         eprintln!("session dir: {}", config.paths.session_dir.display());
+    }
+    // Interactive `noel` talks to a server, which reads the same sessions:
+    // a --session-dir is its too (and names its runtime directory).
+    if cli.session_dir.is_some()
+        && cli.attach.is_none()
+        && io::stdin().is_terminal()
+        && !cli.print
+        && cli.messages.is_empty()
+        && !matches!(cli.mode, OutputMode::Rpc)
+    {
+        // SAFETY: nothing reads the environment concurrently: the only
+        // tasks running yet wait for signals; the model refresh and the
+        // session runtime start below.
+        unsafe { std::env::set_var(ENV_SESSION_DIR, &config.paths.session_dir) };
     }
     // The remote backend: the session runs in its worker, so nothing below
     // (a local runtime, its model, its session) applies.
@@ -529,11 +547,6 @@ async fn run() -> Result<()> {
         && cli.messages.is_empty()
         && !matches!(cli.mode, OutputMode::Rpc)
     {
-        // The server reads the same sessions: a --session-dir is its too
-        // (and names its runtime directory).
-        if cli.session_dir.is_some() {
-            std::env::set_var(ENV_SESSION_DIR, &config.paths.session_dir);
-        }
         match create_runtime(
             &cli,
             &cwd,
@@ -547,11 +560,10 @@ async fn run() -> Result<()> {
                     path,
                     pid: Some(pid),
                 }) = error.downcast_ref::<SessionError>()
+                    && let Some(session) = held_by_worker(path, *pid)
                 {
-                    if let Some(session) = held_by_worker(path, *pid) {
-                        offer_bun_install(&config).await?;
-                        return run_client_tui(session, Some(path.clone()), config, &cli).await;
-                    }
+                    offer_bun_install(&config).await?;
+                    return run_client_tui(session, Some(path.clone()), config, &cli).await;
                 }
             }
         }
@@ -997,10 +1009,10 @@ fn offline_enabled(cli_offline: bool) -> bool {
 }
 
 fn apply_cached_claude_code_version(config: &LoadedConfig) {
-    if let Ok(Some(cache)) = read_model_cache(&config.paths.model_cache_path) {
-        if let Some(version) = cache.claude_code_version {
-            set_claude_code_version(version);
-        }
+    if let Ok(Some(cache)) = read_model_cache(&config.paths.model_cache_path)
+        && let Some(version) = cache.claude_code_version
+    {
+        set_claude_code_version(version);
     }
 }
 
@@ -1152,18 +1164,18 @@ fn create_runtime(
         return opened(store, state);
     }
 
-    if cli.r#continue {
-        if let Some(path) = most_recent_session(&config.paths.session_dir, Some(cwd))? {
-            let (store, state) = SessionStore::open(path)?;
-            return opened(store, state);
-        }
+    if cli.r#continue
+        && let Some(path) = most_recent_session(&config.paths.session_dir, Some(cwd))?
+    {
+        let (store, state) = SessionStore::open(path)?;
+        return opened(store, state);
     }
 
-    if cli.resume {
-        if let Some(path) = most_recent_session(&config.paths.session_dir, None)? {
-            let (store, state) = SessionStore::open(path)?;
-            return opened(store, state);
-        }
+    if cli.resume
+        && let Some(path) = most_recent_session(&config.paths.session_dir, None)?
+    {
+        let (store, state) = SessionStore::open(path)?;
+        return opened(store, state);
     }
 
     let (store, state) = SessionStore::create_with_workspace(
@@ -1202,10 +1214,10 @@ fn resolve_model_reference(
     reference: &str,
     offline: bool,
 ) -> Option<ModelRef> {
-    if let Ok(index) = reference.parse::<usize>() {
-        if index > 0 {
-            return config.models.get(index - 1).map(ModelDefinition::model_ref);
-        }
+    if let Ok(index) = reference.parse::<usize>()
+        && index > 0
+    {
+        return config.models.get(index - 1).map(ModelDefinition::model_ref);
     }
     find_selectable_model(config, reference, offline)
 }
@@ -1858,20 +1870,20 @@ fn tool_call_detail(call: &noel_ai::ChatToolCall) -> String {
         .iter()
         .find_map(|key| args[*key].as_str())
         .unwrap_or("");
-    if call.name == "edit" {
-        if let Some(edits) = args["edits"].as_array() {
-            let added: usize = edits
-                .iter()
-                .filter_map(|edit| edit["newText"].as_str())
-                .map(|text| text.lines().count())
-                .sum();
-            let removed: usize = edits
-                .iter()
-                .filter_map(|edit| edit["oldText"].as_str())
-                .map(|text| text.lines().count())
-                .sum();
-            return format!("{detail} · +{added} -{removed}");
-        }
+    if call.name == "edit"
+        && let Some(edits) = args["edits"].as_array()
+    {
+        let added: usize = edits
+            .iter()
+            .filter_map(|edit| edit["newText"].as_str())
+            .map(|text| text.lines().count())
+            .sum();
+        let removed: usize = edits
+            .iter()
+            .filter_map(|edit| edit["oldText"].as_str())
+            .map(|text| text.lines().count())
+            .sum();
+        return format!("{detail} · +{added} -{removed}");
     }
     detail.to_string()
 }
@@ -2051,11 +2063,12 @@ fn terminal_theme(config: &LoadedConfig) -> Result<TerminalTheme> {
 
 fn resolve_terminal_theme(config: &LoadedConfig, name: &str) -> Result<TerminalTheme> {
     // Loaded resources can customize built-ins; /theme system always restores native colors.
-    if name != "system" && name != "default" {
-        if let Some(resource) = find_resource(&config.themes, name) {
-            return TerminalTheme::from_json(&resource.name, &resource.content)
-                .map_err(|error| anyhow!(error));
-        }
+    if name != "system"
+        && name != "default"
+        && let Some(resource) = find_resource(&config.themes, name)
+    {
+        return TerminalTheme::from_json(&resource.name, &resource.content)
+            .map_err(|error| anyhow!(error));
     }
     if let Some(theme) = TerminalTheme::builtin(name) {
         return Ok(theme);
@@ -2929,13 +2942,13 @@ fn extension_protocol(extension: &ResourceFile) -> Result<Option<String>> {
                 manifest_path.display()
             )
         })?;
-        if let Some(protocol) = manifest.protocol.as_deref() {
-            if !matches!(protocol, "json" | "stdio") {
-                return Err(anyhow!(
-                    "unsupported protocol {protocol} in {}",
-                    manifest_path.display()
-                ));
-            }
+        if let Some(protocol) = manifest.protocol.as_deref()
+            && !matches!(protocol, "json" | "stdio")
+        {
+            return Err(anyhow!(
+                "unsupported protocol {protocol} in {}",
+                manifest_path.display()
+            ));
         }
         return Ok(manifest.protocol);
     }

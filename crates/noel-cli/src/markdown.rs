@@ -66,90 +66,88 @@ pub fn parse_inline_line(line: &str) -> Vec<StyledSpan> {
     while index < bytes.len() {
         let rest = &line[index..];
         // Code spans take priority and suppress other emphasis inside.
-        if rest.starts_with('`') {
-            if let Some(close) = find_code_close(line, index) {
-                flush_plain(&mut spans, plain_start, index);
-                spans.push(StyledSpan {
-                    source: index..close + 1,
-                    style: SpanStyle::Code,
-                    display: line[index + 1..close].to_string(),
-                });
-                index = close + 1;
-                plain_start = index;
-                continue;
-            }
+        if rest.starts_with('`')
+            && let Some(close) = find_code_close(line, index)
+        {
+            flush_plain(&mut spans, plain_start, index);
+            spans.push(StyledSpan {
+                source: index..close + 1,
+                style: SpanStyle::Code,
+                display: line[index + 1..close].to_string(),
+            });
+            index = close + 1;
+            plain_start = index;
+            continue;
         }
-        if rest.starts_with("***") {
-            if let Some(content_end) = find_triple_marker(line, index + 3, b'*') {
-                flush_plain(&mut spans, plain_start, index);
-                spans.push(StyledSpan {
-                    source: index..content_end + 3,
-                    style: SpanStyle::BoldItalic,
-                    display: line[index + 3..content_end].to_string(),
-                });
-                index = content_end + 3;
-                plain_start = index;
-                continue;
-            }
+        if rest.starts_with("***")
+            && let Some(content_end) = find_triple_marker(line, index + 3, b'*')
+        {
+            flush_plain(&mut spans, plain_start, index);
+            spans.push(StyledSpan {
+                source: index..content_end + 3,
+                style: SpanStyle::BoldItalic,
+                display: line[index + 3..content_end].to_string(),
+            });
+            index = content_end + 3;
+            plain_start = index;
+            continue;
         }
-        if rest.starts_with("**") {
-            if let Some(content_end) = find_double_marker(line, index + 2, b'*') {
-                flush_plain(&mut spans, plain_start, index);
-                spans.push(StyledSpan {
-                    source: index..content_end + 2,
-                    style: SpanStyle::Bold,
-                    display: line[index + 2..content_end].to_string(),
-                });
-                index = content_end + 2;
-                plain_start = index;
-                continue;
-            }
+        if rest.starts_with("**")
+            && let Some(content_end) = find_double_marker(line, index + 2, b'*')
+        {
+            flush_plain(&mut spans, plain_start, index);
+            spans.push(StyledSpan {
+                source: index..content_end + 2,
+                style: SpanStyle::Bold,
+                display: line[index + 2..content_end].to_string(),
+            });
+            index = content_end + 2;
+            plain_start = index;
+            continue;
         }
-        if rest.starts_with("~~") {
-            if let Some(content_end) = find_double_marker(line, index + 2, b'~') {
-                flush_plain(&mut spans, plain_start, index);
-                spans.push(StyledSpan {
-                    source: index..content_end + 2,
-                    style: SpanStyle::Strike,
-                    display: line[index + 2..content_end].to_string(),
-                });
-                index = content_end + 2;
-                plain_start = index;
-                continue;
-            }
+        if rest.starts_with("~~")
+            && let Some(content_end) = find_double_marker(line, index + 2, b'~')
+        {
+            flush_plain(&mut spans, plain_start, index);
+            spans.push(StyledSpan {
+                source: index..content_end + 2,
+                style: SpanStyle::Strike,
+                display: line[index + 2..content_end].to_string(),
+            });
+            index = content_end + 2;
+            plain_start = index;
+            continue;
         }
-        if rest.starts_with('[') {
-            if let Some((link_end, text_end)) = find_link(line, index) {
-                flush_plain(&mut spans, plain_start, index);
-                // Display only the link text; the URL stays selectable in
-                // the source range.
-                spans.push(StyledSpan {
-                    source: index..link_end,
-                    style: SpanStyle::Link,
-                    display: line[index + 1..text_end].to_string(),
-                });
-                index = link_end;
-                plain_start = index;
-                continue;
-            }
+        if rest.starts_with('[')
+            && let Some((link_end, text_end)) = find_link(line, index)
+        {
+            flush_plain(&mut spans, plain_start, index);
+            // Display only the link text; the URL stays selectable in
+            // the source range.
+            spans.push(StyledSpan {
+                source: index..link_end,
+                style: SpanStyle::Link,
+                display: line[index + 1..text_end].to_string(),
+            });
+            index = link_end;
+            plain_start = index;
+            continue;
         }
         let single = rest
             .chars()
             .next()
             .map(|ch| (ch == '*' || ch == '_') && !rest.starts_with("**"))
             .unwrap_or(false);
-        if single {
-            if let Some(content_end) = find_single_emphasis_close(line, index) {
-                flush_plain(&mut spans, plain_start, index);
-                spans.push(StyledSpan {
-                    source: index..content_end + 1,
-                    style: SpanStyle::Italic,
-                    display: line[index + 1..content_end].to_string(),
-                });
-                index = content_end + 1;
-                plain_start = index;
-                continue;
-            }
+        if single && let Some(content_end) = find_single_emphasis_close(line, index) {
+            flush_plain(&mut spans, plain_start, index);
+            spans.push(StyledSpan {
+                source: index..content_end + 1,
+                style: SpanStyle::Italic,
+                display: line[index + 1..content_end].to_string(),
+            });
+            index = content_end + 1;
+            plain_start = index;
+            continue;
         }
         index += rest.chars().next().map(char::len_utf8).unwrap_or(1);
     }

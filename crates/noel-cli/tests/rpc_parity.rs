@@ -627,10 +627,10 @@ fn expected(upstream: &[Value]) -> Vec<Value> {
                     result.remove("structuredContent");
                     result.remove("details");
                 }
-                if kind == "compaction_end" {
-                    if let Some(result) = object.get_mut("result") {
-                        *result = json!({ "summary": result["summary"] });
-                    }
+                if kind == "compaction_end"
+                    && let Some(result) = object.get_mut("result")
+                {
+                    *result = json!({ "summary": result["summary"] });
                 }
             });
             if record["command"] == "get_state" {
@@ -692,10 +692,10 @@ fn without_own(mut record: Value) -> Value {
             object.remove(key);
         }
     });
-    if record["type"] == "compaction_end" {
-        if let Some(Value::Object(result)) = record.get_mut("result") {
-            result.remove("details");
-        }
+    if record["type"] == "compaction_end"
+        && let Some(Value::Object(result)) = record.get_mut("result")
+    {
+        result.remove("details");
     }
     record
 }

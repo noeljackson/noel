@@ -137,7 +137,7 @@ pub fn uuidv7() -> String {
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default();
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes[6..]).expect("random bytes");
+    getrandom::fill(&mut bytes[6..]).expect("random bytes");
     bytes[..6].copy_from_slice(&millis.to_be_bytes()[2..]);
     bytes[6] = 0x70 | (bytes[6] & 0x0f);
     bytes[8] = 0x80 | (bytes[8] & 0x3f);

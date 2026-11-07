@@ -1,0 +1,3 @@
+# Formatting keeps the 2021 style edition: the code moved to edition 2024
+# (#182) without reformatting every file.
+style_edition = "2021"

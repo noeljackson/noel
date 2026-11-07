@@ -238,10 +238,10 @@ impl Message {
     /// (deflated parts stay deflated).
     pub fn with_text_parts(mut self) -> Message {
         let text = |part: &mut Part| {
-            if let Part::Bytes(bytes) = part {
-                if let Ok(text) = String::from_utf8(std::mem::take(bytes)) {
-                    *part = Part::Text(text);
-                }
+            if let Part::Bytes(bytes) = part
+                && let Ok(text) = String::from_utf8(std::mem::take(bytes))
+            {
+                *part = Part::Text(text);
             }
         };
         match &mut self {

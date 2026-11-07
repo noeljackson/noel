@@ -2120,12 +2120,11 @@ impl SessionStore {
             return Ok(Some(jsonl_candidate));
         }
         let summaries = Self::list(session_dir)?;
-        if let Ok(index) = reference.parse::<usize>() {
-            if index > 0 {
-                if let Some(summary) = summaries.get(index - 1) {
-                    return Ok(Some(summary.path.clone()));
-                }
-            }
+        if let Ok(index) = reference.parse::<usize>()
+            && index > 0
+            && let Some(summary) = summaries.get(index - 1)
+        {
+            return Ok(Some(summary.path.clone()));
         }
         let matches = summaries
             .into_iter()
@@ -2821,10 +2820,8 @@ impl Runtime {
                 changed = true;
             }
         }
-        if changed {
-            if let Some(store) = &self.store {
-                store.record_edited_files(self.session.edited_files.clone())?;
-            }
+        if changed && let Some(store) = &self.store {
+            store.record_edited_files(self.session.edited_files.clone())?;
         }
         Ok(())
     }
@@ -2953,10 +2950,10 @@ impl Runtime {
     /// is interrupted, as the journal already reads it, so a resume or the
     /// next start ends it (#140). Nothing is saved.
     pub fn interrupt_unrun(&mut self, run_id: &str) {
-        if let Some(run) = self.session.run_mut(run_id) {
-            if run.status == RunStatus::Running {
-                run.status = RunStatus::Interrupted;
-            }
+        if let Some(run) = self.session.run_mut(run_id)
+            && run.status == RunStatus::Running
+        {
+            run.status = RunStatus::Interrupted;
         }
     }
 

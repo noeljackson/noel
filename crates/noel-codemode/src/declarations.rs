@@ -522,10 +522,10 @@ fn constraint_tags(schema: &Value) -> String {
         })
         .unwrap_or_default();
     let mut branches: Vec<&Map<String, Value>> = vec![property];
-    if let [branch] = non_null.as_slice() {
-        if let Some(branch) = branch.as_object() {
-            branches.push(branch);
-        }
+    if let [branch] = non_null.as_slice()
+        && let Some(branch) = branch.as_object()
+    {
+        branches.push(branch);
     }
     // Draft-04's boolean `exclusiveMinimum`/`exclusiveMaximum`.
     let schemas: Vec<Map<String, Value>> = branches

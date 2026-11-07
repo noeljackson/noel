@@ -349,13 +349,12 @@ impl ProviderError {
     /// model's context window ([`is_context_overflow_text`]). Cerebras
     /// answers an overflow with a 400 or 413 without a body.
     pub fn is_context_overflow(&self, provider: &str) -> bool {
-        if let Self::Status { status, body, .. } = self {
-            if provider == "cerebras"
-                && matches!(status.as_u16(), 400 | 413)
-                && body.trim().is_empty()
-            {
-                return true;
-            }
+        if let Self::Status { status, body, .. } = self
+            && provider == "cerebras"
+            && matches!(status.as_u16(), 400 | 413)
+            && body.trim().is_empty()
+        {
+            return true;
         }
         self.provider_answer()
             .is_some_and(|answer| is_context_overflow_text(&answer))

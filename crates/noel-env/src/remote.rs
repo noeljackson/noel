@@ -766,10 +766,10 @@ impl RemoteEnv {
                 }
                 let chunk = &content[offset..content.len().min(offset + WRITE_CHUNK)];
                 in_flight.push_back(handle.start("writeChunk", Json::new(), chunk)?);
-                if in_flight.len() >= WRITE_DEPTH {
-                    if let Some(written) = in_flight.pop_front() {
-                        written.wait(None, None).await?;
-                    }
+                if in_flight.len() >= WRITE_DEPTH
+                    && let Some(written) = in_flight.pop_front()
+                {
+                    written.wait(None, None).await?;
                 }
             }
             // The first failure; later chunks are refused by the daemon, so the file has no gaps.

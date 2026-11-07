@@ -1037,10 +1037,10 @@ impl<H: Host> Busy<'_, H> {
         policy: AbortPolicy,
     ) -> Result<(), String> {
         fence(expected_run_id, Some(self.run_id()))?;
-        if policy == AbortPolicy::WithdrawQueue {
-            if let Err(error) = self.live.clear_queue_saving() {
-                self.live.host.event(Event::SaveFailed { error: &error });
-            }
+        if policy == AbortPolicy::WithdrawQueue
+            && let Err(error) = self.live.clear_queue_saving()
+        {
+            self.live.host.event(Event::SaveFailed { error: &error });
         }
         self.active().cancellation.cancel();
         Ok(())
@@ -1456,7 +1456,7 @@ pub const COMPACTION_CANCELLED: &str = "Compaction cancelled";
 /// A random UUID (version 4), naming a run or a submission.
 pub fn new_id() -> String {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("system randomness");
+    getrandom::fill(&mut bytes).expect("system randomness");
     bytes[6] = 0x40 | (bytes[6] & 0x0f);
     bytes[8] = 0x80 | (bytes[8] & 0x3f);
     let hex = bytes

@@ -162,7 +162,9 @@ async fn start(args: WorkerArgs) -> Result<i32, Fatal> {
     let _ = fs::remove_file(dir.worker_args(&session_id));
     for (key, value) in launched["env"].as_object().into_iter().flatten() {
         if let Some(value) = value.as_str() {
-            std::env::set_var(key, value);
+            // SAFETY: the worker sets its launch environment first, before
+            // it starts any task or thread that could read it.
+            unsafe { std::env::set_var(key, value) };
         }
     }
     let launch: Vec<String> = serde_json::from_value(launched["args"].clone()).unwrap_or_default();
@@ -173,10 +175,10 @@ async fn start(args: WorkerArgs) -> Result<i32, Fatal> {
         serde_json::to_string(&launch).unwrap_or_default(),
     );
     // A relative directory is the opening `noel`'s, as there.
-    if state.cwd.is_relative() {
-        if let Some(base) = launched["cwd"].as_str() {
-            state.cwd = std::path::Path::new(base).join(&state.cwd);
-        }
+    if state.cwd.is_relative()
+        && let Some(base) = launched["cwd"].as_str()
+    {
+        state.cwd = std::path::Path::new(base).join(&state.cwd);
     }
     let cwd = state.cwd.clone();
     if let Err(error) = std::env::set_current_dir(&cwd) {
@@ -521,7 +523,8 @@ fn serve_chat(
 /// before entry `before`, and the entry before those.
 fn entries_method(
     view: &Arc<Mutex<View>>,
-) -> impl Fn(Value, CallContext) -> BoxFuture<Result<Value, WireError>> + Send + Sync + 'static {
+) -> impl Fn(Value, CallContext) -> BoxFuture<Result<Value, WireError>> + Send + Sync + 'static + use<>
+{
     let view = view.clone();
     move |args, _ctx| {
         let page = match args.get("before").and_then(Value::as_u64) {
@@ -543,7 +546,7 @@ fn participant(cell: &Cell, commands: &mpsc::UnboundedSender<Command>) -> Implem
     fn method(
         commands: &mpsc::UnboundedSender<Command>,
         make: fn(Value, Reply) -> Command,
-    ) -> impl Fn(Value, CallContext) -> BoxFuture<Result<Value, WireError>> + Send + Sync + 'static
+    ) -> impl Fn(Value, CallContext) -> BoxFuture<Result<Value, WireError>> + Send + Sync + 'static + use<>
     {
         let commands = commands.clone();
         move |args, _ctx| {
@@ -1024,16 +1027,15 @@ async fn idle_command(
 ) -> Option<Start> {
     // After `/quit` the session's extension hosts are shut down: nothing
     // new starts (#134); a client attaching again gets the next worker.
-    if controller.host().status.get().phase == Phase::Leaving {
-        if let Command::Submit(_, reply) | Command::Run(_, reply) | Command::Resume(_, reply) =
+    if controller.host().status.get().phase == Phase::Leaving
+        && let Command::Submit(_, reply) | Command::Run(_, reply) | Command::Resume(_, reply) =
             command
-        {
-            let _ = reply.send(Err(refused(
-                "closing",
-                "the session is closing; attach to it again to continue",
-            )));
-            return None;
-        }
+    {
+        let _ = reply.send(Err(refused(
+            "closing",
+            "the session is closing; attach to it again to continue",
+        )));
+        return None;
     }
     match command {
         Command::Submit(args, reply) => {
@@ -1785,13 +1787,13 @@ fn configure(
 ) -> Result<Value, WireError> {
     let invalid = |error: anyhow::Error| refused("configure", error.to_string());
     let level = args.get("thinkingLevel").and_then(Value::as_str);
-    if let Some(level) = level {
-        if crate::normalized_thinking_level(level).is_none() {
-            return Err(refused(
-                "configure",
-                format!("Unknown thinking level: {level}"),
-            ));
-        }
+    if let Some(level) = level
+        && crate::normalized_thinking_level(level).is_none()
+    {
+        return Err(refused(
+            "configure",
+            format!("Unknown thinking level: {level}"),
+        ));
     }
     // Durable's `configure({compaction})`: replaces the conversation's
     // settings whole; `null` clears them (upstream 922c3ff2).

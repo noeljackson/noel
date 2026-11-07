@@ -271,13 +271,13 @@ pub(crate) fn resolve_scope(cli: &Cli, config: &LoadedConfig, offline: bool) -> 
 /// ([`model_definition`]). Upstream ignores a saved default it cannot find.
 pub(crate) fn default_model(config: &LoadedConfig, offline: bool) -> Option<ModelRef> {
     let settings = &config.settings;
-    if let (Some(provider), Some(id)) = (&settings.default_provider, &settings.default_model) {
-        if provider_usable(config, provider, offline) {
-            return Some(ModelRef {
-                provider: provider.clone(),
-                id: id.clone(),
-            });
-        }
+    if let (Some(provider), Some(id)) = (&settings.default_provider, &settings.default_model)
+        && provider_usable(config, provider, offline)
+    {
+        return Some(ModelRef {
+            provider: provider.clone(),
+            id: id.clone(),
+        });
     }
     let (faux, real): (Vec<&ModelDefinition>, Vec<&ModelDefinition>) = config
         .models

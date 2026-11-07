@@ -935,10 +935,10 @@ async fn read_frames(inner: Weak<Inner>, session: Arc<Session>, mut stdout: Chil
                 continue;
             };
             let noise = String::from_utf8_lossy(&buffer[..index]).trim().to_string();
-            if !noise.is_empty() {
-                if let Some(inner) = inner.upgrade() {
-                    inner.log(&noise);
-                }
+            if !noise.is_empty()
+                && let Some(inner) = inner.upgrade()
+            {
+                inner.log(&noise);
             }
             buffer.drain(..index + marker.len());
             synced = true;

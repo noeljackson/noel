@@ -285,14 +285,13 @@ pub(crate) async fn run(args: ClientArgs) -> i32 {
 
 async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
     // The working directory of `new`: this one only when the server is here.
-    if let ClientCommand::New { cwd, .. } = &command {
-        if let Endpoint::Ssh { destination, .. } = &endpoint {
-            if !cwd.as_ref().is_some_and(|cwd| cwd.is_absolute()) {
-                return Err(anyhow!(
-                    "with --remote, pass --cwd: an absolute path on {destination}"
-                ));
-            }
-        }
+    if let ClientCommand::New { cwd, .. } = &command
+        && let Endpoint::Ssh { destination, .. } = &endpoint
+        && !cwd.as_ref().is_some_and(|cwd| cwd.is_absolute())
+    {
+        return Err(anyhow!(
+            "with --remote, pass --cwd: an absolute path on {destination}"
+        ));
     }
     let client = connect(
         endpoint,

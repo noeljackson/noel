@@ -1057,10 +1057,10 @@ impl Actor {
             role,
             principal: self.links[&id].principal.clone(),
         });
-        if role == Role::Parent {
-            if let Some(previous) = self.parent.replace(id) {
-                self.close_link(previous);
-            }
+        if role == Role::Parent
+            && let Some(previous) = self.parent.replace(id)
+        {
+            self.close_link(previous);
         }
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -2097,12 +2097,12 @@ impl Actor {
             },
         };
         let object = &self.objects[&key];
-        if let Some(declaration) = object.contract.method(&name) {
-            if let Err(error) = crate::validate::check(&declaration.args, &args) {
-                let error = ChordError::invalid("args", format!("{name}: {error}"));
-                self.refuse_call(link, origin, call, error.into());
-                return Ok(());
-            }
+        if let Some(declaration) = object.contract.method(&name)
+            && let Err(error) = crate::validate::check(&declaration.args, &args)
+        {
+            let error = ChordError::invalid("args", format!("{name}: {error}"));
+            self.refuse_call(link, origin, call, error.into());
+            return Ok(());
         }
         let Some(function) = object.methods.get(&name).cloned() else {
             let error = ChordError::invalid("member", format!("{name}: not implemented"));
