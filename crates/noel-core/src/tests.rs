@@ -4832,3 +4832,32 @@ impl Provider for OverflowProvider {
         ))
     }
 }
+
+/// #175: a model switch saves the model and its thinking level in one
+/// append, and a reopen reads both back.
+#[test]
+fn a_model_switch_saves_the_model_and_its_level_together() {
+    let base = std::env::temp_dir().join(format!("noel-model-switch-{}", new_session_id()));
+    let (store, state) = SessionStore::create(&base, base.clone()).unwrap();
+    let path = store.path().to_path_buf();
+    let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store);
+    let model = ModelRef {
+        provider: "faux".into(),
+        id: "faux-1".into(),
+    };
+    let before = fs::read(&path).unwrap();
+    runtime
+        .set_active_model_and_thinking_level(Some(model.clone()), Some("high".into()))
+        .unwrap();
+    let after = fs::read(&path).unwrap();
+    let added = String::from_utf8(after[before.len()..].to_vec()).unwrap();
+    let kinds: Vec<String> = added
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap()["type"].to_string())
+        .collect();
+    assert_eq!(kinds.len(), 2, "{added}");
+    let (_, reopened) = SessionStore::open(path).unwrap();
+    assert_eq!(reopened.active_model, Some(model));
+    assert_eq!(reopened.active_thinking_level.as_deref(), Some("high"));
+    let _ = fs::remove_dir_all(base);
+}

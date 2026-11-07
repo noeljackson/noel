@@ -1617,6 +1617,23 @@ impl SessionStore {
         Ok((store, state))
     }
 
+    /// A new session that starts as `state` (its model, thinking level,
+    /// account, workspace), written in one atomic write, so it never
+    /// exists half set up (#175).
+    pub fn create_with_state(
+        session_dir: &Path,
+        state: SessionState,
+    ) -> Result<(Self, SessionState), SessionError> {
+        fs::create_dir_all(session_dir).map_err(|source| SessionError::CreateDir {
+            path: session_dir.to_path_buf(),
+            source,
+        })?;
+        let path = session_dir.join(format!("{}.jsonl", state.session_id));
+        let store = Self::writer(path)?;
+        store.write_full_state(&state)?;
+        Ok((store, state))
+    }
+
     pub fn fork(
         session_dir: &Path,
         source: &SessionState,
@@ -2215,6 +2232,27 @@ impl SessionStore {
         self.storage.rewrite(&mut |_| Ok(journal.clone()))
     }
 
+    /// Appends `records` in one write: the journal holds all of them or
+    /// none (#175).
+    fn append_all(&self, records: &[SessionRecord]) -> Result<(), SessionError> {
+        let mut lines = Vec::new();
+        for record in records {
+            if !lines.is_empty() {
+                lines.push(b'\n');
+            }
+            let line = serde_json::to_vec(record).map_err(|source| SessionError::Parse {
+                path: self.path.clone(),
+                source,
+            })?;
+            lines.extend_from_slice(&line);
+        }
+        self.storage.append(&lines)?;
+        for record in records {
+            self.observe_history(record);
+        }
+        Ok(())
+    }
+
     fn append(&self, record: &SessionRecord) -> Result<(), SessionError> {
         let line = serde_json::to_vec(record).map_err(|source| SessionError::Parse {
             path: self.path.clone(),
@@ -2713,6 +2751,28 @@ impl Runtime {
             store.record_compaction_settings(settings.clone())?;
         }
         self.session.compaction = settings;
+        Ok(())
+    }
+
+    /// Sets the model and the thinking level together, in one journal
+    /// write, so a failure leaves neither changed (#175).
+    pub fn set_active_model_and_thinking_level(
+        &mut self,
+        model: Option<ModelRef>,
+        level: Option<String>,
+    ) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.append_all(&[
+                SessionRecord::ActiveModel {
+                    model: model.clone(),
+                },
+                SessionRecord::ActiveThinkingLevel {
+                    level: level.clone(),
+                },
+            ])?;
+        }
+        self.session.active_model = model;
+        self.session.active_thinking_level = level;
         Ok(())
     }
 
@@ -3909,7 +3969,7 @@ fn split_optional_arg(value: &str) -> (&str, Option<&str>) {
     (first, rest)
 }
 
-fn new_session_id() -> String {
+pub fn new_session_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
