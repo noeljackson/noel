@@ -437,9 +437,10 @@ fn with_status(text: String, status: &str) -> String {
 struct BashReporter<'a> {
     output: OutputAccumulator,
     on_output: &'a mut (dyn FnMut(OutputSoFar<'_>) + Send),
-    /// Output not reported yet is reported once the throttle allows.
-    unreported: bool,
     last_report: Option<Instant>,
+    /// When output not reported yet is reported, once the throttle allows;
+    /// `None` with nothing unreported (#175: one field, not a flag beside
+    /// it).
     report_due: Option<Instant>,
     /// Why the output could not be kept, which stopped the command.
     error: Option<io::Error>,
@@ -447,7 +448,7 @@ struct BashReporter<'a> {
 
 impl BashReporter<'_> {
     fn report(&mut self) {
-        (self.unreported, self.report_due, self.last_report) = (false, None, Some(Instant::now()));
+        (self.report_due, self.last_report) = (None, Some(Instant::now()));
         (self.on_output)(OutputSoFar {
             text: &self.output.tail(),
             truncated: self.output.truncated(),
@@ -462,7 +463,6 @@ impl BashReporter<'_> {
             self.error = Some(error);
             return Err(message);
         }
-        self.unreported = true;
         let due = self.last_report.map(|at| at + BASH_UPDATE_THROTTLE);
         match due.filter(|due| *due > Instant::now()) {
             Some(due) => {
@@ -514,7 +514,6 @@ async fn bash_tool(
     let reporter = Mutex::new(BashReporter {
         output: OutputAccumulator::new("noel-bash"),
         on_output,
-        unreported: false,
         last_report: None,
         report_due: None,
         error: None,
@@ -599,7 +598,7 @@ async fn bash_tool(
             _ => return Err(ToolError::Failed(error.message)),
         },
     };
-    if reporter.unreported {
+    if reporter.report_due.is_some() {
         reporter.report();
     }
 
