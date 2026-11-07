@@ -907,7 +907,7 @@ fn host_command(path: &Path, bun: Option<&Path>) -> Result<tokio::process::Comma
 /// binary, else the agent dir's `extension-hosts/noel-bun-host.ts`, the
 /// same agent dir the config discovers.
 fn find_bun_host() -> Option<PathBuf> {
-    if let Some(override_path) = std::env::var_os("NOEL_BUN_HOST") {
+    if let Some(override_path) = std::env::var_os(noel_config::env::BUN_HOST) {
         let path = PathBuf::from(override_path);
         if path.is_file() {
             return Some(path);
@@ -930,7 +930,7 @@ fn find_bun_host() -> Option<PathBuf> {
 /// install` puts there), else a `bun` on PATH. Musl and glibc systems both
 /// run the stock release build; the download picks the right asset.
 pub fn find_bun_binary() -> Option<PathBuf> {
-    if let Some(override_value) = std::env::var_os("NOEL_BUN_BIN") {
+    if let Some(override_value) = std::env::var_os(noel_config::env::BUN_BIN) {
         let value = override_value.to_string_lossy().to_string();
         let value = value.trim();
         if value == "path" {

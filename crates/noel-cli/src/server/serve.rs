@@ -225,9 +225,7 @@ async fn foreground() -> Result<i32> {
 
     // Sessions and models as `noel` sees them from the home directory: the
     // global settings, never a project's.
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
+    let home = noel_config::env::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let paths = crate::config_paths(home.clone(), None)?;
     let mut config = load_config_with_project_trust(paths, false)?;
     if std::env::var_os(ENV_SESSION_DIR).is_none()

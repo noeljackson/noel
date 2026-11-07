@@ -702,7 +702,7 @@ fn without_base_url_env(test: impl FnOnce()) {
     let saved = BASE_URL_ENV.map(|(_, name)| save_env(name));
     for (_, name) in BASE_URL_ENV {
         // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-        unsafe { env::remove_var(name) };
+        unsafe { std::env::remove_var(name) };
     }
     test();
     for (name, value) in saved {
@@ -1171,10 +1171,10 @@ fn without_ambient_logins(test: impl FnOnce()) {
     let isolation = save_env(ENV_TEST_ISOLATION);
     for name in LOGIN_ENV {
         // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-        unsafe { env::remove_var(name) };
+        unsafe { std::env::remove_var(name) };
     }
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var(ENV_TEST_ISOLATION, "1") };
+    unsafe { std::env::set_var(ENV_TEST_ISOLATION, "1") };
     test();
     for (name, value) in saved {
         restore_env(name, value);
@@ -1205,7 +1205,7 @@ fn credentials_offer_the_same_models_as_upstream() {
             let variables = input["env"].as_object().expect("env");
             for (variable, value) in variables {
                 // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-                unsafe { env::set_var(variable, value.as_str().expect("value")) };
+                unsafe { std::env::set_var(variable, value.as_str().expect("value")) };
             }
             let asked = input["providers"]
                 .as_array()
@@ -1230,7 +1230,7 @@ fn credentials_offer_the_same_models_as_upstream() {
             });
             for variable in variables.keys() {
                 // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-                unsafe { env::remove_var(variable) };
+                unsafe { std::env::remove_var(variable) };
             }
 
             let mut expected = case["expected"].clone();
@@ -1277,13 +1277,13 @@ fn a_chatgpt_login_serves_openai_codex_and_an_api_key_serves_openai() {
         // The login is not in the way of a key, in the environment or
         // stored beside it.
         // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-        unsafe { env::set_var("OPENAI_API_KEY", "env-key") };
+        unsafe { std::env::set_var("OPENAI_API_KEY", "env-key") };
         assert_eq!(
             auth_for_provider(&auth, "openai", None),
             Some(ResolvedAuth::ApiKey("env-key".to_string()))
         );
         // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-        unsafe { env::remove_var("OPENAI_API_KEY") };
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
         auth.insert("openai", "work", key("work-key"));
         assert_eq!(auth.account_for_resolution("openai"), Some("work"));
         assert_eq!(
@@ -1299,20 +1299,20 @@ fn a_chatgpt_login_serves_openai_codex_and_an_api_key_serves_openai() {
         // The Codex CLI's login token and its API key.
         let nothing = AuthData::default();
         // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-        unsafe { env::set_var("CODEX_ACCESS_TOKEN", "codex-token") };
+        unsafe { std::env::set_var("CODEX_ACCESS_TOKEN", "codex-token") };
         assert!(is_login(&nothing, "openai-codex"));
         assert!(!has_auth_for_provider(&nothing, "openai", None));
         // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-        unsafe { env::remove_var("CODEX_ACCESS_TOKEN") };
+        unsafe { std::env::remove_var("CODEX_ACCESS_TOKEN") };
         // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-        unsafe { env::set_var("CODEX_API_KEY", "codex-key") };
+        unsafe { std::env::set_var("CODEX_API_KEY", "codex-key") };
         assert_eq!(
             auth_for_provider(&nothing, "openai", None),
             Some(ResolvedAuth::ApiKey("codex-key".to_string()))
         );
         assert!(!has_auth_for_provider(&nothing, "openai-codex", None));
         // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-        unsafe { env::remove_var("CODEX_API_KEY") };
+        unsafe { std::env::remove_var("CODEX_API_KEY") };
     });
 }
 
@@ -1375,13 +1375,13 @@ fn auth_discovery_matches_upstream_ts_fixture() {
     ];
     for (name, _) in saved.iter() {
         // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-        unsafe { env::remove_var(name) };
+        unsafe { std::env::remove_var(name) };
     }
 
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("ANTHROPIC_OAUTH_TOKEN", "claude-oauth-env-token") };
+    unsafe { std::env::set_var("ANTHROPIC_OAUTH_TOKEN", "claude-oauth-env-token") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("ANTHROPIC_API_KEY", "anthropic-api-key") };
+    unsafe { std::env::set_var("ANTHROPIC_API_KEY", "anthropic-api-key") };
     assert_eq!(
         auth_for_provider(&AuthData::default(), "anthropic", None),
         Some(ResolvedAuth::ClaudeCodeOAuth {
@@ -1396,9 +1396,9 @@ fn auth_discovery_matches_upstream_ts_fixture() {
     );
 
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::remove_var("ANTHROPIC_OAUTH_TOKEN") };
+    unsafe { std::env::remove_var("ANTHROPIC_OAUTH_TOKEN") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::remove_var("ANTHROPIC_API_KEY") };
+    unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
     // Every environment case of the fixture, under upstream's provider
     // id: the variables it sets resolve to the credential it expects.
     let cases = fixture["env"].as_array().expect("env cases");
@@ -1408,7 +1408,7 @@ fn auth_discovery_matches_upstream_ts_fixture() {
         let variables = case["env"].as_object().expect("env");
         for (name, value) in variables {
             // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-            unsafe { env::set_var(name, value.as_str().expect("value")) };
+            unsafe { std::env::set_var(name, value.as_str().expect("value")) };
         }
         let token = match auth_for_provider(&AuthData::default(), provider, None) {
             Some(ResolvedAuth::ApiKey(key)) => Some(key),
@@ -1423,7 +1423,7 @@ fn auth_discovery_matches_upstream_ts_fixture() {
         );
         for name in variables.keys() {
             // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-            unsafe { env::remove_var(name) };
+            unsafe { std::env::remove_var(name) };
         }
     }
 
@@ -1529,7 +1529,7 @@ fn requested_account_wins_over_default_and_env() {
     let _guard = ENV_LOCK.lock().expect("lock env");
     let saved = save_env("OPENAI_API_KEY");
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("OPENAI_API_KEY", "env-key") };
+    unsafe { std::env::set_var("OPENAI_API_KEY", "env-key") };
 
     let mut auth = AuthData::default();
     auth.insert(
@@ -1586,7 +1586,7 @@ fn ambiguous_accounts_fall_through_to_env() {
     let _guard = ENV_LOCK.lock().expect("lock env");
     let saved = save_env("OPENAI_API_KEY");
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("OPENAI_API_KEY", "env-key") };
+    unsafe { std::env::set_var("OPENAI_API_KEY", "env-key") };
 
     let mut auth = AuthData::default();
     for account in ["personal", "work"] {
@@ -1612,7 +1612,7 @@ fn named_account_resolves_env_indirection() {
     let _guard = ENV_LOCK.lock().expect("lock env");
     let saved = save_env("WORK_OPENAI_KEY");
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("WORK_OPENAI_KEY", "indirected-key") };
+    unsafe { std::env::set_var("WORK_OPENAI_KEY", "indirected-key") };
 
     let mut auth = AuthData::default();
     auth.insert(
@@ -2074,59 +2074,59 @@ fn env_auth_detects_provider_parity_targets() {
     ];
 
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("AZURE_OPENAI_API_KEY", "azure-key") };
+    unsafe { std::env::set_var("AZURE_OPENAI_API_KEY", "azure-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("CEREBRAS_API_KEY", "cerebras-key") };
+    unsafe { std::env::set_var("CEREBRAS_API_KEY", "cerebras-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("COPILOT_GITHUB_TOKEN", "copilot-key") };
+    unsafe { std::env::set_var("COPILOT_GITHUB_TOKEN", "copilot-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("DEEPSEEK_API_KEY", "deepseek-key") };
+    unsafe { std::env::set_var("DEEPSEEK_API_KEY", "deepseek-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("FIREWORKS_API_KEY", "fireworks-key") };
+    unsafe { std::env::set_var("FIREWORKS_API_KEY", "fireworks-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("GROQ_API_KEY", "groq-key") };
+    unsafe { std::env::set_var("GROQ_API_KEY", "groq-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("HF_TOKEN", "hf-key") };
+    unsafe { std::env::set_var("HF_TOKEN", "hf-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("KIMI_API_KEY", "kimi-key") };
+    unsafe { std::env::set_var("KIMI_API_KEY", "kimi-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("MINIMAX_API_KEY", "minimax-key") };
+    unsafe { std::env::set_var("MINIMAX_API_KEY", "minimax-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("MINIMAX_CN_API_KEY", "minimax-cn-key") };
+    unsafe { std::env::set_var("MINIMAX_CN_API_KEY", "minimax-cn-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("MOONSHOT_API_KEY", "moonshot-key") };
+    unsafe { std::env::set_var("MOONSHOT_API_KEY", "moonshot-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("OPENCODE_API_KEY", "opencode-key") };
+    unsafe { std::env::set_var("OPENCODE_API_KEY", "opencode-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("OPENROUTER_API_KEY", "openrouter-key") };
+    unsafe { std::env::set_var("OPENROUTER_API_KEY", "openrouter-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("GOOGLE_CLOUD_API_KEY", "vertex-key") };
+    unsafe { std::env::set_var("GOOGLE_CLOUD_API_KEY", "vertex-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("AWS_BEARER_TOKEN_BEDROCK", "bedrock-token") };
+    unsafe { std::env::set_var("AWS_BEARER_TOKEN_BEDROCK", "bedrock-token") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("MISTRAL_API_KEY", "mistral-key") };
+    unsafe { std::env::set_var("MISTRAL_API_KEY", "mistral-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("CLOUDFLARE_API_KEY", "cloudflare-key") };
+    unsafe { std::env::set_var("CLOUDFLARE_API_KEY", "cloudflare-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("TOGETHER_API_KEY", "together-key") };
+    unsafe { std::env::set_var("TOGETHER_API_KEY", "together-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("AI_GATEWAY_API_KEY", "vercel-key") };
+    unsafe { std::env::set_var("AI_GATEWAY_API_KEY", "vercel-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("XAI_API_KEY", "xai-key") };
+    unsafe { std::env::set_var("XAI_API_KEY", "xai-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("XIAOMI_API_KEY", "xiaomi-key") };
+    unsafe { std::env::set_var("XIAOMI_API_KEY", "xiaomi-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("XIAOMI_TOKEN_PLAN_AMS_API_KEY", "xiaomi-ams-key") };
+    unsafe { std::env::set_var("XIAOMI_TOKEN_PLAN_AMS_API_KEY", "xiaomi-ams-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("XIAOMI_TOKEN_PLAN_CN_API_KEY", "xiaomi-cn-key") };
+    unsafe { std::env::set_var("XIAOMI_TOKEN_PLAN_CN_API_KEY", "xiaomi-cn-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("XIAOMI_TOKEN_PLAN_SGP_API_KEY", "xiaomi-sgp-key") };
+    unsafe { std::env::set_var("XIAOMI_TOKEN_PLAN_SGP_API_KEY", "xiaomi-sgp-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("ZAI_API_KEY", "zai-key") };
+    unsafe { std::env::set_var("ZAI_API_KEY", "zai-key") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("CODEX_ACCESS_TOKEN", "codex-token") };
+    unsafe { std::env::set_var("CODEX_ACCESS_TOKEN", "codex-token") };
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("CHATGPT_ACCOUNT_ID", "account-id") };
+    unsafe { std::env::set_var("CHATGPT_ACCOUNT_ID", "account-id") };
 
     assert_eq!(
         resolve("azure"),
@@ -2398,7 +2398,7 @@ fn stored_oauth_threads_refresh_metadata_with_env_indirection() {
     let _guard = ENV_LOCK.lock().expect("lock env");
     let saved = save_env("CODEX_REFRESH_TOKEN");
     // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-    unsafe { env::set_var("CODEX_REFRESH_TOKEN", "indirected-refresh") };
+    unsafe { std::env::set_var("CODEX_REFRESH_TOKEN", "indirected-refresh") };
 
     let mut auth = AuthData::default();
     auth.insert(
@@ -2955,14 +2955,14 @@ fn unique_suffix() -> u128 {
 }
 
 fn save_env(name: &'static str) -> (&'static str, Option<String>) {
-    (name, env::var(name).ok())
+    (name, std::env::var(name).ok())
 }
 
 fn restore_env(name: &str, value: Option<String>) {
     match value {
         // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-        Some(value) => unsafe { env::set_var(name, value) },
+        Some(value) => unsafe { std::env::set_var(name, value) },
         // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
-        None => unsafe { env::remove_var(name) },
+        None => unsafe { std::env::remove_var(name) },
     }
 }
