@@ -204,6 +204,34 @@ impl Run {
             closed: false,
         }
     }
+
+    // The run's transitions, the same live and on replay (#130). `closed`
+    // means only "a close stopped this run": a resume or an end clears it,
+    // so a later stop is classified by what happens then.
+
+    /// A close stopped the run: its next resume is not a restart.
+    fn close(&mut self) {
+        self.closed = true;
+    }
+
+    /// The run continues after a stop that was not a close: a restart.
+    fn restart(&mut self) -> u32 {
+        self.closed = false;
+        self.restarts += 1;
+        self.restarts
+    }
+
+    /// The run continues after a close: no restart, but it is open again.
+    fn reopen(&mut self) {
+        self.closed = false;
+    }
+
+    /// The run ended; only a failed run keeps a reason.
+    fn finish(&mut self, status: RunStatus, failure: Option<RunFailure>) {
+        self.status = status;
+        self.closed = false;
+        self.failure = failure.filter(|_| status == RunStatus::Failed);
+    }
 }
 
 /// Why a run ended without an answer, as Durable's `pi.live.runFailure`
@@ -533,12 +561,6 @@ impl SessionState {
             .iter()
             .rev()
             .find(|run| run.request_id.as_deref() == Some(request_id))
-    }
-
-    fn set_run_status(&mut self, run_id: &str, status: RunStatus) {
-        if let Some(run) = self.run_mut(run_id) {
-            run.status = status;
-        }
     }
 
     fn run_mut(&mut self, run_id: &str) -> Option<&mut Run> {
@@ -1322,6 +1344,11 @@ enum SessionRecord {
     },
     /// The run resumed after a stop that was not a close (a crash).
     RunRestarted {
+        run_id: String,
+    },
+    /// The run resumed after a close: no restart, and a later stop is no
+    /// longer that close.
+    RunReopened {
         run_id: String,
     },
     /// A reply's request failed and the turn waits out a retry's backoff
@@ -2426,13 +2453,17 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
         }
         SessionRecord::RunClosed { run_id } => {
             if let Some(run) = state.run_mut(&run_id) {
-                run.closed = true;
+                run.close();
             }
         }
         SessionRecord::RunRestarted { run_id } => {
             if let Some(run) = state.run_mut(&run_id) {
-                run.closed = false;
-                run.restarts += 1;
+                run.restart();
+            }
+        }
+        SessionRecord::RunReopened { run_id } => {
+            if let Some(run) = state.run_mut(&run_id) {
+                run.reopen();
             }
         }
         SessionRecord::RunFinished {
@@ -2440,9 +2471,8 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
             status,
             failure,
         } => {
-            state.set_run_status(&run_id, status);
             if let Some(run) = state.run_mut(&run_id) {
-                run.failure = failure;
+                run.finish(status, failure);
             }
             // The run settled what it left running.
             state.partial = None;
@@ -3638,10 +3668,23 @@ impl Runtime {
         Ok(())
     }
 
-    /// This process continues the interrupted run `run_id`. Nothing is
-    /// saved: if this process stops too, the run is interrupted again.
-    pub fn resume_run(&mut self, run_id: &str) {
-        self.session.set_run_status(run_id, RunStatus::Running);
+    /// This process continues the interrupted run `run_id`; if this
+    /// process stops too, the run is interrupted again. A run a close
+    /// stopped is saved as open again, so that stop is a crash (#130).
+    pub fn resume_run(&mut self, run_id: &str) -> Result<(), SessionError> {
+        let Some(run) = self.session.run_mut(run_id) else {
+            return Ok(());
+        };
+        run.status = RunStatus::Running;
+        if run.closed {
+            run.reopen();
+            if let Some(store) = &self.store {
+                store.append(&SessionRecord::RunReopened {
+                    run_id: run_id.to_owned(),
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Records how run `run_id` ended. The status changes even if saving
@@ -3657,9 +3700,8 @@ impl Runtime {
         status: RunStatus,
         failure: Option<RunFailure>,
     ) -> Result<(), SessionError> {
-        self.session.set_run_status(run_id, status);
         if let Some(run) = self.session.run_mut(run_id) {
-            run.failure = failure.clone();
+            run.finish(status, failure.clone());
         }
         self.session.partial = None;
         self.session.tool_outputs.clear();
@@ -3697,7 +3739,7 @@ impl Runtime {
     /// A close stops run `run_id`: its next resume is not a restart.
     pub fn close_run(&mut self, run_id: &str) -> Result<(), SessionError> {
         if let Some(run) = self.session.run_mut(run_id) {
-            run.closed = true;
+            run.close();
         }
         if let Some(store) = &self.store {
             store.append(&SessionRecord::RunClosed {
@@ -3714,15 +3756,7 @@ impl Runtime {
                 run_id: run_id.to_owned(),
             })?;
         }
-        Ok(self
-            .session
-            .run_mut(run_id)
-            .map(|run| {
-                run.closed = false;
-                run.restarts += 1;
-                run.restarts
-            })
-            .unwrap_or(0))
+        Ok(self.session.run_mut(run_id).map(Run::restart).unwrap_or(0))
     }
 
     /// Turns automatic retries on or off for this runtime's turns; the
