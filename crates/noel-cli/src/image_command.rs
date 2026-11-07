@@ -295,9 +295,7 @@ pub(crate) async fn try_run_package_command() -> Result<bool> {
         }
         "auth" => {
             let status = auth_command::run(&args[1..]).await;
-            if status != 0 {
-                std::process::exit(status);
-            }
+            crate::exit_with(status)?;
             Ok(true)
         }
         // Upstream's MCP server manager; refuse instead of prompting the model.

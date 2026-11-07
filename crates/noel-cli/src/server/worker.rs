@@ -105,7 +105,7 @@ impl<E: std::fmt::Display> From<E> for Fatal {
 
 pub(crate) async fn run(args: WorkerArgs) -> i32 {
     match start(args).await {
-        Ok(never) => match never {},
+        Ok(code) => code,
         Err(fatal) => {
             let mut message = json!({"type": "fatal", "message": fatal.message});
             if let Some(reason) = fatal.reason {
@@ -120,9 +120,8 @@ pub(crate) async fn run(args: WorkerArgs) -> i32 {
     }
 }
 
-enum Never {}
-
-async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
+/// Serves the session until the supervisor ends the worker: its exit code.
+async fn start(args: WorkerArgs) -> Result<i32, Fatal> {
     let session_id = args.session.clone();
     if !valid_session_id(&session_id) {
         return Err(Fatal::new(format!("invalid session id {session_id:?}")));
@@ -292,20 +291,24 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
         args.generation,
         std::process::id()
     );
-    tokio::spawn(supervise(Supervision {
+    let supervisor = supervise(Supervision {
         status,
         parent,
         idle_limit,
         host,
         files: Files { socket, record },
         view: clients,
-    }));
-    drive(controller, inbox, args.resume).await;
-    // The controller only stops when every command sender is gone, which
-    // the served object keeps alive: wait for the supervisor to exit.
-    loop {
-        std::future::pending::<()>().await;
-    }
+    });
+    tokio::pin!(supervisor);
+    // The supervisor decides when the worker ends (#179): it returns the
+    // exit code, and the session loop is dropped here, its controller and
+    // journal with it, before `main` returns. The loop itself only ends
+    // when every command sender is gone, which the served object keeps
+    // alive: then the supervisor still decides.
+    Ok(tokio::select! {
+        code = &mut supervisor => code,
+        () = drive(controller, inbox, args.resume) => supervisor.await,
+    })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -662,7 +665,8 @@ struct Supervision {
 
 /// Reports status to the parent, and ends the worker: idle for the limit,
 /// asked to shut down with no run active, or by a signal.
-async fn supervise(supervision: Supervision) {
+/// Watches the worker until it should end; the exit code.
+async fn supervise(supervision: Supervision) -> i32 {
     use tokio::signal::unix::{signal, SignalKind};
     let Supervision {
         status,
@@ -690,7 +694,7 @@ async fn supervise(supervision: Supervision) {
             noel_core::kill_running_tool_groups();
             files.remove();
             host.close().await;
-            std::process::exit(128 + signal);
+            return 128 + signal;
         }
         let now = status.get();
         lock(&view).set_clients(now.holds);
@@ -710,7 +714,7 @@ async fn supervise(supervision: Supervision) {
             }
             files.remove();
             host.close().await;
-            std::process::exit(0);
+            return 0;
         }
     }
 }
