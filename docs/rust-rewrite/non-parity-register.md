@@ -862,6 +862,26 @@ parts differ:
 Reason: the remaining differences are either invisible to the model or need a
 dependency (Unicode normalization) for a rare case.
 
+### Provider Stream Endings
+
+A reply's stream ends as upstream ends it (#135). Anthropic needs
+`message_stop`, Responses a terminal event, chat completions a
+`finish_reason` and Gemini a finish reason. A stream that ends without one
+fails with upstream's message, which its retry patterns know.
+
+These parts differ:
+- **No opt-out.** Upstream's `compat.supportsFinishReason: false` lets a
+  model's chat stream end without a finish reason. noel has no per-model
+  compat flags, so such a server's replies fail.
+- **Raw stop reasons.** `StreamEvent::Stop` carries the provider's raw stop
+  reason, as upstream's `rawStopReason` does: `incomplete.max_output_tokens`
+  for an incomplete Responses reply, Gemini's `MAX_TOKENS`.
+  `is_output_limit_stop` reads them, instead of upstream mapping each to
+  its own stop reason.
+
+Reason: the raw reason is what noel's RPC mode reports as `rawStopReason`,
+and one string per event keeps the wire as upstream records it.
+
 ### No Session Affinity or Prompt Cache Keys on OpenAI-Style Requests
 
 Upstream passes the session id to its providers: OpenAI Responses sends it as
