@@ -21,10 +21,7 @@ impl Provider for AnthropicProvider {
             .send()
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
-        if let Some(mut events) = parse_anthropic_sse_events(&body) {
-            events.push(StreamEvent::Stop {
-                reason: "stop".to_string(),
-            });
+        if let Some(events) = parse_sse_body::<AnthropicSseParser>(&body)? {
             return Ok(events);
         }
         let response = serde_json::from_str::<Value>(&body)
@@ -55,17 +52,11 @@ impl Provider for AnthropicProvider {
             .send()
             .await?;
         let response = error_for_status_with_body(response).await?;
-        let mut parser = AnthropicSseParser::default();
-        let stream =
-            stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
-        if stream.saw_data {
-            on_event(StreamEvent::Stop {
-                reason: parser.stop_reason.unwrap_or_else(|| "stop".to_string()),
-            })?;
+        let Some(body) = stream_sse::<AnthropicSseParser>(response, on_event).await? else {
             return Ok(());
-        }
-        let response = serde_json::from_str::<Value>(&stream.body)
-            .map_err(|_| ProviderError::InvalidResponse(stream.body.clone()))?;
+        };
+        let response = serde_json::from_str::<Value>(&body)
+            .map_err(|_| ProviderError::InvalidResponse(body.clone()))?;
         let events = parse_anthropic_response_events(&response)
             .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
         emit_events(events, on_event)?;
@@ -395,10 +386,27 @@ pub(crate) struct AnthropicSseParser {
     pub(crate) output_tokens: u64,
     pub(crate) pending_tool_calls: BTreeMap<u64, PendingAnthropicToolCall>,
     pub(crate) stop_reason: Option<String>,
+    /// `message_stop` arrived: the stream ended as Anthropic ends one.
+    pub(crate) stopped: bool,
 }
 
-impl AnthropicSseParser {
-    pub(crate) fn parse_data(
+impl SseParser for AnthropicSseParser {
+    fn finish(
+        self,
+        _on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<String, ProviderError> {
+        // Upstream's words, which its retry patterns know.
+        if !self.stopped {
+            return Err(ProviderError::InvalidResponse(
+                "Anthropic stream ended before message_stop".into(),
+            ));
+        }
+        self.stop_reason.ok_or_else(|| {
+            ProviderError::InvalidResponse("Anthropic stream ended without a stop reason".into())
+        })
+    }
+
+    fn parse_data(
         &mut self,
         data: &str,
         on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
@@ -431,6 +439,10 @@ impl AnthropicSseParser {
             self.stop_reason = Some(reason.into());
         }
         match event.get("type").and_then(Value::as_str) {
+            // A provider error mid-stream (overloaded, for one) fails the
+            // reply with its own text, as upstream throws it.
+            Some("error") => return Err(ProviderError::InvalidResponse(data.to_string())),
+            Some("message_stop") => self.stopped = true,
             Some("content_block_start") => {
                 let Some(index) = event.get("index").and_then(Value::as_u64) else {
                     return Ok(());
@@ -448,11 +460,13 @@ impl AnthropicSseParser {
                     }
                 }
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    let Some(id) = block.get("id").and_then(Value::as_str) else {
-                        return Ok(());
-                    };
-                    let Some(name) = block.get("name").and_then(Value::as_str) else {
-                        return Ok(());
+                    let (Some(id), Some(name)) = (
+                        block.get("id").and_then(Value::as_str),
+                        block.get("name").and_then(Value::as_str),
+                    ) else {
+                        return Err(ProviderError::InvalidResponse(format!(
+                            "Anthropic tool_use block without an id or a name: {block}"
+                        )));
                     };
                     let arguments = block
                         .get("input")
@@ -526,26 +540,6 @@ impl AnthropicSseParser {
             _ => {}
         }
         Ok(())
-    }
-}
-
-pub(crate) fn parse_anthropic_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
-    let mut events = Vec::new();
-    let mut parser = AnthropicSseParser::default();
-    for line in body.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            parser
-                .parse_data(data, &mut |event| {
-                    events.push(event);
-                    Ok(())
-                })
-                .ok()?;
-        }
-    }
-    if events.is_empty() {
-        None
-    } else {
-        Some(events)
     }
 }
 

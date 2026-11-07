@@ -41,10 +41,7 @@ impl Provider for MistralProvider {
             .send()
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
-        if let Some(mut events) = parse_openai_chat_completions_sse_events(&body) {
-            events.push(StreamEvent::Stop {
-                reason: "stop".to_string(),
-            });
+        if let Some(events) = parse_sse_body::<OpenAiChatCompletionsSseParser>(&body)? {
             return Ok(events);
         }
         let response = serde_json::from_str::<Value>(&body)
@@ -76,20 +73,12 @@ impl Provider for MistralProvider {
             .send()
             .await?;
         let response = error_for_status_with_body(response).await?;
-        let mut parser = OpenAiChatCompletionsSseParser::default();
-        let stream =
-            stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
-        if stream.saw_data {
-            let reason = parser
-                .stop_reason
-                .clone()
-                .unwrap_or_else(|| "stop".to_string());
-            parser.finish(on_event)?;
-            on_event(StreamEvent::Stop { reason })?;
+        let Some(body) = stream_sse::<OpenAiChatCompletionsSseParser>(response, on_event).await?
+        else {
             return Ok(());
-        }
-        let response = serde_json::from_str::<Value>(&stream.body)
-            .map_err(|_| ProviderError::InvalidResponse(stream.body.clone()))?;
+        };
+        let response = serde_json::from_str::<Value>(&body)
+            .map_err(|_| ProviderError::InvalidResponse(body.clone()))?;
         let events = parse_openai_chat_completions_events(&response)
             .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
         emit_events(events, on_event)?;

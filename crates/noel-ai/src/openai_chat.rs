@@ -31,10 +31,7 @@ impl Provider for OpenAiProvider {
             .send()
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
-        if let Some(mut events) = parse_openai_chat_completions_sse_events(&body) {
-            events.push(StreamEvent::Stop {
-                reason: "stop".to_string(),
-            });
+        if let Some(events) = parse_sse_body::<OpenAiChatCompletionsSseParser>(&body)? {
             return Ok(events);
         }
         let response = serde_json::from_str::<Value>(&body)
@@ -78,20 +75,12 @@ impl Provider for OpenAiProvider {
             .send()
             .await?;
         let response = error_for_status_with_body(response).await?;
-        let mut parser = OpenAiChatCompletionsSseParser::default();
-        let stream =
-            stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
-        if stream.saw_data {
-            let reason = parser
-                .stop_reason
-                .clone()
-                .unwrap_or_else(|| "stop".to_string());
-            parser.finish(on_event)?;
-            on_event(StreamEvent::Stop { reason })?;
+        let Some(body) = stream_sse::<OpenAiChatCompletionsSseParser>(response, on_event).await?
+        else {
             return Ok(());
-        }
-        let response = serde_json::from_str::<Value>(&stream.body)
-            .map_err(|_| ProviderError::InvalidResponse(stream.body.clone()))?;
+        };
+        let response = serde_json::from_str::<Value>(&body)
+            .map_err(|_| ProviderError::InvalidResponse(body.clone()))?;
         let events = parse_openai_chat_completions_events(&response)
             .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
         emit_events(events, on_event)?;
@@ -126,17 +115,10 @@ impl OpenAiProvider {
             .send()
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
-        let mut events = parse_openai_responses_sse_events(&body)
-            .or_else(|| {
-                serde_json::from_str::<Value>(&body)
-                    .ok()
-                    .and_then(|response| parse_openai_responses_events(&response))
-            })
-            .ok_or_else(|| ProviderError::InvalidResponse(body.clone()))?;
-        events.push(StreamEvent::Stop {
-            reason: "completed".to_string(),
-        });
-        Ok(events)
+        if let Some(events) = parse_sse_body::<OpenAiResponsesSseParser>(&body)? {
+            return Ok(events);
+        }
+        openai_responses_json_events(&body)
     }
 
     pub(crate) async fn complete_with_chatgpt_streaming(
@@ -160,23 +142,10 @@ impl OpenAiProvider {
             .send()
             .await?;
         let response = error_for_status_with_body(response).await?;
-        let mut parser = OpenAiResponsesSseParser::default();
-        let stream =
-            stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
-        if stream.saw_data {
-            on_event(StreamEvent::Stop {
-                reason: "completed".to_string(),
-            })?;
+        let Some(body) = stream_sse::<OpenAiResponsesSseParser>(response, on_event).await? else {
             return Ok(());
-        }
-        let events = serde_json::from_str::<Value>(&stream.body)
-            .ok()
-            .and_then(|response| parse_openai_responses_events(&response))
-            .ok_or_else(|| ProviderError::InvalidResponse(stream.body.clone()))?;
-        emit_events(events, on_event)?;
-        on_event(StreamEvent::Stop {
-            reason: "completed".to_string(),
-        })
+        };
+        emit_events(openai_responses_json_events(&body)?, on_event)
     }
 
     pub(crate) fn api_key(&self) -> Result<String, ProviderError> {
@@ -482,8 +451,25 @@ pub(crate) struct OpenAiChatCompletionsSseParser {
     pub(crate) stop_reason: Option<String>,
 }
 
-impl OpenAiChatCompletionsSseParser {
-    pub(crate) fn parse_data(
+/// A chat completion's finish reason as noel's raw stop reason, or the
+/// error upstream makes of it (`mapStopReason` in openai-completions.ts):
+/// a content filter or a provider error is a failed reply, not a stop.
+pub(crate) fn chat_finish_reason(reason: Option<&str>) -> Result<String, ProviderError> {
+    match reason {
+        None => Err(ProviderError::InvalidResponse(
+            "Stream ended without finish_reason".into(),
+        )),
+        Some(
+            reason @ ("stop" | "end" | "length" | "tool_calls" | "function_call" | "model_length"),
+        ) => Ok(reason.to_owned()),
+        Some(reason) => Err(ProviderError::InvalidResponse(format!(
+            "Provider finish_reason: {reason}"
+        ))),
+    }
+}
+
+impl SseParser for OpenAiChatCompletionsSseParser {
+    fn parse_data(
         &mut self,
         data: &str,
         on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
@@ -530,10 +516,11 @@ impl OpenAiChatCompletionsSseParser {
         Ok(())
     }
 
-    pub(crate) fn finish(
+    fn finish(
         self,
         on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
-    ) -> Result<(), ProviderError> {
+    ) -> Result<String, ProviderError> {
+        let reason = chat_finish_reason(self.stop_reason.as_deref())?;
         for (id, name, arguments) in self.tool_calls {
             if id.is_empty() || name.is_empty() {
                 continue;
@@ -544,65 +531,7 @@ impl OpenAiChatCompletionsSseParser {
                 arguments,
             })?;
         }
-        Ok(())
-    }
-}
-
-pub(crate) fn parse_openai_chat_completions_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
-    let mut events = Vec::new();
-    let mut tool_calls: Vec<(String, String, String)> = Vec::new();
-    for line in body.lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        if data == "[DONE]" {
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        if let Some(usage) = response_usage(&event) {
-            events.push(usage);
-        }
-        let Some(delta) = event.pointer("/choices/0/delta") else {
-            continue;
-        };
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            events.push(StreamEvent::Text(text.to_string()));
-        }
-        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-            for call in calls {
-                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                while tool_calls.len() <= index {
-                    tool_calls.push((String::new(), String::new(), String::new()));
-                }
-                if let Some(id) = call.get("id").and_then(Value::as_str) {
-                    tool_calls[index].0.push_str(id);
-                }
-                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
-                    tool_calls[index].1.push_str(name);
-                }
-                if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
-                {
-                    tool_calls[index].2.push_str(arguments);
-                }
-            }
-        }
-    }
-    events.extend(tool_calls.into_iter().filter_map(|(id, name, arguments)| {
-        if id.is_empty() || name.is_empty() {
-            return None;
-        }
-        Some(StreamEvent::ToolCall {
-            id,
-            name,
-            arguments,
-        })
-    }));
-    if events.is_empty() {
-        None
-    } else {
-        Some(events)
+        Ok(reason)
     }
 }
 

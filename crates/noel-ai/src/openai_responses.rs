@@ -198,17 +198,10 @@ impl Provider for OpenAiResponsesProvider {
             .send()
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
-        let mut events = parse_openai_responses_sse_events(&body)
-            .or_else(|| {
-                serde_json::from_str::<Value>(&body)
-                    .ok()
-                    .and_then(|response| parse_openai_responses_events(&response))
-            })
-            .ok_or_else(|| ProviderError::InvalidResponse(body.clone()))?;
-        events.push(StreamEvent::Stop {
-            reason: "completed".to_string(),
-        });
-        Ok(events)
+        if let Some(events) = parse_sse_body::<OpenAiResponsesSseParser>(&body)? {
+            return Ok(events);
+        }
+        openai_responses_json_events(&body)
     }
 
     async fn complete_streaming(
@@ -229,23 +222,10 @@ impl Provider for OpenAiResponsesProvider {
             .send()
             .await?;
         let response = error_for_status_with_body(response).await?;
-        let mut parser = OpenAiResponsesSseParser::default();
-        let stream =
-            stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
-        if stream.saw_data {
-            on_event(StreamEvent::Stop {
-                reason: "completed".to_string(),
-            })?;
+        let Some(body) = stream_sse::<OpenAiResponsesSseParser>(response, on_event).await? else {
             return Ok(());
-        }
-        let events = serde_json::from_str::<Value>(&stream.body)
-            .ok()
-            .and_then(|response| parse_openai_responses_events(&response))
-            .ok_or_else(|| ProviderError::InvalidResponse(stream.body.clone()))?;
-        emit_events(events, on_event)?;
-        on_event(StreamEvent::Stop {
-            reason: "completed".to_string(),
-        })
+        };
+        emit_events(openai_responses_json_events(&body)?, on_event)
     }
 }
 
@@ -584,11 +564,62 @@ pub(crate) fn normalize_openai_responses_id_part(id: &str) -> String {
     normalized
 }
 
+/// A response's end as noel's raw stop reason (upstream's `rawStopReason`,
+/// `status` or `status.reason`), or the error upstream makes of it: an
+/// incomplete response is an output limit only for `max_output_tokens`.
+pub(crate) fn responses_terminal(response: &Value) -> Result<String, ProviderError> {
+    let reason = response
+        .pointer("/incomplete_details/reason")
+        .and_then(Value::as_str);
+    match response.get("status").and_then(Value::as_str) {
+        None | Some("completed") => Ok("completed".to_owned()),
+        Some("incomplete") => match reason {
+            Some("max_output_tokens") => Ok("incomplete.max_output_tokens".to_owned()),
+            Some(reason) => Err(ProviderError::InvalidResponse(format!(
+                "Response incomplete: {reason}"
+            ))),
+            None => Err(ProviderError::InvalidResponse(
+                "Response incomplete without a provider reason".into(),
+            )),
+        },
+        Some(_) => {
+            let error = response.get("error").filter(|error| !error.is_null());
+            Err(ProviderError::InvalidResponse(match (error, reason) {
+                (Some(error), _) => format!(
+                    "{}: {}",
+                    error
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown"),
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("no message")
+                ),
+                (None, Some(reason)) => format!("incomplete: {reason}"),
+                (None, None) => "Unknown error (no error details in response)".to_owned(),
+            }))
+        }
+    }
+}
+
+/// A plain JSON Responses answer: its events, then its `Stop`.
+pub(crate) fn openai_responses_json_events(body: &str) -> Result<Vec<StreamEvent>, ProviderError> {
+    let response = serde_json::from_str::<Value>(body)
+        .map_err(|_| ProviderError::InvalidResponse(body.to_owned()))?;
+    let reason = responses_terminal(&response)?;
+    let mut events = parse_openai_responses_events(&response)
+        .ok_or_else(|| ProviderError::InvalidResponse(body.to_owned()))?;
+    events.push(StreamEvent::Stop { reason });
+    Ok(events)
+}
+
 pub(crate) fn parse_openai_responses_events(response: &Value) -> Option<Vec<StreamEvent>> {
     if matches!(
         response.get("status").and_then(Value::as_str),
         Some("incomplete" | "failed" | "cancelled")
-    ) {
+    ) && responses_terminal(response).is_err()
+    {
         return None;
     }
     let mut events = Vec::new();
@@ -624,10 +655,23 @@ pub(crate) fn parse_openai_responses_events(response: &Value) -> Option<Vec<Stre
 #[derive(Default)]
 pub(crate) struct OpenAiResponsesSseParser {
     pub(crate) saw_text_delta: bool,
+    /// The raw stop reason of the terminal event, once it arrived.
+    pub(crate) terminal: Option<String>,
 }
 
-impl OpenAiResponsesSseParser {
-    pub(crate) fn parse_data(
+impl SseParser for OpenAiResponsesSseParser {
+    fn finish(
+        self,
+        _on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<String, ProviderError> {
+        self.terminal.ok_or_else(|| {
+            ProviderError::InvalidResponse(
+                "OpenAI Responses stream ended before a terminal response event".into(),
+            )
+        })
+    }
+
+    fn parse_data(
         &mut self,
         data: &str,
         on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
@@ -635,18 +679,43 @@ impl OpenAiResponsesSseParser {
         let Ok(event) = serde_json::from_str::<Value>(data) else {
             return Ok(());
         };
-        if matches!(
-            event.get("type").and_then(Value::as_str),
-            Some("response.incomplete" | "response.failed" | "error")
-        ) {
-            return Err(ProviderError::InvalidResponse(format!(
-                "incomplete provider response: {event}"
-            )));
-        }
-        if event.get("type").and_then(Value::as_str) == Some("response.completed") {
-            if let Some(usage) = event.get("response").and_then(response_usage) {
-                on_event(usage)?;
+        match event.get("type").and_then(Value::as_str) {
+            Some("error") => {
+                return Err(ProviderError::InvalidResponse(format!(
+                    "Error Code {}: {}",
+                    event
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown"),
+                    event
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Unknown error")
+                )))
             }
+            Some("response.completed" | "response.incomplete" | "response.failed") => {
+                let response = event.get("response").unwrap_or(&Value::Null);
+                let mut response = response.clone();
+                if response.get("status").is_none() {
+                    // The event's type names the end when its response does not.
+                    let status = match event.get("type").and_then(Value::as_str) {
+                        Some("response.incomplete") => "incomplete",
+                        Some("response.failed") => "failed",
+                        _ => "completed",
+                    };
+                    if let Some(object) = response.as_object_mut() {
+                        object.insert("status".into(), Value::from(status));
+                    } else {
+                        response = serde_json::json!({ "status": status });
+                    }
+                }
+                self.terminal = Some(responses_terminal(&response)?);
+                if let Some(usage) = response_usage(&response) {
+                    on_event(usage)?;
+                }
+                return Ok(());
+            }
+            _ => {}
         }
         match event.get("type").and_then(Value::as_str) {
             Some("response.reasoning_summary_text.delta")
@@ -682,59 +751,6 @@ impl OpenAiResponsesSseParser {
             _ => {}
         }
         Ok(())
-    }
-}
-
-pub(crate) fn parse_openai_responses_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
-    let mut events = Vec::new();
-    for line in body.lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        if data == "[DONE]" {
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        if event.get("type").and_then(Value::as_str) == Some("response.completed") {
-            if let Some(usage) = event.get("response").and_then(response_usage) {
-                events.push(usage);
-            }
-        }
-        match event.get("type").and_then(Value::as_str) {
-            Some("response.reasoning_summary_text.delta")
-            | Some("response.reasoning_text.delta") => {
-                if let Some(delta) = event
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
-                {
-                    events.push(StreamEvent::Thinking(delta.to_string()));
-                }
-            }
-            Some("response.output_text.delta") | Some("output_text.delta") => {
-                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    events.push(StreamEvent::Text(delta.to_string()));
-                }
-            }
-            Some("response.output_item.done") | Some("output_item.done") => {
-                if let Some(item) = event.get("item") {
-                    if let Some(text) = parse_openai_responses_item_text(item) {
-                        events.push(StreamEvent::Text(text));
-                    }
-                    if let Some(tool_call) = parse_openai_responses_function_call(item) {
-                        events.push(tool_call);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if events.is_empty() {
-        None
-    } else {
-        Some(events)
     }
 }
 

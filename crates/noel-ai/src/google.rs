@@ -20,10 +20,7 @@ impl Provider for GoogleProvider {
             .send()
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
-        if let Some(mut events) = parse_google_sse_events(&body) {
-            events.push(StreamEvent::Stop {
-                reason: "STOP".to_string(),
-            });
+        if let Some(events) = parse_sse_body::<GoogleSseParser>(&body)? {
             return Ok(events);
         }
         parse_google_response(
@@ -46,17 +43,12 @@ impl Provider for GoogleProvider {
             .send()
             .await?;
         let response = error_for_status_with_body(response).await?;
-        let stream =
-            stream_sse_response(response, |data| parse_google_sse_data(data, on_event)).await?;
-        if stream.saw_data {
-            on_event(StreamEvent::Stop {
-                reason: "STOP".to_string(),
-            })?;
+        let Some(body) = stream_sse::<GoogleSseParser>(response, on_event).await? else {
             return Ok(());
-        }
+        };
         let events = parse_google_response(
-            serde_json::from_str::<Value>(&stream.body)
-                .map_err(|_| ProviderError::InvalidResponse(stream.body.clone()))?,
+            serde_json::from_str::<Value>(&body)
+                .map_err(|_| ProviderError::InvalidResponse(body.clone()))?,
         )?;
         emit_events(events, on_event)
     }
@@ -210,16 +202,71 @@ impl GoogleVertexProvider {
 }
 
 pub(crate) fn parse_google_response(response: Value) -> Result<Vec<StreamEvent>, ProviderError> {
+    let reason = google_finish_reason(
+        response
+            .pointer("/candidates/0/finishReason")
+            .and_then(Value::as_str),
+        "Google response has no finish reason",
+    )?;
     let mut events = parse_google_response_events(&response)
         .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
-    events.push(StreamEvent::Stop {
-        reason: response
+    events.push(StreamEvent::Stop { reason });
+    Ok(events)
+}
+
+/// A Gemini finish reason as noel's raw stop reason, or the error upstream
+/// makes of it (`mapStopReason` in google-shared.ts): only `STOP` and
+/// `MAX_TOKENS` end a reply; safety, recitation and the rest fail it.
+pub(crate) fn google_finish_reason(
+    reason: Option<&str>,
+    missing: &str,
+) -> Result<String, ProviderError> {
+    match reason {
+        None => Err(ProviderError::InvalidResponse(missing.to_owned())),
+        Some(reason @ ("STOP" | "MAX_TOKENS")) => Ok(reason.to_owned()),
+        Some(reason) => Err(ProviderError::InvalidResponse(format!(
+            "Provider stopped with: {reason}"
+        ))),
+    }
+}
+
+/// Gemini's stream: each event is a whole response chunk; the last carries
+/// the finish reason.
+#[derive(Default)]
+pub(crate) struct GoogleSseParser {
+    pub(crate) finish_reason: Option<String>,
+}
+
+impl SseParser for GoogleSseParser {
+    fn parse_data(
+        &mut self,
+        data: &str,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        let Ok(response) = serde_json::from_str::<Value>(data) else {
+            return Ok(());
+        };
+        if let Some(events) = parse_google_response_events(&response) {
+            emit_events(events, on_event)?;
+        }
+        if let Some(reason) = response
             .pointer("/candidates/0/finishReason")
             .and_then(Value::as_str)
-            .unwrap_or("STOP")
-            .to_string(),
-    });
-    Ok(events)
+        {
+            self.finish_reason = Some(reason.to_owned());
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        _on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<String, ProviderError> {
+        google_finish_reason(
+            self.finish_reason.as_deref(),
+            "Google stream ended without a finish reason",
+        )
+    }
 }
 
 pub(crate) fn parse_google_response_events(response: &Value) -> Option<Vec<StreamEvent>> {
@@ -236,45 +283,6 @@ pub(crate) fn parse_google_response_events(response: &Value) -> Option<Vec<Strea
     } else {
         Some(events)
     }
-}
-
-pub(crate) fn parse_google_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
-    let mut events = Vec::new();
-    for line in body.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            if let Ok(response) = serde_json::from_str::<Value>(data) {
-                if let Some(mut next) = parse_google_response_events(&response) {
-                    events.append(&mut next);
-                }
-            }
-        }
-    }
-    if events.is_empty() {
-        None
-    } else {
-        Some(events)
-    }
-}
-
-pub(crate) fn parse_google_sse_data(
-    data: &str,
-    on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
-) -> Result<(), ProviderError> {
-    if let Ok(response) = serde_json::from_str::<Value>(data) {
-        if response
-            .pointer("/candidates/0/finishReason")
-            .and_then(Value::as_str)
-            == Some("MAX_TOKENS")
-        {
-            on_event(StreamEvent::Stop {
-                reason: "max_tokens".into(),
-            })?;
-        }
-        if let Some(events) = parse_google_response_events(&response) {
-            emit_events(events, on_event)?;
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn google_part_events(parts: &[Value]) -> Option<Vec<StreamEvent>> {
