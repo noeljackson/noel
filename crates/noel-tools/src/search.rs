@@ -217,16 +217,14 @@ impl GrepSearch {
     /// byte.
     fn file(&mut self, bytes: &[u8], explicit: bool, display: &str) -> bool {
         let mut searched = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
-        if !explicit {
-            if let Some(nul) = searched.iter().position(|byte| *byte == 0) {
-                // A binary file: only the blocks before the NUL are searched.
-                let block_start = nul - nul % BINARY_BLOCK_BYTES;
-                let end = searched[..block_start]
-                    .iter()
-                    .rposition(|byte| *byte == b'\n')
-                    .map_or(0, |newline| newline + 1);
-                searched = &searched[..end];
-            }
+        if !explicit && let Some(nul) = searched.iter().position(|byte| *byte == 0) {
+            // A binary file: only the blocks before the NUL are searched.
+            let block_start = nul - nul % BINARY_BLOCK_BYTES;
+            let end = searched[..block_start]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |newline| newline + 1);
+            searched = &searched[..end];
         }
         let mut lines = searched.split(|byte| *byte == b'\n').collect::<Vec<_>>();
         if searched.last().is_none_or(|byte| *byte == b'\n') {
@@ -395,10 +393,8 @@ async fn grep_remote(
     if !is_directory {
         // The search path itself is searched whatever it holds, if it is a
         // file.
-        if is_file {
-            if let Ok(bytes) = env.read_binary_file(&search_path, cx).await {
-                search.file(&bytes, true, noel_env_basename(&search_path));
-            }
+        if is_file && let Ok(bytes) = env.read_binary_file(&search_path, cx).await {
+            search.file(&bytes, true, noel_env_basename(&search_path));
         }
         return Ok(search.finish(None));
     }

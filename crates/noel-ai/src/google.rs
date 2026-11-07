@@ -298,10 +298,10 @@ pub(crate) fn google_part_events(parts: &[Value]) -> Option<Vec<StreamEvent>> {
             }
             continue;
         }
-        if let Some(text) = part.get("text").and_then(Value::as_str) {
-            if !text.is_empty() {
-                events.push(StreamEvent::Text(text.to_string()));
-            }
+        if let Some(text) = part.get("text").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            events.push(StreamEvent::Text(text.to_string()));
         }
         if let Some(function_call) = part.get("functionCall") {
             let Some(name) = function_call.get("name").and_then(Value::as_str) else {
@@ -385,10 +385,10 @@ pub(crate) fn google_messages(config: &ProviderConfig, messages: &[ChatMessage])
             if has_images && google_supports_multimodal_function_response(&config.model.id) {
                 function_response["parts"] = Value::Array(image_parts.clone());
             }
-            if google_requires_tool_call_id(&config.model.id) {
-                if let Some(tool_call_id) = message.tool_call_id.as_deref() {
-                    function_response["id"] = json!(tool_call_id);
-                }
+            if google_requires_tool_call_id(&config.model.id)
+                && let Some(tool_call_id) = message.tool_call_id.as_deref()
+            {
+                function_response["id"] = json!(tool_call_id);
             }
             let function_response_part = json!({ "functionResponse": function_response });
             let should_merge = contents

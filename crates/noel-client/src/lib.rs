@@ -127,7 +127,7 @@ pub fn session_address(session: &str) -> Address {
 /// A random id (a version 4 UUID) for a `requestId`.
 pub fn new_request_id() -> String {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("system randomness");
+    getrandom::fill(&mut bytes).expect("system randomness");
     bytes[6] = 0x40 | (bytes[6] & 0x0f);
     bytes[8] = 0x80 | (bytes[8] & 0x3f);
     let hex = bytes

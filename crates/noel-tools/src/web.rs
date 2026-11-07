@@ -127,19 +127,16 @@ fn readable_html(html: &str, base: &Url) -> (String, String) {
                 output.push_str(text);
             }
         }
-        if name == "a" {
-            if let Some(url) = element
+        if name == "a"
+            && let Some(url) = element
                 .value()
                 .attr("href")
                 .and_then(|href| base.join(href).ok())
-            {
-                if matches!(url.scheme(), "http" | "https")
-                    && url.username().is_empty()
-                    && url.password().is_none()
-                {
-                    output.push_str(&format!(" ({url})"));
-                }
-            }
+            && matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
+        {
+            output.push_str(&format!(" ({url})"));
         }
         if block {
             output.push('\n');
@@ -248,13 +245,13 @@ impl SearchProvider {
         if let Ok(url) = std::env::var("NOEL_SEARXNG_URL") {
             return Ok(Self::Searxng(checked_url(&url)?));
         }
-        if let Ok(key) = std::env::var("BRAVE_SEARCH_API_KEY") {
-            if !key.trim().is_empty() {
-                return Ok(Self::Brave {
-                    url: checked_url("https://api.search.brave.com/res/v1/web/search")?,
-                    key,
-                });
-            }
+        if let Ok(key) = std::env::var("BRAVE_SEARCH_API_KEY")
+            && !key.trim().is_empty()
+        {
+            return Ok(Self::Brave {
+                url: checked_url("https://api.search.brave.com/res/v1/web/search")?,
+                key,
+            });
         }
         Ok(Self::DuckDuckGo(checked_url(
             "https://html.duckduckgo.com/html/",

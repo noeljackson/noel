@@ -237,10 +237,10 @@ pub(crate) fn anthropic_system(config: &ProviderConfig, request: &ProviderReques
         let mut blocks = vec![anthropic_cached_text_block(
             "You are Claude Code, Anthropic's official CLI for Claude.",
         )];
-        if let Some(system_prompt) = request.system_prompt.as_deref() {
-            if !system_prompt.trim().is_empty() {
-                blocks.push(anthropic_cached_text_block(system_prompt));
-            }
+        if let Some(system_prompt) = request.system_prompt.as_deref()
+            && !system_prompt.trim().is_empty()
+        {
+            blocks.push(anthropic_cached_text_block(system_prompt));
         }
         Value::Array(blocks)
     } else if let Some(system_prompt) = request.system_prompt.as_deref() {
@@ -328,10 +328,10 @@ pub(crate) fn parse_anthropic_response_events(response: &Value) -> Option<Vec<St
     for item in content {
         match item.get("type").and_then(Value::as_str) {
             Some("text") => {
-                if let Some(text) = item.get("text").and_then(Value::as_str) {
-                    if !text.is_empty() {
-                        events.push(StreamEvent::Text(text.to_string()));
-                    }
+                if let Some(text) = item.get("text").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    events.push(StreamEvent::Text(text.to_string()));
                 }
             }
             Some("thinking") => {
@@ -417,23 +417,22 @@ impl SseParser for AnthropicSseParser {
         let usage = event
             .pointer("/message/usage")
             .or_else(|| event.get("usage"));
-        if let Some(usage) = usage {
-            if let Some(StreamEvent::Usage {
+        if let Some(usage) = usage
+            && let Some(StreamEvent::Usage {
                 input_tokens,
                 output_tokens,
             }) = token_usage(usage)
-            {
-                if usage.get("input_tokens").is_some() {
-                    self.input_tokens = input_tokens;
-                }
-                if usage.get("output_tokens").is_some() {
-                    self.output_tokens = output_tokens;
-                }
-                on_event(StreamEvent::Usage {
-                    input_tokens: self.input_tokens,
-                    output_tokens: self.output_tokens,
-                })?;
+        {
+            if usage.get("input_tokens").is_some() {
+                self.input_tokens = input_tokens;
             }
+            if usage.get("output_tokens").is_some() {
+                self.output_tokens = output_tokens;
+            }
+            on_event(StreamEvent::Usage {
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+            })?;
         }
         if let Some(reason) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {
             self.stop_reason = Some(reason.into());
@@ -450,14 +449,13 @@ impl SseParser for AnthropicSseParser {
                 let Some(block) = event.get("content_block") else {
                     return Ok(());
                 };
-                if block.get("type").and_then(Value::as_str) == Some("thinking") {
-                    if let Some(text) = block
+                if block.get("type").and_then(Value::as_str) == Some("thinking")
+                    && let Some(text) = block
                         .get("thinking")
                         .and_then(Value::as_str)
                         .filter(|text| !text.is_empty())
-                    {
-                        on_event(StreamEvent::Thinking(text.to_string()))?;
-                    }
+                {
+                    on_event(StreamEvent::Thinking(text.to_string()))?;
                 }
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     let (Some(id), Some(name)) = (
@@ -490,10 +488,10 @@ impl SseParser for AnthropicSseParser {
                 };
                 match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => {
-                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                            if !text.is_empty() {
-                                on_event(StreamEvent::Text(text.to_string()))?;
-                            }
+                        if let Some(text) = delta.get("text").and_then(Value::as_str)
+                            && !text.is_empty()
+                        {
+                            on_event(StreamEvent::Text(text.to_string()))?;
                         }
                     }
                     Some("thinking_delta") => {
@@ -551,17 +549,17 @@ pub(crate) fn anthropic_messages_with_cache_control(
         .iter()
         .filter(|message| message.role != ChatRole::System)
         .map(|message| {
-            if message.role == ChatRole::Tool {
-                if let Some(tool_call_id) = message.tool_call_id.as_deref() {
-                    return json!({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": tool_call_id,
-                            "content": anthropic_tool_result_content(message),
-                        }],
-                    });
-                }
+            if message.role == ChatRole::Tool
+                && let Some(tool_call_id) = message.tool_call_id.as_deref()
+            {
+                return json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": anthropic_tool_result_content(message),
+                    }],
+                });
             }
             if message.role == ChatRole::Assistant && !message.tool_calls.is_empty() {
                 let mut content = Vec::new();
@@ -643,10 +641,10 @@ pub(crate) fn apply_anthropic_cache_control_to_last_user_message(messages: &mut 
         return;
     };
     if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
-        if let Some(block) = content.last_mut() {
-            if block["type"] == "text" || block["type"] == "image" {
-                block["cache_control"] = json!({ "type": "ephemeral" });
-            }
+        if let Some(block) = content.last_mut()
+            && (block["type"] == "text" || block["type"] == "image")
+        {
+            block["cache_control"] = json!({ "type": "ephemeral" });
         }
         return;
     }

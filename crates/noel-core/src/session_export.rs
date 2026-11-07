@@ -52,7 +52,7 @@ pub(crate) fn ts_jsonl_export_records(state: &SessionState) -> Vec<Value> {
     })];
     let mut parent_id: Option<String> = None;
     macro_rules! next_entry {
-        ($entry_type:expr, $fields:expr $(,)?) => {
+        ($entry_type:expr_2021, $fields:expr_2021 $(,)?) => {
             push_ts_jsonl_entry(
                 &mut records,
                 &mut parent_id,
@@ -354,10 +354,10 @@ pub(crate) fn reduce_ts_jsonl_entry(state: &mut SessionState, entry: &Value) {
             });
         }
         Some("label") => {
-            if let Some(label) = entry.get("label").and_then(Value::as_str) {
-                if !label.trim().is_empty() {
-                    state.labels.insert(label.trim().to_string());
-                }
+            if let Some(label) = entry.get("label").and_then(Value::as_str)
+                && !label.trim().is_empty()
+            {
+                state.labels.insert(label.trim().to_string());
             }
         }
         _ => {}

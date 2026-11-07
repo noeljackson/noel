@@ -532,10 +532,10 @@ fn app(args: &[String]) -> i32 {
     let mut command = std::process::Command::new(&program);
     // This program's resolved path: `/proc/self/exe` would name the app in
     // the app's own process.
-    if !args.iter().any(|arg| arg == "--remote" || arg == "--noel") {
-        if let Ok(noel) = std::env::current_exe() {
-            command.arg("--noel").arg(noel);
-        }
+    if !args.iter().any(|arg| arg == "--remote" || arg == "--noel")
+        && let Ok(noel) = std::env::current_exe()
+    {
+        command.arg("--noel").arg(noel);
     }
     match command.args(args).status() {
         Ok(status) => status.code().unwrap_or(1),

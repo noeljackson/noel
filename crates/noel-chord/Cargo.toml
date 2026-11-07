@@ -19,3 +19,6 @@ thiserror.workspace = true
 [dev-dependencies]
 libc = "=0.2.186"
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "test-util"] }
+
+[lints]
+workspace = true

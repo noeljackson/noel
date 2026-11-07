@@ -361,10 +361,10 @@ async fn watch() {
         let on_change = {
             let seen = seen.clone();
             Arc::new(move |change: WatchChange| {
-                if let WatchChange::Paths(paths) = change {
-                    if paths.contains(&written) {
-                        seen.send_replace(true);
-                    }
+                if let WatchChange::Paths(paths) = change
+                    && paths.contains(&written)
+                {
+                    seen.send_replace(true);
                 }
             })
         };

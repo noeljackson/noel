@@ -460,10 +460,10 @@ impl ExtensionHosts {
         session_id: &str,
     ) -> Result<(), String> {
         let spec = HostSpec::new(path, cwd, session_id);
-        if let Some(old) = self.entries.remove(extension_name) {
-            if let HostPhase::Running(host) = old.phase {
-                let _ = host.lock().await.child.start_kill();
-            }
+        if let Some(old) = self.entries.remove(extension_name)
+            && let HostPhase::Running(host) = old.phase
+        {
+            let _ = host.lock().await.child.start_kill();
         }
         match launch(extension_name, &spec).await {
             Ok((process, set)) => {
@@ -788,10 +788,10 @@ impl ExtensionHosts {
     pub fn retain_extensions(&mut self, keep: &[String]) {
         self.entries.retain(|name, entry| {
             let kept = keep.contains(name);
-            if let (false, HostPhase::Running(host)) = (kept, &entry.phase) {
-                if let Ok(mut host) = host.try_lock() {
-                    let _ = host.child.start_kill();
-                }
+            if let (false, HostPhase::Running(host)) = (kept, &entry.phase)
+                && let Ok(mut host) = host.try_lock()
+            {
+                let _ = host.child.start_kill();
             }
             kept
         });
@@ -943,12 +943,12 @@ pub fn find_bun_binary() -> Option<PathBuf> {
     }
     // The agent dir's install (what `noel bun install` put there): a
     // discover failure (test isolation, odd HOME) never hides a PATH bun.
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Ok((paths, _import)) = noel_config::ConfigPaths::discover(cwd, None) {
-            let installed = paths.agent_dir.join("bin/bun");
-            if installed.is_file() {
-                return Some(installed);
-            }
+    if let Ok(cwd) = std::env::current_dir()
+        && let Ok((paths, _import)) = noel_config::ConfigPaths::discover(cwd, None)
+    {
+        let installed = paths.agent_dir.join("bin/bun");
+        if installed.is_file() {
+            return Some(installed);
         }
     }
     which_bun()
@@ -1081,8 +1081,10 @@ mod tests {
     impl Drop for BunHostEnv {
         fn drop(&mut self) {
             match self.previous.take() {
-                Some(value) => std::env::set_var("NOEL_BUN_HOST", value),
-                None => std::env::remove_var("NOEL_BUN_HOST"),
+                // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+                Some(value) => unsafe { std::env::set_var("NOEL_BUN_HOST", value) },
+                // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+                None => unsafe { std::env::remove_var("NOEL_BUN_HOST") },
             }
         }
     }
@@ -1115,7 +1117,8 @@ mod tests {
     async fn bun_host_env(shim: &Path) -> BunHostEnv {
         let lock = BUN_ENV.lock().await;
         let previous = std::env::var_os("NOEL_BUN_HOST");
-        std::env::set_var("NOEL_BUN_HOST", shim);
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        unsafe { std::env::set_var("NOEL_BUN_HOST", shim) };
         BunHostEnv {
             previous,
             _lock: lock,
@@ -1615,12 +1618,16 @@ done
         impl Drop for EnvGuard {
             fn drop(&mut self) {
                 match self.bun_bin.take() {
-                    Some(value) => std::env::set_var("NOEL_BUN_BIN", value),
-                    None => std::env::remove_var("NOEL_BUN_BIN"),
+                    // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+                    Some(value) => unsafe { std::env::set_var("NOEL_BUN_BIN", value) },
+                    // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+                    None => unsafe { std::env::remove_var("NOEL_BUN_BIN") },
                 }
                 match self.old_dir.take() {
-                    Some(value) => std::env::set_var("NOEL_DIR", value),
-                    None => std::env::remove_var("NOEL_DIR"),
+                    // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+                    Some(value) => unsafe { std::env::set_var("NOEL_DIR", value) },
+                    // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+                    None => unsafe { std::env::remove_var("NOEL_DIR") },
                 }
                 let _ = std::fs::remove_dir_all(&self.dir);
             }
@@ -1634,8 +1641,10 @@ done
             dir: dir.clone(),
             old_dir: std::env::var_os("NOEL_DIR"),
         };
-        std::env::set_var("NOEL_DIR", &dir);
-        std::env::remove_var("NOEL_BUN_BIN");
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        unsafe { std::env::set_var("NOEL_DIR", &dir) };
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        unsafe { std::env::remove_var("NOEL_BUN_BIN") };
 
         // The agent dir's install wins over PATH.
         let resolved = find_bun_binary().expect("installed bun");
@@ -1644,12 +1653,14 @@ done
         // An explicit path wins over the install.
         let override_path = dir.join("other-bun");
         std::fs::write(&override_path, b"stub").expect("stub");
-        std::env::set_var("NOEL_BUN_BIN", &override_path);
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        unsafe { std::env::set_var("NOEL_BUN_BIN", &override_path) };
         let resolved = find_bun_binary().expect("override bun");
         assert_eq!(resolved, override_path);
 
         // `path` resolves from PATH, ignoring the install.
-        std::env::set_var("NOEL_BUN_BIN", "path");
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        unsafe { std::env::set_var("NOEL_BUN_BIN", "path") };
         let resolved = find_bun_binary();
         assert_ne!(resolved.as_ref(), Some(&dir.join("bin/bun")));
         drop(guard);

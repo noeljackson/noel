@@ -459,10 +459,10 @@ async fn check(
         }
     };
     // Only a lone --provider can be unknown: --model resolves known ones.
-    if let [provider] = providers.as_slice() {
-        if !provider_is_known(config, provider) {
-            return Ok(CheckResult::not_ready(provider, "provider_not_found"));
-        }
+    if let [provider] = providers.as_slice()
+        && !provider_is_known(config, provider)
+    {
+        return Ok(CheckResult::not_ready(provider, "provider_not_found"));
     }
     let provider = preferred_provider(
         config,
@@ -646,13 +646,12 @@ fn resolve_providers(config: &LoadedConfig, command: &AuthCommand) -> Result<Vec
     }
     if providers.is_empty() {
         // `provider/id` names a provider even when its catalog lacks the id.
-        if let Some((prefix, id)) = model.split_once('/') {
-            if !id.is_empty()
-                && provider.is_none_or(|provider| provider == prefix)
-                && provider_is_known(config, prefix)
-            {
-                providers.push(prefix.to_string());
-            }
+        if let Some((prefix, id)) = model.split_once('/')
+            && !id.is_empty()
+            && provider.is_none_or(|provider| provider == prefix)
+            && provider_is_known(config, prefix)
+        {
+            providers.push(prefix.to_string());
         }
     }
     if providers.is_empty() {

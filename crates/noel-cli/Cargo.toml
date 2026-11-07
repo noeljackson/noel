@@ -47,3 +47,6 @@ tokio = { workspace = true, features = ["net"] }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 unicode-segmentation = "1.13.2"
 unicode-width = "0.2.2"
+
+[lints]
+workspace = true

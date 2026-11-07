@@ -743,7 +743,7 @@ impl<'a> Watching<'a> {
 
 /// Runs `body` with a watcher of `targets`, closing it afterwards.
 macro_rules! watching {
-    ($env:expr, $targets:expr, |$w:ident| $body:block) => {{
+    ($env:expr_2021, $targets:expr_2021, |$w:ident| $body:block) => {{
         let $w = Watching::start($env, $targets).await?;
         let result: Result<(), String> = async { $body }.await;
         $w.close().await;

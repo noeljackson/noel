@@ -1701,10 +1701,10 @@ pub(crate) fn selected_todos_with_limit(
             .map(|(index, _)| index)
             .take(pending_slots),
     );
-    if let Some(index) = recent_done {
-        if selected.len() < limit {
-            selected.push(index);
-        }
+    if let Some(index) = recent_done
+        && selected.len() < limit
+    {
+        selected.push(index);
     }
     for index in (0..todos.len()).rev() {
         if selected.len() >= limit {

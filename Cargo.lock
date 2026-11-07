@@ -431,9 +431,9 @@ dependencies = [
 
 [[package]]
 name = "core-foundation"
-version = "0.10.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
+checksum = "b55271e5c8c478ad3f38ad24ef34923091e0548492a266d19b3c0b4d82574c63"
 dependencies = [
  "core-foundation-sys",
  "libc",
@@ -1784,7 +1784,7 @@ version = "0.3.0"
 dependencies = [
  "flate2",
  "futures-util",
- "getrandom 0.2.17",
+ "getrandom 0.4.2",
  "libc",
  "regex",
  "serde",
@@ -1803,7 +1803,7 @@ dependencies = [
  "base64",
  "clap",
  "crossterm",
- "getrandom 0.2.17",
+ "getrandom 0.4.2",
  "image",
  "libc",
  "nix",
@@ -1822,7 +1822,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "time",
  "tokio",
  "tokio-rustls",
@@ -1837,7 +1837,7 @@ name = "noel-client"
 version = "0.3.0"
 dependencies = [
  "anyhow",
- "getrandom 0.2.17",
+ "getrandom 0.4.2",
  "noel-chord",
  "serde_json",
  "tokio",
@@ -1877,7 +1877,7 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64",
- "getrandom 0.2.17",
+ "getrandom 0.4.2",
  "noel-agent",
  "noel-ai",
  "noel-codemode",
@@ -1887,7 +1887,7 @@ dependencies = [
  "noel-tools",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -1902,7 +1902,7 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -1918,7 +1918,7 @@ dependencies = [
  "notify",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "tokio",
 ]
 
@@ -2224,7 +2224,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89815c69d36021a140146f26659a81d6c2afa33d216d736dd4be5381a7362220"
 dependencies = [
  "pest",
- "sha2",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2973,6 +2973,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3252,7 +3263,7 @@ dependencies = [
  "pest",
  "pest_derive",
  "phf",
- "sha2",
+ "sha2 0.10.9",
  "signal-hook",
  "siphasher",
  "terminfo",
@@ -4045,7 +4056,7 @@ checksum = "692daff6d93d94e29e4114544ef6d5c942a7ed998b37abdc19b17136ea428eb7"
 dependencies = [
  "getrandom 0.3.4",
  "mac_address",
- "sha2",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "uuid",
 ]

@@ -60,12 +60,12 @@ pub(crate) async fn run(runtime: Runtime, config: LoadedConfig, offline: bool) -
     };
     let mut controller = SessionController::new(runtime, host, AbortPolicy::KeepQueue);
     while let Some(line) = lines.recv().await {
-        if let Some(start) = command(&mut controller, &line).await {
-            if !controller.run(start, &mut lines, busy_command).await {
-                // The stopped run's tools died with it; leave none behind.
-                noel_core::kill_running_tool_groups();
-                break;
-            }
+        if let Some(start) = command(&mut controller, &line).await
+            && !controller.run(start, &mut lines, busy_command).await
+        {
+            // The stopped run's tools died with it; leave none behind.
+            noel_core::kill_running_tool_groups();
+            break;
         }
     }
     Ok(())
