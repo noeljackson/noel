@@ -330,12 +330,21 @@ pub enum BlockKind {
     Plain,
 }
 
+/// The fence marker a line opens or closes a code block with: ``` or
+/// ~~~ (#158: both, as upstream's renderer reads them).
+pub fn fence_marker(line: &str) -> Option<&'static str> {
+    let trimmed = line.trim_start();
+    ["```", "~~~"]
+        .into_iter()
+        .find(|marker| trimmed.starts_with(marker))
+}
+
 /// Classify one source line for block rendering.
 pub fn classify_line(line: &str) -> BlockKind {
     let trimmed = line.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("```") {
+    if let Some(marker) = fence_marker(trimmed) {
         return BlockKind::Fence {
-            language: rest.trim().to_string(),
+            language: trimmed[marker.len()..].trim().to_string(),
             closing: false,
         };
     }
@@ -554,6 +563,17 @@ mod block_tests {
                 closing: false
             }
         );
+        // #158: tilde fences too; each closes only on its own marker.
+        assert_eq!(
+            classify_line("~~~ python"),
+            BlockKind::Fence {
+                language: "python".into(),
+                closing: false
+            }
+        );
+        assert_eq!(fence_marker("  ~~~"), Some("~~~"));
+        assert_eq!(fence_marker("```js"), Some("```"));
+        assert_eq!(fence_marker("~~ not"), None);
         assert_eq!(
             classify_line("- item"),
             BlockKind::ListItem {
