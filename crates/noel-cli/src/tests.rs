@@ -4538,3 +4538,68 @@ fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         .expect("encode png");
     output.into_inner()
 }
+
+/// #108: the branch navigator folds a branch and moves to its parent and
+/// child, shows named branches only under its filter, and keeps its tree
+/// across the worker-to-client JSON.
+#[test]
+fn the_branch_navigator_folds_and_filters() {
+    let items = ["root", "child", "grandchild", "other"]
+        .into_iter()
+        .map(|value| SelectorItem {
+            label: value.to_owned(),
+            value: value.to_owned(),
+            active: false,
+        })
+        .collect();
+    let mut state = TuiSelectorState::new("branches", Selector::new("branches", items), "", None);
+    state.set_tree(BTreeMap::from([
+        ("root".to_owned(), (None, true)),
+        ("child".to_owned(), (Some("root".to_owned()), false)),
+        ("grandchild".to_owned(), (Some("child".to_owned()), true)),
+        ("other".to_owned(), (None, false)),
+    ]));
+    let shown = |state: &TuiSelectorState| -> Vec<String> {
+        state
+            .filtered_indices
+            .iter()
+            .map(|index| state.items[*index].label.clone())
+            .collect()
+    };
+    assert_eq!(shown(&state), ["root", "child", "grandchild", "other"]);
+
+    // Fold the root: its branch hides, and the row says it is folded.
+    state.fold_or_up();
+    assert_eq!(shown(&state), ["root [+]", "other"]);
+    // Unfold, then down to the child and up to the root again.
+    state.unfold_or_down();
+    state.unfold_or_down();
+    assert_eq!(state.selected_item().unwrap().value, "child");
+    state.fold_or_up();
+    assert_eq!(shown(&state), ["root", "child [+]", "other"]);
+    // Up from a folded child goes to its parent; the child stays folded.
+    state.fold_or_up();
+    assert_eq!(state.selected_item().unwrap().value, "root");
+    assert_eq!(shown(&state), ["root", "child [+]", "other"]);
+    state.unfold_or_down();
+    state.unfold_or_down();
+    assert_eq!(shown(&state), ["root", "child", "grandchild", "other"]);
+
+    // Named branches only, then all again.
+    state.set_tree_filter(TreeFilter::Named);
+    assert_eq!(shown(&state), ["root", "grandchild"]);
+    assert_eq!(state.title, "branches · named only");
+    state.set_tree_filter(TreeFilter::All);
+    assert_eq!(state.title, "branches");
+    assert_eq!(
+        TreeFilter::from_setting(Some("labeled-only")),
+        TreeFilter::Named
+    );
+    assert_eq!(TreeFilter::Named.setting(), "labeled-only");
+
+    // The tree survives the JSON a worker sends.
+    let again = TuiSelectorState::from_json(&state.to_json()).unwrap();
+    assert_eq!(again.tree.len(), 4);
+    assert_eq!(again.tree["grandchild"].parent.as_deref(), Some("child"));
+    assert!(again.tree["grandchild"].named);
+}

@@ -111,7 +111,7 @@ pub(crate) enum CommandOutcome {
         account: String,
     },
     /// Open this selector.
-    Selector(TuiSelectorState),
+    Selector(Box<TuiSelectorState>),
     /// Attach to this session instead (a worker's answer to a switch).
     Session(String),
 }
@@ -129,10 +129,13 @@ pub(crate) fn open_selector(
         ui.push(TuiEntryKind::System, format!("no {kind}"));
         return Ok(CommandOutcome::Handled);
     }
-    let state =
+    let mut state =
         TuiSelectorState::new(kind, selector, query, None).with_model_thinking(config, runtime);
+    if kind == "branches" {
+        state.set_tree(crate::session_tree_rows(config)?);
+    }
     ui.push(TuiEntryKind::System, format!("{} selector", state.title));
-    Ok(CommandOutcome::Selector(state))
+    Ok(CommandOutcome::Selector(Box::new(state)))
 }
 
 /// Runs the session side of `line`, a slash command or a prompt.
@@ -406,7 +409,7 @@ pub(crate) async fn run(
             {
                 state.selected = index;
             }
-            return Ok(CommandOutcome::Selector(state));
+            return Ok(CommandOutcome::Selector(Box::new(state)));
         }
         _ if line.starts_with("/select ") => {
             let (kind, _) = split_once_text(line.trim_start_matches("/select ").trim());

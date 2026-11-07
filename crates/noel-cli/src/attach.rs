@@ -97,6 +97,7 @@ pub(crate) async fn run(
     let mut app = TuiApp {
         owned_screen,
         status: "Ready".to_owned(),
+        tree_filter: crate::TreeFilter::from_setting(config.settings.tree_filter_mode.as_deref()),
         ..TuiApp::default()
     };
     // A local `noel` greets as it always has; an attach says where it is.
@@ -402,6 +403,13 @@ async fn sessions_request(client: &Client, session: &str, cwd: &str, line: &str)
             };
             client.sessions_call("fork", to_args(&args)).await
         }
+        // A branch's label: the session's name (from the navigator's
+        // shift+L, #108).
+        "/rename" => {
+            let (target, name) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            let args = json!({"sessionId": named(target).await?, "name": name.trim()});
+            client.sessions_call("rename", args).await
+        }
         "/import" => {
             let path = std::path::Path::new(cwd).join(rest);
             let args = ImportArgs {
@@ -427,6 +435,54 @@ async fn sessions_request(client: &Client, session: &str, cwd: &str, line: &str)
                 .await
         }
     }
+}
+
+/// The branch navigator's keys (#108), as upstream's tree selector reads
+/// them: ctrl/alt+left folds or goes up, ctrl/alt+right unfolds or goes
+/// down; ctrl+l shows named branches only, ctrl+a and ctrl+d all of them,
+/// ctrl+o cycles, each kept as `treeFilterMode`; shift+L edits the selected
+/// branch's label (its session name). Whether the key was the tree's.
+fn tree_key(key: KeyEvent, app: &mut TuiApp, config: &mut LoadedConfig) -> bool {
+    let selector = app.selector_mut().expect("selector");
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let filter = match key.code {
+        KeyCode::Left if ctrl || alt => {
+            selector.fold_or_up();
+            return true;
+        }
+        KeyCode::Right if ctrl || alt => {
+            selector.unfold_or_down();
+            return true;
+        }
+        KeyCode::Char('l') if ctrl => match selector.tree_filter {
+            crate::TreeFilter::Named => crate::TreeFilter::All,
+            crate::TreeFilter::All => crate::TreeFilter::Named,
+        },
+        KeyCode::Char('a' | 'd') if ctrl => crate::TreeFilter::All,
+        KeyCode::Char('o') if ctrl => selector.tree_filter.next(),
+        KeyCode::Char('L') if !ctrl && !alt => {
+            let Some(item) = selector.selected_item().cloned() else {
+                return true;
+            };
+            app.take_selector();
+            app.set_input(format!("/rename {} ", item.value));
+            return true;
+        }
+        _ => return false,
+    };
+    selector.set_tree_filter(filter);
+    app.tree_filter = filter;
+    let saved = crate::write_user_setting(
+        &config.paths.settings_path,
+        &["treeFilterMode"],
+        filter.setting().into(),
+    );
+    match saved {
+        Ok(()) => config.settings.tree_filter_mode = Some(filter.setting().to_owned()),
+        Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+    }
+    true
 }
 
 /// The session the server lists under `reference`: its id, the one id it
@@ -1334,7 +1390,7 @@ impl Remote {
             // Managing sessions is the server's (`noel.sessions`): a fork, a
             // clone, an import, deleting another session. Deleting the
             // session shown stays the worker's, which opens a new one.
-            _ if matches!(name, "/fork" | "/clone")
+            _ if matches!(name, "/fork" | "/clone" | "/rename")
                 || (matches!(name, "/import" | "/delete") && line.trim() != name) =>
             {
                 self.sessions_command(line.to_owned());
@@ -1513,6 +1569,13 @@ impl Remote {
     /// the worker (`/select <kind> <value>`). The model picker's provider
     /// layer opens that provider's models.
     fn selector_key(&mut self, key: KeyEvent, app: &mut TuiApp, config: &mut LoadedConfig) {
+        if app
+            .selector()
+            .is_some_and(|selector| !selector.tree.is_empty())
+            && tree_key(key, app, config)
+        {
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 let mut selector = app.take_selector().expect("selector");
@@ -1866,25 +1929,33 @@ impl Remote {
                     }
                 }
             }
-            Some("selector") => match crate::TuiSelectorState::from_json(&next["selector"]) {
-                // A settings pick's list again, after the list was closed.
-                Some(_)
-                    if line.starts_with("/select settings ")
-                        && app.selector().is_none_or(|open| open.kind != "settings") => {}
-                Some(selector) => {
-                    if let Some(layers) = next["selector"]["layers"].as_object() {
-                        self.provider_layers = layers
-                            .iter()
-                            .map(|(provider, items)| (provider.clone(), items.clone()))
-                            .collect();
+            Some("selector") => {
+                match crate::TuiSelectorState::from_json(&next["selector"]).map(|mut selector| {
+                    // A tree opens on the filter the settings keep.
+                    if !selector.tree.is_empty() {
+                        selector.set_tree_filter(app.tree_filter);
                     }
-                    app.overlay = crate::Overlay::Selector(selector);
+                    selector
+                }) {
+                    // A settings pick's list again, after the list was closed.
+                    Some(_)
+                        if line.starts_with("/select settings ")
+                            && app.selector().is_none_or(|open| open.kind != "settings") => {}
+                    Some(selector) => {
+                        if let Some(layers) = next["selector"]["layers"].as_object() {
+                            self.provider_layers = layers
+                                .iter()
+                                .map(|(provider, items)| (provider.clone(), items.clone()))
+                                .collect();
+                        }
+                        app.overlay = crate::Overlay::Selector(selector);
+                    }
+                    None => app.push(
+                        TuiEntryKind::Error,
+                        "the worker sent an unreadable selector",
+                    ),
                 }
-                None => app.push(
-                    TuiEntryKind::Error,
-                    "the worker sent an unreadable selector",
-                ),
-            },
+            }
             Some("diff") => {
                 let mut files = Vec::new();
                 self.diff_lines.clear();
