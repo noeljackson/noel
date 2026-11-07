@@ -976,6 +976,38 @@ async fn a_run_restarted_restart_limit_times_ends_restart_limit() {
     assert!(fixture.requests().is_empty());
 }
 
+/// #130: a resume after a close is not a restart, but the run is open
+/// again, so a crash during it counts one.
+#[tokio::test]
+async fn a_crash_after_resuming_a_closed_run_counts_a_restart() {
+    let path = crashed_run("reclosed", systems());
+    {
+        let (store, state) = SessionStore::open(path.clone()).unwrap();
+        let mut runtime = Runtime::with_store(state, systems(), store);
+        runtime.close_run("run-1").unwrap();
+    }
+    {
+        // Resumed after the close: no restart is counted; then the
+        // process stops without finishing the run (a crash).
+        let mut fixture = reopen_with(&path, systems());
+        fixture.controller.resume("run-1").await.unwrap();
+    }
+    let run = SessionStore::read(&path).unwrap().runs.pop().unwrap();
+    assert_eq!((run.restarts, run.closed), (0, false));
+    // The next resume counts that crash.
+    let mut limited = systems();
+    limited.restart_limit = 1;
+    let mut fixture = reopen_with(&path, limited);
+    resume_to_end(&mut fixture, "run-1").await;
+    assert_eq!(
+        fixture.take_events(),
+        [
+            "run started",
+            "settled Unanswered { reason: RestartLimit, detail: \"The run was interrupted 1 times in a row; it is not run again\" }",
+        ]
+    );
+}
+
 #[tokio::test]
 async fn progress_clears_a_runs_restarts_and_a_close_counts_none() {
     let path = crashed_run("progress", systems());
