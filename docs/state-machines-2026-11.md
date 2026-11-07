@@ -86,6 +86,9 @@ Outcomes: **fixed** (with the test that fails before the fix), **refactored**
 
 | issue | outcome |
 |---|---|
+| #130 | fixed: Run's transitions live on `Run` (close, restart, reopen, finish), the same live and on replay; resuming a closed run journals `RunReopened`. Test `a_crash_after_resuming_a_closed_run_counts_a_restart` |
+| #131 | fixed: the host's stdout is `Pipe::Idle/Busy/Broken`, kept by the host; a broken or exited host is started again on its next call. Test `a_cancelled_request_does_not_break_the_host` |
+| #132 | fixed: the Bun host has a `Phase` (loading, factoryFailed, ready, shuttingDown); session_start runs at init, session_shutdown at shutdown, unknown kinds get an error; shutdown waits for the host. Test `bun_host_runs_session_start_and_shutdown_handlers` |
 
 ## Status
 
