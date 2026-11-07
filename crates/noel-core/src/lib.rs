@@ -333,6 +333,27 @@ pub struct QueueItemId {
     pub mode: QueueMode,
 }
 
+/// One saved queued submission: its mode, its text, and its saved identity
+/// when it has one (see [`QueueItemId`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedEntry {
+    pub mode: QueueMode,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<QueueItemId>,
+}
+
+impl QueuedEntry {
+    /// A follow-up saved without an identity.
+    pub fn follow_up(content: impl Into<String>) -> Self {
+        Self {
+            mode: QueueMode::FollowUp,
+            content: content.into(),
+            id: None,
+        }
+    }
+}
+
 impl QueueItemId {
     /// Whether the journal keeps this identity (see [`QueueItemId`]).
     pub fn is_durable(&self) -> bool {
@@ -383,16 +404,11 @@ pub struct SessionState {
     pub parent_session_id: Option<String>,
     pub messages: Vec<ConversationMessage>,
     pub tool_history: Vec<ToolEvent>,
-    pub queued_messages: Vec<String>,
-    /// How many of `queued_messages`, from the front, are steering for a
-    /// run's next provider round; the rest are follow-ups. Only RPC mode
-    /// queues steering: the TUI turns leftover steering into follow-ups.
+    /// The saved queue, steering first (#138: three parallel fields, whose
+    /// ids counted only while their lengths matched). Only RPC mode queues
+    /// steering: the TUI turns leftover steering into follow-ups.
     #[serde(default)]
-    pub queued_steering: usize,
-    /// The saved identity of each of `queued_messages`, when the queue was
-    /// saved with any (see [`QueueItemId`]); otherwise empty.
-    #[serde(default)]
-    pub queued_ids: Vec<QueueItemId>,
+    pub queue: Vec<QueuedEntry>,
     /// Saved submissions that left the queue, oldest first, as the journal
     /// had them when the session was loaded. The session controller keeps
     /// its own copy current.
@@ -484,32 +500,34 @@ pub struct SavedToolOutput {
 
 impl SessionState {
     /// The saved queue: its steering, then its follow-ups.
-    pub fn saved_queue(&self) -> (&[String], &[String]) {
-        let steering = self.queued_steering.min(self.queued_messages.len());
-        self.queued_messages.split_at(steering)
+    pub fn saved_queue(&self) -> (Vec<String>, Vec<String>) {
+        let texts = |mode: QueueMode| {
+            self.queue
+                .iter()
+                .filter(|entry| entry.mode == mode)
+                .map(|entry| entry.content.clone())
+                .collect()
+        };
+        (texts(QueueMode::Steer), texts(QueueMode::FollowUp))
+    }
+
+    /// The saved queue's texts, steering first.
+    pub fn queued_messages(&self) -> Vec<String> {
+        self.queue
+            .iter()
+            .map(|entry| entry.content.clone())
+            .collect()
     }
 
     /// The saved queue's items, steering first, with their saved
     /// identities. An item saved without one (by an older version, by the
     /// TUI, or without a `requestId`) has `None`.
     pub fn saved_queue_items(&self) -> Vec<(QueueMode, String, Option<QueueItemId>)> {
-        let steering = self.queued_steering.min(self.queued_messages.len());
-        let ids = (self.queued_ids.len() == self.queued_messages.len())
-            .then_some(self.queued_ids.as_slice());
-        self.queued_messages
+        self.queue
             .iter()
-            .enumerate()
-            .map(|(index, content)| {
-                let mode = if index < steering {
-                    QueueMode::Steer
-                } else {
-                    QueueMode::FollowUp
-                };
-                let id = ids
-                    .map(|ids| &ids[index])
-                    .filter(|id| id.mode == mode)
-                    .cloned();
-                (mode, content.clone(), id)
+            .map(|entry| {
+                let id = entry.id.clone().filter(|id| id.mode == entry.mode);
+                (entry.mode, entry.content.clone(), id)
             })
             .collect()
     }
@@ -518,19 +536,14 @@ impl SessionState {
     /// message that placed them into run `run_id` is saved.
     fn place_queued(&mut self, placed: Vec<QueueItemId>, run_id: Option<&str>) {
         for id in placed {
-            let index = (self.queued_ids.len() == self.queued_messages.len())
-                .then(|| {
-                    self.queued_ids
-                        .iter()
-                        .position(|queued| queued.submission_id == id.submission_id)
-                })
-                .flatten();
+            let index = self.queue.iter().position(|entry| {
+                entry
+                    .id
+                    .as_ref()
+                    .is_some_and(|queued| queued.submission_id == id.submission_id)
+            });
             if let Some(index) = index {
-                self.queued_ids.remove(index);
-                self.queued_messages.remove(index);
-                if index < self.queued_steering {
-                    self.queued_steering -= 1;
-                }
+                self.queue.remove(index);
             }
             self.past_submissions.push(PastSubmission {
                 id,
@@ -599,9 +612,7 @@ impl SessionState {
             parent_session_id: None,
             messages: Vec::new(),
             tool_history: Vec::new(),
-            queued_messages: Vec::new(),
-            queued_steering: 0,
-            queued_ids: Vec::new(),
+            queue: Vec::new(),
             past_submissions: Vec::new(),
             compactions: Vec::new(),
             branch_summaries: Vec::new(),
@@ -734,7 +745,7 @@ impl From<&SessionState> for SessionExport {
             parent_session_id: state.parent_session_id.clone(),
             messages: state.messages.clone(),
             tool_history: state.tool_history.clone(),
-            queued_messages: state.queued_messages.clone(),
+            queued_messages: state.queued_messages(),
             compactions: state.compactions.clone(),
             branch_summaries: state.branch_summaries.clone(),
             active_model: state.active_model.clone(),
@@ -760,9 +771,11 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         messages: export.messages,
         tool_history: export.tool_history,
         // An imported session has no run for steering to join.
-        queued_messages: export.queued_messages,
-        queued_steering: 0,
-        queued_ids: Vec::new(),
+        queue: export
+            .queued_messages
+            .into_iter()
+            .map(QueuedEntry::follow_up)
+            .collect(),
         past_submissions: Vec::new(),
         compactions: export.compactions,
         branch_summaries: export.branch_summaries,
@@ -1308,7 +1321,7 @@ enum SessionRecord {
         /// Each message's identity, when any has a `requestId` (see
         /// [`QueueItemId`]); older versions ignore it.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        items: Vec<QueueItemId>,
+        items: Vec<Option<QueueItemId>>,
         /// The saved submissions this record withdraws from the queue
         /// unanswered; older versions ignore it.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2125,9 +2138,8 @@ impl SessionStore {
                 .cloned()
                 .map(|event| SessionRecord::Tool { event }),
         );
-        if !state.queued_messages.is_empty() {
-            let (steering, follow_ups) = state.saved_queue();
-            records.push(queue_record(steering.to_vec(), follow_ups.to_vec()));
+        if !state.queue.is_empty() {
+            records.push(entries_record(&state.queue));
         }
         records.extend(
             state
@@ -2230,6 +2242,27 @@ fn queue_record(steering: Vec<String>, follow_ups: Vec<String>) -> SessionRecord
     }
 }
 
+/// The queue record for saved `entries` (a checkpoint): their identities
+/// kept where they have one.
+fn entries_record(entries: &[QueuedEntry]) -> SessionRecord {
+    let durable = entries
+        .iter()
+        .any(|entry| entry.id.as_ref().is_some_and(QueueItemId::is_durable));
+    SessionRecord::QueuedMessagesSnapshot {
+        messages: entries.iter().map(|entry| entry.content.clone()).collect(),
+        steering: entries
+            .iter()
+            .take_while(|entry| entry.mode == QueueMode::Steer)
+            .count(),
+        items: if durable {
+            entries.iter().map(|entry| entry.id.clone()).collect()
+        } else {
+            Vec::new()
+        },
+        withdrawn: Vec::new(),
+    }
+}
+
 /// The queue record for `items`, steering first.
 fn queue_items_record(items: &[QueueItem], withdrawn: &[QueueItemId]) -> SessionRecord {
     let steering = items
@@ -2241,7 +2274,7 @@ fn queue_items_record(items: &[QueueItem], withdrawn: &[QueueItemId]) -> Session
         messages: items.iter().map(|item| item.content.clone()).collect(),
         steering,
         items: if durable {
-            items.iter().map(|item| item.id.clone()).collect()
+            items.iter().map(|item| Some(item.id.clone())).collect()
         } else {
             Vec::new()
         },
@@ -2416,9 +2449,9 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
         SessionRecord::EditedFiles { paths } => state.edited_files = paths,
         SessionRecord::CodemodeStore { store } => state.codemode_store = store,
         SessionRecord::QueuedMessage { message } => {
-            state.queued_messages.push(message);
-            // Records like this one name no identities.
-            state.queued_ids.clear();
+            // A record like this one names no identity; the others keep
+            // theirs (#138).
+            state.queue.push(QueuedEntry::follow_up(message));
         }
         SessionRecord::QueuedMessagesSnapshot {
             messages,
@@ -2426,13 +2459,20 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
             items,
             withdrawn,
         } => {
-            state.queued_ids = if items.len() == messages.len() {
-                items
-            } else {
-                Vec::new()
-            };
-            state.queued_messages = messages;
-            state.queued_steering = steering;
+            let aligned = items.len() == messages.len();
+            state.queue = messages
+                .into_iter()
+                .enumerate()
+                .map(|(index, content)| QueuedEntry {
+                    mode: if index < steering {
+                        QueueMode::Steer
+                    } else {
+                        QueueMode::FollowUp
+                    },
+                    content,
+                    id: aligned.then(|| items[index].clone()).flatten(),
+                })
+                .collect();
             state.past_submissions.extend(
                 withdrawn
                     .into_iter()
@@ -2599,7 +2639,7 @@ fn ts_jsonl_export_records(state: &SessionState) -> Vec<Value> {
             "data": {
                 "labels": state.labels,
                 "disabled_tools": state.disabled_tools,
-                "queued_messages": state.queued_messages,
+                "queued_messages": state.queued_messages(),
                 "tool_history": state.tool_history,
                 "usage": state.usage,
             },
@@ -2913,10 +2953,10 @@ fn restore_rust_session_state(state: &mut SessionState, data: &Value) {
         state.active_tool_names = active_tools_with(&state.disabled_tools);
     }
     if let Some(messages) = data.get("queued_messages").and_then(Value::as_array) {
-        state.queued_messages = messages
+        state.queue = messages
             .iter()
             .filter_map(Value::as_str)
-            .map(ToString::to_string)
+            .map(QueuedEntry::follow_up)
             .collect();
     }
     if let Some(history) = data.get("tool_history").and_then(Value::as_array) {
@@ -3595,8 +3635,8 @@ impl Runtime {
         if let Some(store) = &self.store {
             store.record_queued_message(message.clone())?;
         }
-        self.session.queued_messages.push(message);
-        self.session.queued_ids.clear();
+        // The other entries keep their identities (#138: all were wiped).
+        self.session.queue.push(QueuedEntry::follow_up(message));
         Ok(())
     }
 
@@ -3605,14 +3645,12 @@ impl Runtime {
         if let Some(store) = &self.store {
             store.record_queued_messages_snapshot(messages.clone())?;
         }
-        self.session.queued_messages = messages;
-        self.session.queued_steering = 0;
-        self.session.queued_ids.clear();
+        self.session.queue = messages.into_iter().map(QueuedEntry::follow_up).collect();
         Ok(())
     }
 
     pub fn clear_queued_messages(&mut self) -> Result<usize, SessionError> {
-        let count = self.session.queued_messages.len();
+        let count = self.session.queue.len();
         self.replace_queued_messages(Vec::new())?;
         Ok(count)
     }
@@ -6488,7 +6526,9 @@ mod tests {
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("user.txt"), "unrelated edits").unwrap();
         let (store, mut session) = SessionStore::create(&base, base.clone()).unwrap();
-        session.queued_messages.push("follow up".into());
+        session
+            .queue
+            .push(crate::QueuedEntry::follow_up("follow up"));
         session.edited_files.push("user.txt".into());
         session.tool_history.push(ToolEvent {
             id: "call".into(),
@@ -6662,7 +6702,7 @@ mod tests {
             result: "ok".to_string(),
             is_error: false,
         });
-        session.queued_messages.push("next".to_string());
+        session.queue.push(crate::QueuedEntry::follow_up("next"));
         session.active_model = Some(model.clone());
         session.active_tool_names = BTreeSet::from(["read".to_string()]);
 
@@ -6684,7 +6724,7 @@ mod tests {
         assert_eq!(runtime.session().cwd, cwd);
         assert_eq!(runtime.session().messages.len(), 1);
         assert_eq!(runtime.session().tool_history.len(), 1);
-        assert_eq!(runtime.session().queued_messages, ["next"]);
+        assert_eq!(runtime.session().queued_messages(), ["next"]);
     }
 
     #[test]
@@ -6853,7 +6893,10 @@ mod tests {
         state.active_thinking_level = Some("xhigh".to_string());
         state.disabled_tools = BTreeSet::from(["write".to_string()]);
         state.active_tool_names = active_tools_with(&state.disabled_tools);
-        state.queued_messages = vec!["next prompt".to_string()];
+        state.queue = vec!["next prompt".to_string()]
+            .into_iter()
+            .map(crate::QueuedEntry::follow_up)
+            .collect();
         state.messages.push(ConversationMessage {
             thinking: String::new(),
             role: MessageRole::User,
@@ -6920,7 +6963,7 @@ mod tests {
             .record_tool(state.tool_history[0].clone())
             .expect("record tool");
         store
-            .record_queued_message(state.queued_messages[0].clone())
+            .record_queued_message(state.queued_messages()[0].clone())
             .expect("record queued");
         store
             .record_compaction(state.compactions[0].clone())
@@ -9291,7 +9334,10 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(reopened.session().queued_messages, before.queued_messages);
+        assert_eq!(
+            reopened.session().queued_messages(),
+            before.queued_messages()
+        );
         assert_eq!(reopened.session().active_model, before.active_model);
         assert_eq!(reopened.session().active_account, before.active_account);
         assert_eq!(
@@ -9471,7 +9517,7 @@ mod tests {
         let last = runtime.session().messages.last().unwrap();
         assert_eq!(last.role, MessageRole::Tool);
         assert_eq!(last.content, "saved result");
-        assert_eq!(runtime.session().queued_messages, ["pending follow-up"]);
+        assert_eq!(runtime.session().queued_messages(), ["pending follow-up"]);
         let (store, state) = SessionStore::open(path).unwrap();
         assert_eq!(runtime.session(), &state);
         let mut reopened = Runtime::with_store(state, ReloadableSystems::default(), store);
@@ -9510,7 +9556,7 @@ mod tests {
             reopened.session().tool_history.len(),
             DEFAULT_MAX_TOOL_ROUNDS
         );
-        assert_eq!(reopened.session().queued_messages, ["pending follow-up"]);
+        assert_eq!(reopened.session().queued_messages(), ["pending follow-up"]);
         fs::remove_dir_all(cwd).unwrap();
     }
 
@@ -10690,9 +10736,9 @@ mod tests {
         let cleared = runtime.clear_queued_messages().expect("clear queue");
 
         assert_eq!(cleared, 2);
-        assert!(runtime.session().queued_messages.is_empty());
+        assert!(runtime.session().queued_messages().is_empty());
         let (_store, loaded) = SessionStore::open(store.path().to_path_buf()).expect("open queue");
-        assert!(loaded.queued_messages.is_empty());
+        assert!(loaded.queued_messages().is_empty());
 
         let _ = fs::remove_dir_all(base);
     }

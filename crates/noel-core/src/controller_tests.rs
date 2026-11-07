@@ -778,11 +778,13 @@ async fn a_journal_written_by_noel_main_opens_and_resumes_unchanged() {
     assert_eq!(
         (steering, follow_ups),
         (
-            &["look again".to_owned()][..],
-            &["then summarize".to_owned()][..]
+            vec!["look again".to_owned()],
+            vec!["then summarize".to_owned()]
         )
     );
-    assert!(state.queued_ids.is_empty() && state.past_submissions.is_empty());
+    assert!(
+        state.queue.iter().all(|entry| entry.id.is_none()) && state.past_submissions.is_empty()
+    );
     let (first, second) = (state.runs[0].id.clone(), state.runs[1].id.clone());
 
     // Main wrote no close records, so its interrupted run was a crash:
@@ -840,7 +842,7 @@ async fn a_journal_written_by_noel_main_opens_and_resumes_unchanged() {
     }
     let state = SessionStore::read(&path).unwrap();
     assert_eq!(state.runs[1].status, RunStatus::Completed);
-    assert!(state.queued_messages.is_empty());
+    assert!(state.queued_messages().is_empty());
     assert_eq!(
         fixture.controller.runtime().session().messages.len(),
         state.messages.len()
@@ -1204,4 +1206,41 @@ async fn a_queued_slash_tool_command_is_placed_alone() {
             .collect::<Vec<_>>(),
         ["three"]
     );
+}
+
+/// #138: a TUI enqueue keeps the saved identities of what was queued
+/// before it, in memory and in the journal.
+#[test]
+fn queueing_a_message_keeps_the_saved_ids_of_the_others() {
+    let base = std::env::temp_dir().join(format!("noel-controller-queue-ids-{}", new_session_id()));
+    let (store, state) = SessionStore::create(&base, base.clone()).unwrap();
+    let path = store.path().to_path_buf();
+    let look = QueueItem {
+        id: QueueItemId {
+            submission_id: "sub-1".into(),
+            request_id: Some("s-1".into()),
+            mode: QueueMode::FollowUp,
+        },
+        content: "look".into(),
+    };
+    store
+        .record_queue_items(std::slice::from_ref(&look), &[])
+        .unwrap();
+    drop(store);
+    let _ = state;
+    let (store, state) = SessionStore::open(path.clone()).unwrap();
+    let mut runtime = Runtime::with_store(state, systems(), store);
+    runtime.queue_message("typed".into()).unwrap();
+    let expected = vec![
+        (
+            QueueMode::FollowUp,
+            "look".to_owned(),
+            Some(look.id.clone()),
+        ),
+        (QueueMode::FollowUp, "typed".to_owned(), None),
+    ];
+    assert_eq!(runtime.session().saved_queue_items(), expected);
+    drop(runtime);
+    let (_, reopened) = SessionStore::open(path).unwrap();
+    assert_eq!(reopened.saved_queue_items(), expected);
 }
