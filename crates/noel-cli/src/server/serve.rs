@@ -86,7 +86,7 @@ pub(crate) async fn run(args: ServerArgs) -> i32 {
         return match foreground().await {
             Ok(code) => code,
             Err(error) => {
-                eprintln!("noel server: {error:#}");
+                tracing::warn!("noel server: {error:#}");
                 1
             }
         };
@@ -97,11 +97,11 @@ pub(crate) async fn run(args: ServerArgs) -> i32 {
             0
         }
         Ok(Started::AlreadyRunning(pid)) => {
-            eprintln!("noel server: already running (pid {pid})");
+            tracing::info!("noel server: already running (pid {pid})");
             EXIT_LOCKED
         }
         Err(error) => {
-            eprintln!("noel server: {error:#}");
+            tracing::warn!("noel server: {error:#}");
             1
         }
     }
@@ -211,7 +211,7 @@ async fn foreground() -> Result<i32> {
     match lock_file.try_lock() {
         Ok(()) => {}
         Err(fs::TryLockError::WouldBlock) => {
-            eprintln!(
+            tracing::info!(
                 "noel server: another server holds {}; exiting",
                 lock_path.display()
             );
@@ -225,9 +225,7 @@ async fn foreground() -> Result<i32> {
 
     // Sessions and models as `noel` sees them from the home directory: the
     // global settings, never a project's.
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
+    let home = noel_config::env::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let paths = crate::config_paths(home.clone(), None)?;
     let mut config = load_config_with_project_trust(paths, false)?;
     if std::env::var_os(ENV_SESSION_DIR).is_none()
@@ -263,7 +261,7 @@ async fn foreground() -> Result<i32> {
             "sessionDir": config.paths.session_dir.display().to_string(),
         }),
     )?;
-    eprintln!(
+    tracing::info!(
         "noel server: listening on {} (pid {}, build {build}); sessions in {}",
         socket.display(),
         std::process::id(),
@@ -342,7 +340,7 @@ async fn foreground() -> Result<i32> {
         }
         let idle = lock(&clients).is_empty() && workers.count() == 0;
         if idle && lock(&activity).elapsed() >= idle_exit {
-            eprintln!("noel server: idle; exiting");
+            tracing::info!("noel server: idle; exiting");
             break 0;
         }
     };
@@ -352,7 +350,7 @@ async fn foreground() -> Result<i32> {
     let _ = fs::remove_file(&socket);
     let _ = fs::remove_file(dir.server_record());
     host.close().await;
-    eprintln!("noel server: exited ({code})");
+    tracing::info!("noel server: exited ({code})");
     drop(lock_file);
     Ok(code)
 }
@@ -367,15 +365,15 @@ fn log_event(event: &HostEvent, clients: &Mutex<HashSet<u64>>) {
             if *role == Role::Child {
                 lock(clients).insert(*link);
             }
-            eprintln!("noel server: link {link} opened: {role:?} {principal}");
+            tracing::info!("noel server: link {link} opened: {role:?} {principal}");
         }
         HostEvent::Opened { .. } => {}
         HostEvent::Closed { link } => {
             lock(clients).remove(link);
-            eprintln!("noel server: link {link} closed");
+            tracing::info!("noel server: link {link} closed");
         }
         HostEvent::ProtocolError { link, error } => {
-            eprintln!("noel server: link {link}: protocol error: {error}")
+            tracing::warn!("noel server: link {link}: protocol error: {error}")
         }
         HostEvent::Held {
             link,
@@ -383,12 +381,12 @@ fn log_event(event: &HostEvent, clients: &Mutex<HashSet<u64>>) {
             type_name,
             params,
             ..
-        } => eprintln!("noel server: hold link {link} id {hold}: {type_name} {params}"),
+        } => tracing::info!("noel server: hold link {link} id {hold}: {type_name} {params}"),
         HostEvent::Released {
             link,
             hold,
             type_name,
-        } => eprintln!("noel server: release link {link} id {hold}: {type_name}"),
+        } => tracing::info!("noel server: release link {link} id {hold}: {type_name}"),
     }
 }
 
@@ -420,7 +418,7 @@ pub(crate) async fn accept_clients(listener: UnixListener, host: Host, owner_uid
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
             Err(error) => {
-                eprintln!("noel server: accept: {error}");
+                tracing::warn!("noel server: accept: {error}");
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -428,7 +426,7 @@ pub(crate) async fn accept_clients(listener: UnixListener, host: Host, owner_uid
         match stream.peer_cred() {
             Ok(credentials) if credentials.uid() == owner_uid => {}
             Ok(credentials) => {
-                eprintln!(
+                tracing::warn!(
                     "noel server: refused a connection from uid {} (pid {:?}): not the owner",
                     credentials.uid(),
                     credentials.pid()
@@ -437,7 +435,7 @@ pub(crate) async fn accept_clients(listener: UnixListener, host: Host, owner_uid
                 continue;
             }
             Err(error) => {
-                eprintln!("noel server: refused a connection: no peer credentials: {error}");
+                tracing::warn!("noel server: refused a connection: no peer credentials: {error}");
                 drop(stream);
                 continue;
             }
@@ -458,7 +456,7 @@ pub(crate) async fn accept_clients(listener: UnixListener, host: Host, owner_uid
                     let via = *lock(&via);
                     host.accept(websocket(socket), LinkOptions::new(owner(via)));
                 }
-                Err(error) => eprintln!("noel server: refused: websocket upgrade: {error}"),
+                Err(error) => tracing::warn!("noel server: refused: websocket upgrade: {error}"),
             }
         });
     }
@@ -589,10 +587,10 @@ impl Workers {
             if let Some(pid) = pid.filter(|pid| alive(*pid)) {
                 match workers.attach(&id, Some(pid), true).await {
                     Ok(link) => {
-                        eprintln!("noel server: attached worker {id} again (pid {pid})");
+                        tracing::info!("noel server: attached worker {id} again (pid {pid})");
                         return Ok(link);
                     }
-                    Err(error) => eprintln!("noel server: {error}"),
+                    Err(error) => tracing::warn!("noel server: {error}"),
                 }
             }
             // A worker lost a moment ago may still hold the journal's lock.
@@ -684,7 +682,7 @@ impl Workers {
         };
         tokio::spawn(async move {
             if let Ok(status) = child.wait().await {
-                eprintln!("noel server: worker pid {pid:?} exited: {status}");
+                tracing::info!("noel server: worker pid {pid:?} exited: {status}");
             }
         });
         match message
@@ -725,7 +723,7 @@ impl Workers {
             }
             entry.1 += 1;
         }
-        eprintln!(
+        tracing::info!(
             "noel server: started worker {id} generation {generation} (pid {pid:?}){}",
             resume
                 .as_ref()
@@ -756,7 +754,7 @@ impl Workers {
             .filter(|(run_id, _)| *run_id == run.id)
             .map_or(0, |(_, count)| *count);
         if resumes >= RESUME_LIMIT {
-            eprintln!(
+            tracing::info!(
                 "noel server: run {} of {id} stays interrupted: resumed {RESUME_LIMIT} times already",
                 run.id
             );
@@ -884,10 +882,10 @@ impl Workers {
         self.changed.notify_one();
         let Some(leaving) = leaving else { return };
         if leaving {
-            eprintln!("noel server: worker {id} generation {generation} exited");
+            tracing::info!("noel server: worker {id} generation {generation} exited");
             return;
         }
-        eprintln!("noel server: lost worker {id} generation {generation}");
+        tracing::warn!("noel server: lost worker {id} generation {generation}");
         if self.closing.load(Ordering::SeqCst) {
             return;
         }
@@ -907,7 +905,7 @@ impl Workers {
         .flatten()
         .unwrap_or(false);
         if interrupted && let Err(error) = self.ensure(&id).await {
-            eprintln!("noel server: could not restart worker {id}: {error}");
+            tracing::warn!("noel server: could not restart worker {id}: {error}");
         }
     }
 
@@ -940,14 +938,14 @@ impl Workers {
                 .and_then(Value::as_u64)
                 .and_then(|pid| u32::try_from(pid).ok());
             if pid.is_some_and(|pid| !alive(pid)) {
-                eprintln!("noel server: worker {id} is gone; removing its files");
+                tracing::info!("noel server: worker {id} is gone; removing its files");
                 let _ = fs::remove_file(&path);
                 let _ = remove_stale_socket(&self.dir.worker_socket(&id));
                 continue;
             }
             match self.attach(&id, pid, true).await {
-                Ok(_) => eprintln!("noel server: adopted worker {id} (pid {pid:?})"),
-                Err(error) => eprintln!("noel server: did not adopt worker {id}: {error}"),
+                Ok(_) => tracing::info!("noel server: adopted worker {id} (pid {pid:?})"),
+                Err(error) => tracing::warn!("noel server: did not adopt worker {id}: {error}"),
             }
         }
     }
@@ -1502,7 +1500,7 @@ async fn refresh_directory(sessions: Arc<Sessions>, workers: Arc<Workers>) {
         if let Ok(value) = tokio::task::spawn_blocking(move || scanner.scan(&live)).await
             && let Err(error) = sessions.directory.update(value)
         {
-            eprintln!("noel server: directory: {error}");
+            tracing::warn!("noel server: directory: {error}");
         }
         tokio::select! {
             () = sessions.changed.notified() => {}

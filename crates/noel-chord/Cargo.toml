@@ -6,6 +6,7 @@ license.workspace = true
 description = "Chord v2 for noel: contracts, messages and the binary codec, channels, hosts with routes and relays, transports, the Delta op codec and canonical JSON"
 
 [dependencies]
+tracing.workspace = true
 flate2 = "=1.1.9"
 getrandom.workspace = true
 futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }

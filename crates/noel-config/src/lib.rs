@@ -9,7 +9,7 @@ pub use resources::{ResourceOptions, SourceInfo, SourceScope};
 pub use skills::{format_skills_for_prompt, Skill, SkillReader};
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
+
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
@@ -24,6 +24,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
 mod auth;
 mod context_files;
+pub mod env;
 mod model_resolver;
 mod resource_files;
 mod settings;
@@ -47,19 +48,19 @@ pub const CONFIG_DIR_NAME: &str = ".noel";
 /// pi's directory: projects written for pi track `.pi/`, and pi kept its
 /// state in `~/.pi/agent`.
 pub const PI_CONFIG_DIR_NAME: &str = ".pi";
-pub const ENV_AGENT_DIR: &str = "NOEL_DIR";
-pub const ENV_SESSION_DIR: &str = "NOEL_SESSION_DIR";
+pub const ENV_AGENT_DIR: &str = env::AGENT_DIR;
+pub const ENV_SESSION_DIR: &str = env::SESSION_DIR;
 /// Set by the test harness (`make test`, and every `noel` the CLI tests run).
 /// noel then refuses to fall back to `~/.noel`, so a test must name its
 /// agent dir with `NOEL_DIR`, imports no Claude Code or Codex
 /// login from `$HOME` and no `~/.pi/agent`, reads no `~/.agents/skills`, and
 /// starts no background model refresh.
-pub const ENV_TEST_ISOLATION: &str = "NOEL_TEST_ISOLATION";
+pub const ENV_TEST_ISOLATION: &str = env::TEST_ISOLATION;
 pub const PROJECT_TRUST_FILE_NAME: &str = "trust.json";
 
 /// True under the test harness; see [`ENV_TEST_ISOLATION`].
 pub fn test_isolation() -> bool {
-    env::var_os(ENV_TEST_ISOLATION).is_some()
+    std::env::var_os(ENV_TEST_ISOLATION).is_some()
 }
 const RESOURCE_IGNORE_FILES: [&str; 3] = [".gitignore", ".ignore", ".fdignore"];
 
@@ -123,7 +124,7 @@ impl ConfigPaths {
     ) -> Result<(Self, Option<PiImport>), ConfigError> {
         let cwd = cwd.into();
         let mut import = None;
-        let agent_dir = match env::var_os(ENV_AGENT_DIR) {
+        let agent_dir = match std::env::var_os(ENV_AGENT_DIR) {
             Some(value) => expand_tilde(PathBuf::from(value))?,
             None if test_isolation() => return Err(ConfigError::DefaultAgentDirInTest),
             None => {
@@ -136,7 +137,7 @@ impl ConfigPaths {
         };
         let session_dir = match session_dir_override {
             Some(value) => expand_tilde(value)?,
-            None => match env::var_os(ENV_SESSION_DIR) {
+            None => match std::env::var_os(ENV_SESSION_DIR) {
                 Some(value) => expand_tilde(PathBuf::from(value))?,
                 None => agent_dir.join("sessions"),
             },
@@ -1099,7 +1100,7 @@ fn merge_model_definitions(
 
 fn resolve_config_value(value: &str) -> String {
     if let Some(name) = value.strip_prefix("env:") {
-        return env::var(name).unwrap_or_default();
+        return std::env::var(name).unwrap_or_default();
     }
     value.to_string()
 }
@@ -1136,7 +1137,9 @@ fn with_base_url_env(
 }
 
 fn read_non_empty_env(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.trim().is_empty())
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -1340,9 +1343,7 @@ fn expand_tilde(path: PathBuf) -> Result<PathBuf, ConfigError> {
 }
 
 fn home_dir() -> Result<PathBuf, ConfigError> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or(ConfigError::HomeUnavailable)
+    env::home_dir().ok_or(ConfigError::HomeUnavailable)
 }
 
 #[cfg(test)]

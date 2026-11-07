@@ -6,6 +6,7 @@ license.workspace = true
 description = "noel's workspaces: the ExecutionEnv interface (a file system plus a shell, as upstream Durable's), LocalEnv, and the pi-env client (RemoteEnv over a daemon, SSH deployment)"
 
 [dependencies]
+tracing.workspace = true
 async-trait.workspace = true
 libc = "=0.2.186"
 nix.workspace = true

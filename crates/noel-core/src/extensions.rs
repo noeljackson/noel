@@ -467,6 +467,7 @@ impl ExtensionHosts {
         }
         match launch(extension_name, &spec).await {
             Ok((process, set)) => {
+                tracing::debug!(extension = extension_name, "extension host started");
                 match set {
                     Some(set) => {
                         self.registrations.insert(extension_name.to_string(), set);
@@ -485,6 +486,7 @@ impl ExtensionHosts {
                 Ok(())
             }
             Err(message) => {
+                tracing::warn!(extension = extension_name, %message, "extension host failed to start");
                 // A spawn or init failure is recorded: later calls report
                 // it instead of "has no host", failing closed with the
                 // reason.
@@ -610,6 +612,10 @@ impl ExtensionHosts {
         if !host.usable() {
             // Exited, or its pipe broke (a request cancelled mid-read, or
             // one that failed): start it again, as `/reload` would.
+            tracing::debug!(
+                extension = extension_name,
+                "extension host unusable; starting it again"
+            );
             let (process, set) = launch(extension_name, &entry.spec)
                 .await
                 .map_err(|error| format!("extension {extension_name} exited; {error}"))?;
@@ -907,7 +913,7 @@ fn host_command(path: &Path, bun: Option<&Path>) -> Result<tokio::process::Comma
 /// binary, else the agent dir's `extension-hosts/noel-bun-host.ts`, the
 /// same agent dir the config discovers.
 fn find_bun_host() -> Option<PathBuf> {
-    if let Some(override_path) = std::env::var_os("NOEL_BUN_HOST") {
+    if let Some(override_path) = std::env::var_os(noel_config::env::BUN_HOST) {
         let path = PathBuf::from(override_path);
         if path.is_file() {
             return Some(path);
@@ -930,7 +936,7 @@ fn find_bun_host() -> Option<PathBuf> {
 /// install` puts there), else a `bun` on PATH. Musl and glibc systems both
 /// run the stock release build; the download picks the right asset.
 pub fn find_bun_binary() -> Option<PathBuf> {
-    if let Some(override_value) = std::env::var_os("NOEL_BUN_BIN") {
+    if let Some(override_value) = std::env::var_os(noel_config::env::BUN_BIN) {
         let value = override_value.to_string_lossy().to_string();
         let value = value.trim();
         if value == "path" {

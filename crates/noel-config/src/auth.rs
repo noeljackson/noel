@@ -478,7 +478,7 @@ pub(crate) fn env_api_key(provider: &str) -> Option<String> {
         "zai-coding-cn" => &["ZAI_CODING_CN_API_KEY"][..],
         _ => &[],
     };
-    names.iter().find_map(|name| env::var(name).ok())
+    names.iter().find_map(|name| std::env::var(name).ok())
 }
 
 pub(crate) fn env_auth(provider: &str) -> Option<ResolvedAuth> {

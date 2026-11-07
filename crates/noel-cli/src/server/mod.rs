@@ -151,13 +151,12 @@ fn passwd_home() -> Option<std::ffi::OsString> {
 /// user's own (which moves the default agent and session dirs) when any is
 /// set, so each has its own server; empty for the defaults.
 fn scope_suffix() -> String {
+    use noel_config::env;
     use sha2::{Digest, Sha256};
-    let dir = std::env::var_os("NOEL_DIR").filter(|dir| !dir.is_empty());
-    let sessions = std::env::var_os(noel_config::ENV_SESSION_DIR).filter(|dir| !dir.is_empty());
+    let dir = env::non_empty(env::AGENT_DIR);
+    let sessions = env::non_empty(env::SESSION_DIR);
     let own_home = passwd_home();
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .filter(|home| Some(home) != own_home.as_ref());
+    let home = env::non_empty("HOME").filter(|home| Some(home) != own_home.as_ref());
     if dir.is_none() && sessions.is_none() && home.is_none() {
         return String::new();
     }

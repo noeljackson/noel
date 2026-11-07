@@ -461,6 +461,7 @@ impl Inner {
     /// fail: a caller that tries again as soon as its request fails must not get the lost session back, as it cannot
     /// in upstream's single-threaded runtime, where the rejections run after the teardown.
     fn teardown(&self, session: &Arc<Session>, error: RemoteError) {
+        tracing::debug!(session = session.id, error = %error.message, "pi-env session ended");
         let Some(was_ready) = session.mark_ended() else {
             return;
         };
@@ -719,6 +720,7 @@ impl Connection {
                     state.set_status(ConnectionStatus::Lost(error.message.clone()));
                 }
                 Ok(started) if current && started.session.is_live() => {
+                    tracing::debug!(session = started.session.id, "pi-env connected");
                     state.set_status(ConnectionStatus::Connected);
                 }
                 _ => {}
