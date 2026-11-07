@@ -614,6 +614,8 @@ impl View {
                 }
                 true
             }
+            // The compaction's end reports it; the history is read afresh.
+            TurnEvent::HistoryRewritten(_) => false,
             TurnEvent::CompactionStarted => {
                 let trigger = if std::mem::take(&mut self.live.overflowed) {
                     CompactionTrigger::Overflow

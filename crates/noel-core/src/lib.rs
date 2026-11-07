@@ -1504,13 +1504,16 @@ pub struct SessionStore {
 /// How the journal's last run stopped, as opening it found: for a resume
 /// to charge a model request a crash cut off (Durable section 8.3).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ResumeHint {
-    /// The attempt of the reply a stop cut off, recovered as an aborted
-    /// reply.
-    pub attempt: Option<u64>,
-    /// The run was waiting out a retry's backoff (its last record is a
-    /// `retry_wait`): no request was in flight.
-    pub waiting: bool,
+pub enum ResumeHint {
+    /// Nothing says how it stopped (or a resume already took the hint).
+    #[default]
+    Unknown,
+    /// A request was in flight: the attempt of the reply a stop cut off,
+    /// recovered as an aborted reply.
+    InRequest(u64),
+    /// The run was waiting out a retry's backoff or a compaction (its last
+    /// record is a `retry_wait`): no request was in flight.
+    InBackoff,
 }
 
 fn lock_hint(hint: &Mutex<ResumeHint>) -> std::sync::MutexGuard<'_, ResumeHint> {
@@ -1653,8 +1656,13 @@ impl SessionStore {
         })?;
         let store = Self::writer(path)?;
         let mut state = store.load()?;
-        lock_hint(&store.hint).waiting = waiting_retry(&store.path);
-        store.recover_partial(&mut state)?;
+        let waiting = waiting_retry(&store.path);
+        let attempt = store.recover_partial(&mut state)?;
+        *lock_hint(&store.hint) = match (waiting, attempt) {
+            (true, _) => ResumeHint::InBackoff,
+            (false, Some(attempt)) => ResumeHint::InRequest(attempt),
+            (false, None) => ResumeHint::Unknown,
+        };
         Ok((store, state))
     }
 
@@ -1662,16 +1670,17 @@ impl SessionStore {
     /// saved of it becomes an aborted reply in the transcript, which later
     /// requests leave out, and supersedes the partial. A reply that saved
     /// nothing leaves nothing.
-    pub fn recover_partial(&self, state: &mut SessionState) -> Result<(), SessionError> {
+    /// Returns the attempt of the reply recovered, if one was cut off.
+    pub fn recover_partial(&self, state: &mut SessionState) -> Result<Option<u64>, SessionError> {
         let Some(partial) = state.partial.take() else {
-            return Ok(());
+            return Ok(None);
         };
-        lock_hint(&self.hint).attempt = Some(partial.attempt);
+        let attempt = partial.attempt;
         if let Some(message) = partial.aborted_message() {
             self.record_message(message.clone())?;
             state.messages.push(message);
         }
-        Ok(())
+        Ok(Some(attempt))
     }
 
     /// Loads a session without locking or repairing it, for listing, pickers,
@@ -1706,9 +1715,11 @@ impl SessionStore {
         }
     }
 
-    /// How the journal's last run stopped, as opening it found.
-    pub fn resume_hint(&self) -> ResumeHint {
-        *lock_hint(&self.hint)
+    /// How the journal's last run stopped, as opening it found. Taken
+    /// once: the resume it informs is the only one it describes, so a
+    /// later call (and every clone of this store) finds `Unknown`.
+    pub fn take_resume_hint(&self) -> ResumeHint {
+        std::mem::take(&mut *lock_hint(&self.hint))
     }
 
     /// Opens the session a storage holds (another backend than the journal
@@ -1717,7 +1728,9 @@ impl SessionStore {
     pub fn open_storage(storage: storage::Storage) -> Result<(Self, SessionState), SessionError> {
         let store = Self::on(storage);
         let mut state = store.load()?;
-        store.recover_partial(&mut state)?;
+        if let Some(attempt) = store.recover_partial(&mut state)? {
+            *lock_hint(&store.hint) = ResumeHint::InRequest(attempt);
+        }
         Ok((store, state))
     }
 
@@ -4229,6 +4242,10 @@ pub enum TurnEvent {
     /// A compaction started: because the context estimate crossed the
     /// threshold, or after `Overflowed`.
     CompactionStarted,
+    /// A compaction replaced the history: the messages as saved now, sent
+    /// just before `CompactionFinished`, so a copy of the session kept from
+    /// the events stays the same as the saved one.
+    HistoryRewritten(Vec<ConversationMessage>),
     CompactionFinished(CompactionRecord),
     /// Automatic compaction could not run (nothing compactable, or the
     /// retained tail alone exceeds the budget). The turn proceeds with the
@@ -4508,6 +4525,9 @@ async fn run_model_turn(
             {
                 Ok(Some(record)) => {
                     failed_compaction_fingerprint = None;
+                    on_event(&TurnEvent::HistoryRewritten(
+                        runtime.session.messages.clone(),
+                    ));
                     on_event(&TurnEvent::CompactionFinished(record));
                 }
                 Ok(None) => {}
@@ -4594,7 +4614,7 @@ async fn run_model_turn(
             recovery.finish_retries(None, &mut on_event);
             // What was saved of the reply no longer stands; the reply is
             // still saved below if nothing replaces it.
-            progress.dropped()?;
+            progress.dropped(progress::Dropped::Compaction)?;
             if recovery
                 .compact(runtime, provider, run, &mut on_event)
                 .await?
@@ -4695,7 +4715,7 @@ impl Recovery {
                     error: Some(error.to_string()),
                 });
                 self.finish_retries(Some(&error), on_event);
-                progress.dropped()?;
+                progress.dropped(progress::Dropped::Compaction)?;
                 if let Some(store) = &runtime.store {
                     store.append(&SessionRecord::RetryWait {
                         run_id: run.run_id.clone(),
@@ -4726,7 +4746,7 @@ impl Recovery {
                     delay_ms: delay,
                     error_message: error.to_string(),
                 }));
-                progress.dropped()?;
+                progress.dropped(progress::Dropped::Retry)?;
                 let backoff = run.retry.backoff(Duration::from_millis(delay));
                 if run.until_cancelled(backoff).await? {
                     return Ok(());
@@ -4782,6 +4802,9 @@ impl Recovery {
         let compaction = runtime.compact_after_overflow(provider);
         match run.until_cancelled(compaction).await? {
             Ok(record) => {
+                on_event(&TurnEvent::HistoryRewritten(
+                    runtime.session.messages.clone(),
+                ));
                 on_event(&TurnEvent::CompactionFinished(record));
                 Ok(true)
             }
@@ -11014,7 +11037,9 @@ mod tests {
         };
         events
             .iter()
+            .filter(|event| !matches!(event, TurnEvent::HistoryRewritten(_)))
             .map(|event| match event {
+                TurnEvent::HistoryRewritten(_) => unreachable!("filtered"),
                 TurnEvent::RoundStarted => "round started".to_string(),
                 TurnEvent::RoundResumed(reply) => format!("round resumed: {}", message(reply)),
                 TurnEvent::MessageAdded(saved) => message(saved),

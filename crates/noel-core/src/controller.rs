@@ -700,11 +700,16 @@ impl<H: Host> SessionController<H> {
                 let hint = runtime
                     .store
                     .as_ref()
-                    .map(SessionStore::resume_hint)
+                    .map(SessionStore::take_resume_hint)
                     .unwrap_or_default();
-                if !hint.waiting {
+                let charged = match hint {
+                    crate::ResumeHint::InBackoff => None,
+                    crate::ResumeHint::InRequest(attempt) => Some(attempt.max(1)),
+                    crate::ResumeHint::Unknown => Some(1),
+                };
+                if let Some(charged) = charged {
                     call = Call::Resume {
-                        charged: Some(hint.attempt.unwrap_or(1).max(1)),
+                        charged: Some(charged),
                     };
                 }
             }
@@ -1394,34 +1399,47 @@ impl<H: Host> Live<H> {
 impl ActiveRun {
     /// Keeps the session copy in step with what the engine saves.
     fn mirror(&mut self, event: &TurnEvent) {
-        match event {
-            TurnEvent::MessageAdded(message) => self.session.messages.push(message.clone()),
-            TurnEvent::ToolOutput {
-                call,
-                output,
-                images,
-                is_error,
-                ..
-            } => {
-                self.session.tool_history.push(ToolEvent {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    result: output.clone(),
-                    is_error: *is_error,
-                });
-                self.session.messages.push(ConversationMessage {
-                    role: MessageRole::Tool,
-                    content: output.clone(),
-                    thinking: String::new(),
-                    media: images.clone(),
-                    tool_call_id: Some(call.id.clone()),
-                    tool_name: Some(call.name.clone()),
-                    tool_calls: Vec::new(),
-                    aborted: false,
-                });
-            }
-            _ => {}
+        mirror(&mut self.session, event);
+    }
+}
+
+/// Applies to `session` what the engine saved with `event`, so a copy kept
+/// from a run's events is the session the run saved (#142): messages and
+/// tool results, todos, and a compaction's rewritten history.
+pub(crate) fn mirror(session: &mut SessionState, event: &TurnEvent) {
+    match event {
+        TurnEvent::MessageAdded(message) => session.messages.push(message.clone()),
+        TurnEvent::ToolOutput {
+            call,
+            output,
+            images,
+            is_error,
+            ..
+        } => {
+            session.tool_history.push(ToolEvent {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                result: output.clone(),
+                is_error: *is_error,
+            });
+            session.messages.push(ConversationMessage {
+                role: MessageRole::Tool,
+                content: output.clone(),
+                thinking: String::new(),
+                media: images.clone(),
+                tool_call_id: Some(call.id.clone()),
+                tool_name: Some(call.name.clone()),
+                tool_calls: Vec::new(),
+                aborted: false,
+            });
         }
+        TurnEvent::HistoryRewritten(messages) => {
+            session.messages.clone_from(messages);
+            session.partial = None;
+        }
+        TurnEvent::TodosUpdated(todos) => session.todos.clone_from(todos),
+        TurnEvent::CompactionFinished(record) => session.compactions.push(record.clone()),
+        _ => {}
     }
 }
 
