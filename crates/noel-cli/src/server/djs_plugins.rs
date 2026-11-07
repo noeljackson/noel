@@ -154,7 +154,7 @@ impl Script {
         if let Some(state) = completed.store_writes.set.get("state") {
             *self.state.lock().unwrap_or_else(PoisonError::into_inner) = Some(state.clone());
             if let Err(error) = std::fs::write(&self.state_path, state.to_string()) {
-                eprintln!(
+                tracing::warn!(
                     "noel server: plugin state {}: {error}",
                     self.state_path.display()
                 );

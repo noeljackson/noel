@@ -467,6 +467,7 @@ impl ExtensionHosts {
         }
         match launch(extension_name, &spec).await {
             Ok((process, set)) => {
+                tracing::debug!(extension = extension_name, "extension host started");
                 match set {
                     Some(set) => {
                         self.registrations.insert(extension_name.to_string(), set);
@@ -485,6 +486,7 @@ impl ExtensionHosts {
                 Ok(())
             }
             Err(message) => {
+                tracing::warn!(extension = extension_name, %message, "extension host failed to start");
                 // A spawn or init failure is recorded: later calls report
                 // it instead of "has no host", failing closed with the
                 // reason.
@@ -610,6 +612,10 @@ impl ExtensionHosts {
         if !host.usable() {
             // Exited, or its pipe broke (a request cancelled mid-read, or
             // one that failed): start it again, as `/reload` would.
+            tracing::debug!(
+                extension = extension_name,
+                "extension host unusable; starting it again"
+            );
             let (process, set) = launch(extension_name, &entry.spec)
                 .await
                 .map_err(|error| format!("extension {extension_name} exited; {error}"))?;

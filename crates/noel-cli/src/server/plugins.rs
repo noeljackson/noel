@@ -89,11 +89,11 @@ pub(crate) fn manifests(agent_dir: &Path) -> Vec<Manifest> {
                 manifest.dir = entry.path();
                 found.insert(manifest.name.clone(), manifest);
             }
-            Ok(_) => eprintln!(
+            Ok(_) => tracing::info!(
                 "noel server: plugin {}: needs a name of [a-z0-9-] and a command or a script",
                 path.display()
             ),
-            Err(error) => eprintln!("noel server: plugin {}: {error}", path.display()),
+            Err(error) => tracing::warn!("noel server: plugin {}: {error}", path.display()),
         }
     }
     found.into_values().collect()
@@ -113,7 +113,7 @@ pub(crate) fn grants(agent_dir: &Path) -> BTreeMap<String, Vec<String>> {
         return BTreeMap::new();
     };
     let Ok(Value::Object(plugins)) = serde_json::from_str::<Value>(&text) else {
-        eprintln!("noel server: plugins.json is no JSON object; no permissions granted");
+        tracing::info!("noel server: plugins.json is no JSON object; no permissions granted");
         return BTreeMap::new();
     };
     plugins
@@ -252,10 +252,10 @@ impl Plugins {
                         plugin.error = Some(stopped);
                     }
                     drop(state);
-                    eprintln!("noel server: plugin {name} stopped; starting it again");
+                    tracing::warn!("noel server: plugin {name} stopped; starting it again");
                 }
                 Err(error) => {
-                    eprintln!("noel server: plugin {name}: {error}");
+                    tracing::warn!("noel server: plugin {name}: {error}");
                     if let Some(plugin) = lock(&self.state).get_mut(&name) {
                         plugin.error = Some(error);
                     }
@@ -287,7 +287,7 @@ impl Plugins {
             let (outer, inner) = Link::memory_pair();
             let serving = tokio::spawn(super::djs_plugins::serve(name.to_owned(), script, inner));
             self.linked(name, outer, granted);
-            eprintln!("noel server: started script plugin {name}");
+            tracing::info!("noel server: started script plugin {name}");
             return Ok(Box::pin(async move {
                 match serving.await {
                     Ok(Ok(())) => "its link closed".to_owned(),
@@ -325,7 +325,7 @@ impl Plugins {
         let stdin = child.stdin.take().expect("piped");
         let (link, _) = framed(stdout, stdin, None);
         self.linked(name, link, granted);
-        eprintln!("noel server: started plugin {name} (pid {:?})", child.id());
+        tracing::info!("noel server: started plugin {name} (pid {:?})", child.id());
         Ok(Box::pin(async move {
             match child.wait().await {
                 Ok(status) => format!("exited: {status}"),
@@ -423,7 +423,7 @@ impl Plugins {
             .collect();
         drop(state);
         if let Err(error) = self.directory.update(json!({ "plugins": entries })) {
-            eprintln!("noel server: the plugin directory: {error}");
+            tracing::warn!("noel server: the plugin directory: {error}");
         }
     }
 

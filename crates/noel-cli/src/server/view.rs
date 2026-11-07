@@ -845,7 +845,7 @@ impl View {
         if let Err(error) = self.cell.apply(ops) {
             // The ops were made from what the cell holds; should they not
             // apply, the whole value replaces it.
-            eprintln!("noel worker: view ops failed ({error}); replacing the view");
+            tracing::warn!("noel worker: view ops failed ({error}); replacing the view");
             let _ = self.cell.replace(self.full());
         }
     }

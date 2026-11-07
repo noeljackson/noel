@@ -205,6 +205,7 @@ impl Actor {
 
     /// `link` is the path's link now: every holder is held on it.
     pub(super) fn path_connected(&mut self, key: &PathKey, link: u64) {
+        tracing::debug!(?key, link, "path connected");
         let path = self.paths.entry(key.clone()).or_default();
         path.phase = PathPhase::Linked(link);
         path.linked = true;
@@ -216,6 +217,7 @@ impl Actor {
     /// `link` closed: the holders of its path go loading until the next
     /// link; a route resolves its address again while it has holders.
     pub(super) fn path_disconnected(&mut self, link: u64) {
+        tracing::debug!(link, "path link closed");
         let Some((key, path)) = self
             .paths
             .iter_mut()
@@ -252,6 +254,7 @@ impl Actor {
             return;
         };
         path.phase = PathPhase::Resolving;
+        tracing::debug!(address = ?path.address, "resolving a route address");
         let tx = self.tx.clone();
         let key = key.clone();
         tokio::spawn(async move {
@@ -300,6 +303,7 @@ impl Actor {
     /// The path's route could not reach it: its holders fail waiting until
     /// the next resolve.
     fn path_failed(&mut self, key: &PathKey, error: ChordError) {
+        tracing::debug!(?key, %error, "path failed");
         let Some(path) = self.paths.get_mut(key) else {
             return;
         };
