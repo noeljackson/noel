@@ -348,14 +348,75 @@ pub(crate) fn config_paths(cwd: PathBuf, session_dir: Option<PathBuf>) -> Result
     Ok(paths)
 }
 
+fn main() -> std::process::ExitCode {
+    // Upstream's process markers, inherited by every command and tool noel
+    // starts: a generic one naming the agent, and its own, which noel sets
+    // under its name and under pi's for what was written for pi. Set before
+    // any other thread exists, because the environment is process-wide.
+    std::env::set_var("AI_AGENT", PRODUCT_NAME);
+    std::env::set_var("NOEL_CODING_AGENT", "true");
+    std::env::set_var("PI_CODING_AGENT", "true");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build();
+    let result = match runtime {
+        Ok(runtime) => {
+            let result = runtime.block_on(run());
+            // A blocking task may wait on input that never comes (a reader
+            // of stdin): the process does not wait for it long.
+            runtime.shutdown_timeout(Duration::from_millis(500));
+            result
+        }
+        Err(error) => Err(error.into()),
+    };
+    // Every exit comes back here (#179): what `run` holds is dropped first,
+    // so journals are written, children reaped and the terminal restored.
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => match error.downcast_ref::<ExitStatus>() {
+            Some(ExitStatus(code)) => exit_code(*code),
+            None => {
+                eprintln!("Error: {error:?}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+/// An exit with `code`, carried up to `main` as an error so everything on
+/// the way is dropped (#179) instead of `std::process::exit` skipping it.
+#[derive(Debug)]
+pub(crate) struct ExitStatus(pub(crate) i32);
+
+impl std::fmt::Display for ExitStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "exit status {}", self.0)
+    }
+}
+
+impl std::error::Error for ExitStatus {}
+
+/// `Ok` for status 0, else the status carried up to `main`.
+pub(crate) fn exit_with(code: i32) -> Result<()> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(ExitStatus(code).into())
+    }
+}
+
+fn exit_code(code: i32) -> std::process::ExitCode {
+    std::process::ExitCode::from(u8::try_from(code).unwrap_or(1))
+}
+
 async fn run() -> Result<()> {
     // `noel server`, `noel worker` and `noel client` (Mode 2) handle their
     // own signals.
     if let Some(code) = server::try_run(&std::env::args().collect::<Vec<_>>()).await {
-        std::process::exit(code);
+        return exit_with(code);
     }
     if let Some(code) = workspace::try_run(&std::env::args().collect::<Vec<_>>()).await {
-        std::process::exit(code);
+        return exit_with(code);
     }
     signals::install();
     if try_run_image_command().await? {
@@ -1028,7 +1089,7 @@ async fn create_runtime_when_unlocked(
                 "noel: {error}; gave up after waiting {}s",
                 SESSION_LOCK_WAIT.as_secs()
             );
-            std::process::exit(EXIT_SESSION_LOCKED);
+            return Err(ExitStatus(EXIT_SESSION_LOCKED).into());
         }
         tokio::time::sleep(SESSION_LOCK_POLL).await;
     }

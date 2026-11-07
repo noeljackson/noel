@@ -67,6 +67,8 @@ async fn main() {
             },
         )
         .command("crash", "Exits at once.", |_, _| async {
+            // On purpose: the server's restart of a plugin that dies is
+            // what this command exercises.
             std::process::exit(3);
         })
         .panel(
