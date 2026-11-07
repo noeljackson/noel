@@ -273,6 +273,7 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
         aborts: Vec::new(),
         plugin_host: Arc::new(ServerPluginTools(plugins)),
         pending_plugin_tools: None,
+        compaction: None,
     };
     let mut controller = SessionController::new(runtime, worker, AbortPolicy::WithdrawQueue);
     refresh(&mut controller);
@@ -336,6 +337,8 @@ struct Status {
     queued: usize,
     /// Whether the worker serves new work or is on its way out.
     phase: Phase,
+    /// A manual compaction runs: an abort cancels it.
+    compacting: bool,
 }
 
 /// What the worker's session loop has in hand (#134). `Working` and
@@ -734,6 +737,9 @@ struct WorkerHost {
     plugin_host: Arc<dyn PluginToolHost>,
     /// Plugin tools that changed during a run, set once it settles.
     pending_plugin_tools: Option<Vec<PluginTool>>,
+    /// Ends the manual compaction running now, if any: an abort that
+    /// arrives meanwhile cancels it.
+    compaction: Option<noel_core::CancellationToken>,
 }
 
 impl ControllerHost for WorkerHost {
@@ -850,7 +856,7 @@ async fn drive(
         };
         let status = controller.host().status.clone();
         status.update(|status| status.slot = Slot::Working);
-        let start = idle_command(&mut controller, command).await;
+        let start = idle_command_aborting(&mut controller, command, &mut inbox, &mut early).await;
         refresh(&mut controller);
         // A start in hand blocks an exit until its run reports starting
         // (#134: the status used to read idle in between).
@@ -869,6 +875,38 @@ async fn drive(
             }
         }
     }
+}
+
+/// [`idle_command`], with the inbox read meanwhile: an abort cancels a
+/// manual compaction in progress (#175) and is answered at once; anything
+/// else waits for the command to finish.
+async fn idle_command_aborting(
+    controller: &mut SessionController<WorkerHost>,
+    command: Command,
+    inbox: &mut mpsc::UnboundedReceiver<Command>,
+    early: &mut std::collections::VecDeque<Command>,
+) -> Option<Start> {
+    let cancel = noel_core::CancellationToken::default();
+    controller.host().compaction = Some(cancel.clone());
+    let compacting = controller.host().status.clone();
+    let start = {
+        let command = idle_command(controller, command);
+        tokio::pin!(command);
+        loop {
+            tokio::select! {
+                start = &mut command => break start,
+                Some(next) = inbox.recv() => match next {
+                    Command::Abort(_, reply) if compacting.get().compacting => {
+                        cancel.cancel();
+                        let _ = reply.send(Ok(json!({"withdrawn": 0})));
+                    }
+                    next => early.push_back(next),
+                },
+            }
+        }
+    };
+    controller.host().compaction = None;
+    start
 }
 
 async fn run_session(
@@ -962,6 +1000,19 @@ impl PluginToolHost for ServerPluginTools {
     }
 }
 
+/// A manual compaction, which an abort meanwhile cancels.
+async fn compact(
+    controller: &mut SessionController<WorkerHost>,
+    focus: Option<&str>,
+) -> Result<noel_core::CompactionRecord, String> {
+    let cancel = controller.host().compaction.clone().unwrap_or_default();
+    let status = controller.host().status.clone();
+    status.update(|status| status.compacting = true);
+    let result = controller.compact(focus, &cancel).await;
+    status.update(|status| status.compacting = false);
+    result
+}
+
 /// A command while no run is active; a run it starts is returned.
 async fn idle_command(
     controller: &mut SessionController<WorkerHost>,
@@ -1042,7 +1093,7 @@ async fn idle_command(
         }
         Command::Compact(args, reply) => {
             let focus = args.get("instructions").and_then(Value::as_str);
-            let result = controller.compact(focus).await.map(|record| {
+            let result = compact(controller, focus).await.map(|record| {
                 json!({
                     "omittedMessages": record.omitted_messages,
                     "retainedMessages": record.retained_messages,
@@ -1433,7 +1484,7 @@ async fn session_command(
         }
         Ok(CommandOutcome::Compact { focus }) => {
             let focus = Some(focus.as_str()).filter(|focus| !focus.is_empty());
-            match controller.compact(focus).await {
+            match compact(controller, focus).await {
                 Ok(record) => output.push(
                     crate::TuiEntryKind::System,
                     format!(

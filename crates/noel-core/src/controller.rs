@@ -780,19 +780,26 @@ impl<H: Host> SessionController<H> {
     }
 
     /// Compacts the session now.
-    pub async fn compact(&mut self, focus: Option<&str>) -> Result<CompactionRecord, String> {
+    /// `cancel` ends it, with nothing saved: a compaction saves its
+    /// checkpoint only once complete (upstream's "Compaction cancelled").
+    pub async fn compact(
+        &mut self,
+        focus: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Result<CompactionRecord, String> {
         let Self { runtime, live } = self;
         let live = live.get_mut().expect("controller state");
         let provider = live.host.provider(runtime).await?;
         live.host.event(Event::CompactionStarted);
-        let result = runtime
-            .compact_messages(
-                provider.as_ref(),
-                CompactionKind::Manual,
-                focus.unwrap_or(""),
-            )
-            .await
-            .map_err(|error| error.to_string());
+        let compaction = runtime.compact_messages(
+            provider.as_ref(),
+            CompactionKind::Manual,
+            focus.unwrap_or(""),
+        );
+        let result = tokio::select! {
+            result = compaction => result.map_err(|error| error.to_string()),
+            () = cancel.cancelled() => Err(COMPACTION_CANCELLED.to_owned()),
+        };
         live.host.event(Event::CompactionEnded {
             result: result.as_ref().map_err(String::as_str),
         });
@@ -1442,6 +1449,9 @@ pub(crate) fn mirror(session: &mut SessionState, event: &TurnEvent) {
         _ => {}
     }
 }
+
+/// What a cancelled manual compaction answers (upstream's words).
+pub const COMPACTION_CANCELLED: &str = "Compaction cancelled";
 
 /// A random UUID (version 4), naming a run or a submission.
 pub fn new_id() -> String {
