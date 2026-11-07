@@ -1138,8 +1138,7 @@ impl ReloadableSystems {
             shell_command_prefix: config.settings.shell_command_prefix.clone(),
             auto_resize_images: image_setting(config, |images| images.auto_resize, true),
             block_images: image_setting(config, |images| images.block_images, false),
-            offline: std::env::var("NOEL_OFFLINE")
-                .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
+            offline: noel_config::env::offline(),
             retry: RuntimeRetrySettings {
                 enabled: config
                     .settings

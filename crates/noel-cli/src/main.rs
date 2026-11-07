@@ -1001,11 +1001,7 @@ fn validate_session_id_flags(cli: &Cli) -> Result<()> {
 }
 
 fn offline_enabled(cli_offline: bool) -> bool {
-    cli_offline
-        || std::env::var("NOEL_OFFLINE")
-            .ok()
-            .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
+    cli_offline || noel_config::env::offline()
 }
 
 fn apply_cached_claude_code_version(config: &LoadedConfig) {
@@ -1381,10 +1377,7 @@ impl AutoRestart {
                 pending: None,
             };
         }
-        let executable = std::env::var_os("NOEL_DOGFOOD_RESTART_EXE")
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_exe().ok())
-            .unwrap_or_default();
+        let executable = noel_config::env::restart_executable().unwrap_or_default();
         let modified = executable
             .metadata()
             .and_then(|metadata| metadata.modified())
@@ -1425,9 +1418,7 @@ impl AutoRestart {
 
 #[cfg(unix)]
 fn restart_current_process(session_file: Option<&Path>) -> Result<()> {
-    let executable = std::env::var_os("NOEL_DOGFOOD_RESTART_EXE")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok())
+    let executable = noel_config::env::restart_executable()
         .ok_or_else(|| anyhow!("failed to resolve restart executable"))?;
     let session_file =
         session_file.map(|path| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));

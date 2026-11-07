@@ -54,8 +54,7 @@ pub(crate) fn update_package_source(cwd: &Path, source: &str) -> Result<()> {
 
 pub(crate) fn resolve_package_source_path(cwd: &Path, source: &str) -> Result<PathBuf> {
     let path = if let Some(rest) = source.strip_prefix("~/") {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
+        noel_config::env::home_dir()
             .ok_or_else(|| anyhow!("home directory is not available"))?
             .join(rest)
     } else {
