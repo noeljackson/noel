@@ -71,7 +71,12 @@ pub enum StreamEvent {
 pub fn is_output_limit_stop(reason: &str) -> bool {
     matches!(
         reason.to_ascii_lowercase().as_str(),
-        "max_tokens" | "length" | "max_output_tokens" | "model_context_window_exceeded"
+        "max_tokens"
+            | "length"
+            | "model_length"
+            | "max_output_tokens"
+            | "incomplete.max_output_tokens"
+            | "model_context_window_exceeded"
     )
 }
 

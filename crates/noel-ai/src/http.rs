@@ -294,6 +294,72 @@ pub(crate) async fn stream_sse_response(
     Ok(SseStreamResult { body, saw_data })
 }
 
+/// One provider wire format's event stream (#135). Both the streaming
+/// and the batch path run the same parser, so they cannot drift.
+pub(crate) trait SseParser: Default {
+    /// One SSE event's data. A provider error event fails the stream.
+    fn parse_data(
+        &mut self,
+        data: &str,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError>;
+
+    /// After the last event: emits what the parser still holds (tool calls
+    /// assembled from deltas), then returns the provider's raw stop reason,
+    /// or the error for a stream that ended without its terminal event.
+    fn finish(
+        self,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<String, ProviderError>;
+}
+
+/// A whole SSE body run through `P`: its events, then exactly one `Stop`.
+/// `None` when the body has no `data:` line (a plain JSON answer).
+pub(crate) fn parse_sse_body<P: SseParser>(
+    body: &str,
+) -> Result<Option<Vec<StreamEvent>>, ProviderError> {
+    let mut parser = P::default();
+    let mut events = Vec::new();
+    let mut saw_data = false;
+    let mut sink = |event| {
+        events.push(event);
+        Ok(())
+    };
+    for line in body.lines() {
+        let Some(data) = line.trim_end_matches('\r').strip_prefix("data:") else {
+            continue;
+        };
+        saw_data = true;
+        let data = data.strip_prefix(' ').unwrap_or(data);
+        if data != "[DONE]" {
+            parser.parse_data(data, &mut sink)?;
+        }
+    }
+    if !saw_data {
+        return Ok(None);
+    }
+    let reason = parser.finish(&mut sink)?;
+    events.push(StreamEvent::Stop { reason });
+    Ok(Some(events))
+}
+
+/// A streamed SSE response run through `P`: its events as they arrive,
+/// then exactly one `Stop`. Returns the body when it had no `data:` line,
+/// for the caller to read as a plain JSON answer.
+pub(crate) async fn stream_sse<P: SseParser>(
+    response: reqwest::Response,
+    on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+) -> Result<Option<String>, ProviderError> {
+    let mut parser = P::default();
+    let stream = stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
+    if !stream.saw_data {
+        return Ok(Some(stream.body));
+    }
+    let reason = parser.finish(on_event)?;
+    on_event(StreamEvent::Stop { reason })?;
+    Ok(None)
+}
+
 pub(crate) fn process_complete_sse_blocks(
     pending: &mut Vec<u8>,
     saw_data: &mut bool,

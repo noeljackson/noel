@@ -3,6 +3,31 @@
 use super::*;
 use std::collections::BTreeSet;
 
+/// A whole SSE body's events through parser `P`, without the final
+/// `Stop`: what the batch path emits before it. `None` for no events, or
+/// for a stream that did not end properly.
+fn sse_events<P: SseParser>(body: &str) -> Option<Vec<StreamEvent>> {
+    let mut events = parse_sse_body::<P>(body).ok().flatten()?;
+    events.pop();
+    (!events.is_empty()).then_some(events)
+}
+
+fn parse_google_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
+    sse_events::<GoogleSseParser>(body)
+}
+
+fn parse_anthropic_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
+    sse_events::<AnthropicSseParser>(body)
+}
+
+fn parse_openai_responses_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
+    sse_events::<OpenAiResponsesSseParser>(body)
+}
+
+fn parse_openai_chat_completions_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
+    sse_events::<OpenAiChatCompletionsSseParser>(body)
+}
+
 fn parse_google_sse_text(body: &str) -> Option<String> {
     let events = parse_google_sse_events(body)?;
     let text = events
@@ -261,21 +286,23 @@ fn streaming_parsers_preserve_truncation_instead_of_accepting_partial_checkpoint
         )
         .unwrap();
     assert_eq!(anthropic.stop_reason.as_deref(), Some("max_tokens"));
-    let mut google = Vec::new();
-    parse_google_sse_data(
-        r#"{"candidates":[{"finishReason":"MAX_TOKENS"}]}"#,
-        &mut |event| {
-            google.push(event);
-            Ok(())
-        },
+    // Google's truncation is the stream's one Stop, last, with Google's
+    // reason (#135: it used to come first, followed by a second "STOP").
+    let google = parse_sse_body::<GoogleSseParser>(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"cut\"}]},\"finishReason\":\"MAX_TOKENS\"}]}\n",
     )
+    .unwrap()
     .unwrap();
     assert_eq!(
         google,
-        [StreamEvent::Stop {
-            reason: "max_tokens".into()
-        }]
+        [
+            StreamEvent::Text("cut".into()),
+            StreamEvent::Stop {
+                reason: "MAX_TOKENS".into()
+            }
+        ]
     );
+    assert!(is_output_limit_stop("MAX_TOKENS"));
     for status in ["incomplete", "failed", "cancelled"] {
         assert!(
             parse_openai_responses_events(&json!({"status":status,"output_text":"partial"}))
@@ -1060,9 +1087,9 @@ fn usage_is_decoded_for_all_response_apis_and_streams() {
         assert_eq!(events.unwrap().last(), Some(&expected));
     }
     assert!(response_usage(&json!({"usage": null})).is_none());
-    let chat = r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":5}}"#;
+    let chat = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":5}}"#;
     let responses = r#"{"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":5}}}"#;
-    let google = r#"{"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":5}}"#;
+    let google = r#"{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":5}}"#;
     for (data, buffered) in [
         (
             chat,
@@ -1092,13 +1119,15 @@ fn usage_is_decoded_for_all_response_apis_and_streams() {
                 .parse_data(data, &mut callback)
                 .unwrap();
         } else {
-            parse_google_sse_data(data, &mut callback).unwrap();
+            GoogleSseParser::default()
+                .parse_data(data, &mut callback)
+                .unwrap();
         }
         assert_eq!(events, std::slice::from_ref(&expected));
     }
     let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":10,"output_tokens":1}}}"#;
-    let delta = r#"{"type":"message_delta","usage":{"output_tokens":5}}"#;
-    let body = format!("data: {start}\ndata: {delta}\n");
+    let delta = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#;
+    let body = format!("data: {start}\ndata: {delta}\ndata: {{\"type\":\"message_stop\"}}\n");
     let buffered = parse_anthropic_sse_events(&body).unwrap();
     assert_eq!(buffered.last(), Some(&expected));
     let mut parser = AnthropicSseParser::default();
@@ -1121,6 +1150,8 @@ fn thinking_events_are_separate_from_answer_text() {
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" second\"}}\n\n",
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"private-signature\"}}\n\n",
         "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
     );
     let expected = vec![
         StreamEvent::Thinking("first".into()),
@@ -1150,6 +1181,7 @@ fn thinking_events_are_separate_from_answer_text() {
         "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"first\"}\n\n",
         "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\" second\"}\n\n",
         "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
     );
     assert_eq!(
         parse_openai_responses_sse_events(openai),
@@ -1243,7 +1275,12 @@ fn parses_openai_responses_sse_delta_text() {
 
 #[test]
 fn parses_openai_responses_function_call_events() {
-    let body = r#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"a.txt\"}"}}"#;
+    let body = concat!(
+        r#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"a.txt\"}"}}"#,
+        "\n\n",
+        r#"data: {"type":"response.completed","response":{"status":"completed"}}"#,
+        "\n\n",
+    );
     let events = parse_openai_responses_sse_events(body).expect("events");
 
     assert_eq!(
@@ -1275,6 +1312,7 @@ fn parses_openai_chat_completions_tool_call_events() {
     let body = concat!(
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a.txt\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n"
     );
 
@@ -1322,13 +1360,20 @@ fn openai_chat_stream_parser_emits_text_before_finish() {
         )
         .expect("parse tool end");
     assert_eq!(events, [StreamEvent::Text("hel".to_string())]);
-
     parser
+        .parse_data(
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            &mut |_| Ok(()),
+        )
+        .expect("parse finish");
+
+    let reason = parser
         .finish(&mut |event| {
             events.push(event);
             Ok(())
         })
         .expect("finish");
+    assert_eq!(reason, "tool_calls");
     assert_eq!(
         events,
         [
@@ -1372,7 +1417,7 @@ fn openai_responses_stream_parser_does_not_duplicate_done_text_after_delta() {
 fn parses_google_sse_text_deltas() {
     let body = concat!(
         "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hel\"}]}}]}\n\n",
-        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"skip\"},{\"text\":\"lo\"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"skip\"},{\"text\":\"lo\"}]},\"finishReason\":\"STOP\"}]}\n\n",
     );
 
     assert_eq!(parse_google_sse_text(body), Some("hello".to_string()));
@@ -1789,6 +1834,10 @@ fn parses_anthropic_sse_tool_use_events() {
         "\n",
         r#"data: {"type":"content_block_stop","index":1}"#,
         "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+        "\n\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
     );
 
     assert_eq!(
@@ -1918,7 +1967,7 @@ fn parses_google_function_call_events() {
     let body = concat!(
         "data: {\"candidates\":[{\"content\":{\"parts\":[",
         "{\"functionCall\":{\"name\":\"read\",\"args\":{\"path\":\"a.txt\"}}}",
-        "]}}]}\n\n"
+        "]},\"finishReason\":\"STOP\"}]}\n\n"
     );
 
     assert_eq!(
@@ -4008,4 +4057,192 @@ fn bedrock_messages_include_image_payloads() {
         messages[0]["content"][1]["image"]["source"]["bytes"],
         "aW1hZ2U="
     );
+}
+
+/// Serves every request with `body` as an event stream, then closes the
+/// connection: a stream that ends when the body ends.
+fn spawn_sse_server(body: &'static str) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let url = format!("http://{}", listener.local_addr().expect("stub addr"));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while let Ok(read) = stream.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some((headers, rest)) = text.split_once("\r\n\r\n") {
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if rest.len() >= length {
+                        break;
+                    }
+                }
+            }
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    url
+}
+
+/// #135: every wire format ends a reply the way its provider ends it. A
+/// stream cut short or failed mid-way is an error (retryable when it was
+/// cut short), never a clean stop, and the streaming and batch paths agree
+/// on events and on the one `Stop`, which comes last.
+#[tokio::test]
+async fn streams_end_with_their_provider_terminal_or_an_error() {
+    const ANTHROPIC_START: &str = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
+    let cases: Vec<(ProviderApi, &'static str, Result<&str, &str>)> = vec![
+        (
+            ProviderApi::Anthropic,
+            // The verified case: an error event mid-stream.
+            concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+            ),
+            Err("overloaded_error"),
+        ),
+        (ProviderApi::Anthropic, ANTHROPIC_START, Err("ended before message_stop")),
+        (
+            ProviderApi::Anthropic,
+            concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            ),
+            Ok("max_tokens"),
+        ),
+        (
+            ProviderApi::OpenAi,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: [DONE]\n\n",
+            Err("without finish_reason"),
+        ),
+        (
+            ProviderApi::OpenAi,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+            Ok("length"),
+        ),
+        (
+            ProviderApi::OpenAi,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"content_filter\"}]}\n\n",
+            Err("content_filter"),
+        ),
+        (
+            ProviderApi::OpenAiResponses,
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            Err("ended before a terminal response event"),
+        ),
+        (
+            ProviderApi::OpenAiResponses,
+            // Text arrives as deltas and again in the finished item: once.
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}}\n\n",
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+            ),
+            Ok("incomplete.max_output_tokens"),
+        ),
+        (
+            ProviderApi::Google,
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]},\"finishReason\":\"MAX_TOKENS\"}]}\n\n",
+            Ok("MAX_TOKENS"),
+        ),
+        (
+            ProviderApi::Google,
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+            Err("without a finish reason"),
+        ),
+        (
+            ProviderApi::Google,
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]},\"finishReason\":\"SAFETY\"}]}\n\n",
+            Err("Provider stopped with: SAFETY"),
+        ),
+    ];
+    for (api, body, expected) in cases {
+        let provider = create_provider_with_client(
+            ProviderConfig {
+                model: ModelRef {
+                    provider: "local".to_string(),
+                    id: "test".to_string(),
+                },
+                api: api.clone(),
+                base_url: Some(spawn_sse_server(body)),
+                auth: ProviderAuth::ApiKey("test-key".to_string()),
+                thinking_level: None,
+                thinking_budget_tokens: None,
+                session_id: None,
+                traits: ModelTraits::default(),
+            },
+            provider_http_client(),
+        );
+        let mut streamed = Vec::new();
+        let streaming = provider
+            .complete_streaming(uncapped_request("system"), &mut |event| {
+                streamed.push(event);
+                Ok(())
+            })
+            .await;
+        let batch = provider.complete(uncapped_request("system")).await;
+        let case = format!("{api:?} {body}");
+        match expected {
+            Ok(reason) => {
+                let batch = batch.unwrap_or_else(|error| panic!("{case}: {error}"));
+                streaming.unwrap_or_else(|error| panic!("{case}: {error}"));
+                assert_eq!(streamed, batch, "{case}");
+                let stops: Vec<_> = batch
+                    .iter()
+                    .filter(|event| matches!(event, StreamEvent::Stop { .. }))
+                    .collect();
+                assert_eq!(
+                    stops,
+                    [&StreamEvent::Stop {
+                        reason: reason.into()
+                    }],
+                    "{case}"
+                );
+                assert!(
+                    matches!(batch.last(), Some(StreamEvent::Stop { .. })),
+                    "{case}"
+                );
+                let texts = batch
+                    .iter()
+                    .filter(|event| matches!(event, StreamEvent::Text(_)))
+                    .count();
+                assert_eq!(texts, 1, "{case}");
+                assert!(is_output_limit_stop(reason) || reason == "stop", "{case}");
+            }
+            Err(message) => {
+                for error in [streaming.unwrap_err(), batch.unwrap_err()] {
+                    assert!(error.to_string().contains(message), "{case}: {error}");
+                    if message.contains("ended") || message.contains("overloaded") {
+                        assert!(error.is_retryable(), "{case}: {error}");
+                    }
+                }
+                assert!(
+                    !streamed
+                        .iter()
+                        .any(|event| matches!(event, StreamEvent::Stop { .. })),
+                    "{case}"
+                );
+            }
+        }
+    }
 }
