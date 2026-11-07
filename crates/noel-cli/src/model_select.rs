@@ -302,7 +302,7 @@ pub(crate) fn register_cli_model(
     offline: bool,
 ) -> Option<CliModel> {
     let resolved = resolve_cli(cli, config, offline)?;
-    if let (true, Some(model)) = (resolved.custom, &resolved.model) {
+    if let CliModel::Custom { model, .. } = &resolved {
         config.models.push(model.clone());
     }
     Some(resolved)
@@ -337,14 +337,14 @@ pub(crate) fn resolve_cli_selection(
         warn(diagnostic);
     }
     if let Some(resolved) = register_cli_model(cli, config, offline) {
-        if let Some(warning) = &resolved.warning {
+        if let Some(warning) = resolved.warning() {
             warn(warning);
         }
-        if let Some(error) = resolved.error {
-            return Err(anyhow!(error));
+        if let Some(error) = resolved.error() {
+            return Err(anyhow!(error.to_owned()));
         }
-        selection.model = resolved.model.as_ref().map(ModelDefinition::model_ref);
-        selection.thinking = selection.thinking.or(resolved.thinking_level);
+        selection.model = resolved.model().map(ModelDefinition::model_ref);
+        selection.thinking = selection.thinking.or(resolved.thinking_level());
     }
     Ok(selection)
 }

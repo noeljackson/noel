@@ -2,10 +2,19 @@
 import Foundation
 import SwiftUI
 
+/// Where the link to the server is.
+public enum ConnectionState: Equatable, Sendable {
+    case disconnected
+    case connecting
+    case connected
+    case reconnecting
+    case failed(String)
+}
+
 @MainActor
 public final class NoelModel: ObservableObject {
-    @Published public var connected = false
-    @Published public var status = "connecting"
+    @Published public var connection = ConnectionState.disconnected
+    @Published public var status = ""
     @Published public var sessions: [SessionItem] = []
     @Published public var selected: String?
     @Published public var entries: [EntryItem] = []
@@ -16,14 +25,26 @@ public final class NoelModel: ObservableObject {
 
     public init() {}
 
-    /// Connects to the server at `endpoint` over SSH.
+    public var connected: Bool { connection == .connected }
+
+    /// Connects to the server at `endpoint` over SSH; does nothing while a
+    /// connection is up or being made.
     public func connect(_ endpoint: SSHEndpoint) {
+        switch connection {
+        case .connecting, .connected, .reconnecting:
+            return
+        case .disconnected, .failed:
+            break
+        }
+        connection = .connecting
+        status = "connecting"
         noel = Noel.connect(opener: SSHChannelOpener(endpoint: endpoint), listener: Listener(model: self))
     }
 
     public func select(_ session: String) {
         selected = session
         entries = []
+        streaming = nil
         noel?.select(session: session)
     }
 
@@ -38,13 +59,23 @@ public final class NoelModel: ObservableObject {
     func apply(_ event: NoelEvent) {
         switch event {
         case .connected:
-            connected = true
+            connection = .connected
             status = "connected"
+        case .reconnecting:
+            connection = .reconnecting
+            status = "reconnecting"
+        case let .failed(message):
+            // This Noel is done; connect makes a new one.
+            noel = nil
+            connection = .failed(message)
+            status = message
         case let .status(text):
             status = text
         case let .sessions(sessions):
             self.sessions = sessions
         case let .view(session, entries, streaming):
+            // A view of a session no longer selected came late: ignored.
+            guard selected == nil || selected == session else { return }
             selected = session
             self.entries = entries
             self.streaming = streaming

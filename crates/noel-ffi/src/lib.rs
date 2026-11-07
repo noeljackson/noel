@@ -62,7 +62,15 @@ pub struct PluginItem {
 /// What the server tells the app.
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum NoelEvent {
+    /// Connected to the server, at first or again.
     Connected,
+    /// The link dropped; connecting again.
+    Reconnecting,
+    /// Connecting failed for good: this `Noel` does nothing more, and the
+    /// app connects again with a new one.
+    Failed {
+        message: String,
+    },
     Status {
         text: String,
     },
@@ -202,8 +210,8 @@ impl Noel {
             if let Err(error) =
                 noel_client::app::run(Arc::new(Channels(opener)), events, receiver).await
             {
-                listener.on_event(NoelEvent::Status {
-                    text: format!("connect: {error:#}"),
+                listener.on_event(NoelEvent::Failed {
+                    message: format!("connect: {error:#}"),
                 });
             }
         });
@@ -249,6 +257,7 @@ impl Noel {
 fn convert(event: Event) -> NoelEvent {
     match event {
         Event::Connected => NoelEvent::Connected,
+        Event::Reconnecting => NoelEvent::Reconnecting,
         Event::Status(text) => NoelEvent::Status { text },
         Event::Sessions(sessions) => NoelEvent::Sessions {
             sessions: sessions.iter().map(session_item).collect(),

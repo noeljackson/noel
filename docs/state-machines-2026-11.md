@@ -111,6 +111,11 @@ Outcomes: **fixed** (with the test that fails before the fix), **refactored**
 | #152 | wrong, closed: the daemon ends a watch after its `error` event, so nothing keeps running; the stop flag and the kept mode are upstream's (`env/src/watch.ts`) |
 | #153 | wrong, closed: a cancel in the stdio grace period gives `aborted` in upstream too (`durable/src/env/node.ts` settles after the grace period and checks the signal), and the outcome order matches upstream |
 | #154 | fixed: the flush and poll deadlines live on the watcher; switching to polling clears the native deadlines and queued events, sets the first poll one interval away, and ignores late native events. Test `switching_to_polling_drops_the_native_state` |
+| #147 | fixed in part, rest wrong: the state file's lock now spans read and write, so concurrent saves keep every change (test `concurrent_saves_keep_every_change`, fails before the fix); each attempt reads the clock. Wrong: memory and disk agree (a switch is saved with the sticky change that carries it); the limited and exhausted maps hold two different facts and are bounded by the accounts |
+| #148 | fixed: the refresh returns `RefreshOutcome { Fresh, Refreshed, Kept { reason } }`; callers read it instead of comparing credentials; a refreshed credential keeps its kind. Test `failed_refresh_keeps_unexpired_token` (extended) |
+| #155 | refactored: `CliModel` is `Empty / Found / Custom / Error`, the provider reading `ProviderHint`; the upstream parity fixtures still pass |
+| #149 | wrong, closed: entering Reading needs no other field set, a removed anchor moves to the next entry, `pending_copy` is empty during a drag, and `was_latest` is the state before the press (issue comment) |
+| #157 | fixed, Swift not compiled: the app and FFI report `Reconnecting`, `Connected` again, and `Failed` (test `the_app_reports_the_link_coming_back`); the Swift bindings are regenerated; `NoelModel` keeps a `ConnectionState`, does not connect twice, drops a failed `Noel`, clears `streaming` on select and ignores a late view; `SSHChannelOpener` settles once under a lock, times out, and closes the client. Not verifiable here without Xcode |
 
 ## Status
 

@@ -844,6 +844,39 @@ mod tests {
         assert_eq!(memory.opens.lock().unwrap().len(), 2);
     }
 
+    /// #157: a front end hears the link drop and come back, not only a
+    /// status line: `Connected` again once the supervisor reconnected.
+    #[tokio::test]
+    async fn the_app_reports_the_link_coming_back() {
+        let server = host_at(session_address("s1"));
+        let memory = Memory::new(&server);
+        let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let (_commands, commands) = tokio::sync::mpsc::unbounded_channel();
+        let events: app::Events = Arc::new(events);
+        let running = tokio::spawn(app::run(memory.clone(), events, commands));
+        let mut connected = 0;
+        let mut reconnecting = 0;
+        while connected < 2 {
+            let event = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+                .await
+                .expect("an event")
+                .expect("the app runs");
+            match event {
+                app::Event::Connected => {
+                    connected += 1;
+                    if connected == 1 {
+                        memory.opens.lock().unwrap()[0].1.close();
+                    }
+                }
+                app::Event::Reconnecting => reconnecting += 1,
+                _ => {}
+            }
+        }
+        // The watch may coalesce the loss into the reconnect.
+        assert!(reconnecting <= 1);
+        running.abort();
+    }
+
     #[tokio::test]
     async fn following_a_view_survives_a_lost_link() {
         let server = host_at(session_address("s1"));
