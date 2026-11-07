@@ -1352,7 +1352,8 @@ fn openai_chat_stream_parser_emits_text_before_finish() {
         .expect("parse tool start");
     parser
         .parse_data(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}"}}]}}]}"#,
+            // #160: some providers send the id and name with every chunk.
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"\"a.txt\"}"}}]}}]}"#,
             &mut |event| {
                 events.push(event);
                 Ok(())
@@ -1411,6 +1412,33 @@ fn openai_responses_stream_parser_does_not_duplicate_done_text_after_delta() {
         .expect("parse done");
 
     assert_eq!(events, [StreamEvent::Text("hello".to_string())]);
+}
+
+/// #160: whether an item's text streamed is per output item: a later item
+/// that streamed no deltas still gives its text when it is done.
+#[test]
+fn openai_responses_done_text_of_an_item_without_deltas_is_kept() {
+    let mut parser = OpenAiResponsesSseParser::default();
+    let mut events = Vec::new();
+    for data in [
+        r#"{"type":"response.output_text.delta","output_index":0,"delta":"first"}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"first"}]}}"#,
+        r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message","content":[{"type":"output_text","text":" second"}]}}"#,
+    ] {
+        parser
+            .parse_data(data, &mut |event| {
+                events.push(event);
+                Ok(())
+            })
+            .expect("parse");
+    }
+    assert_eq!(
+        events,
+        [
+            StreamEvent::Text("first".to_string()),
+            StreamEvent::Text(" second".to_string())
+        ]
+    );
 }
 
 #[test]

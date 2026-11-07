@@ -211,7 +211,16 @@ pub async fn run_turn(
             cancellation,
             |event| on_event(&AgentEvent::Provider(event.clone())),
         )
-        .await?;
+        .await;
+        // A cancel during the request or its backoff is reported as one
+        // between requests is (#159).
+        let events = match events {
+            Err(AgentError::Cancelled) => {
+                on_event(&AgentEvent::TurnCancelled);
+                return Err(AgentError::Cancelled);
+            }
+            events => events?,
+        };
         if cancellation.is_cancelled() {
             on_event(&AgentEvent::TurnCancelled);
             return Err(AgentError::Cancelled);
@@ -640,6 +649,35 @@ mod tests {
             latency < Duration::from_millis(100),
             "cancellation took {latency:?}"
         );
+    }
+
+    /// #159: a cancel that lands during the request ends the turn with
+    /// `TurnCancelled`, as one between requests does.
+    #[tokio::test]
+    async fn a_cancel_during_the_request_reports_the_turn_cancelled() {
+        let cancellation = CancellationToken::default();
+        let _cancelled_at = cancel_later(&cancellation, Duration::from_millis(20));
+        let mut state = AgentState {
+            messages: Vec::new(),
+        };
+        let mut events = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_turn(
+                &PendingProvider,
+                &mut state,
+                "hi".to_string(),
+                &AgentConfig::default(),
+                &NoTools,
+                &cancellation,
+                None,
+                |event| events.push(format!("{event:?}")),
+            ),
+        )
+        .await
+        .expect("the cancel ends the turn");
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_eq!(events.last().map(String::as_str), Some("TurnCancelled"));
     }
 
     #[tokio::test]

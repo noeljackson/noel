@@ -654,7 +654,10 @@ pub(crate) fn parse_openai_responses_events(response: &Value) -> Option<Vec<Stre
 
 #[derive(Default)]
 pub(crate) struct OpenAiResponsesSseParser {
-    pub(crate) saw_text_delta: bool,
+    /// The output items (by `output_index`) whose text streamed as deltas:
+    /// their `output_item.done` text is not sent again (#160: per item, as
+    /// upstream's output slots, not per response).
+    pub(crate) streamed_items: std::collections::BTreeSet<Option<u64>>,
     /// The raw stop reason of the terminal event, once it arrived.
     pub(crate) terminal: Option<String>,
 }
@@ -731,14 +734,14 @@ impl SseParser for OpenAiResponsesSseParser {
             Some("response.output_text.delta") | Some("output_text.delta") => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                     if !delta.is_empty() {
-                        self.saw_text_delta = true;
+                        self.streamed_items.insert(output_index(&event));
                         on_event(StreamEvent::Text(delta.to_string()))?;
                     }
                 }
             }
             Some("response.output_item.done") | Some("output_item.done") => {
                 if let Some(item) = event.get("item") {
-                    if !self.saw_text_delta {
+                    if !self.streamed_items.contains(&output_index(&event)) {
                         if let Some(text) = parse_openai_responses_item_text(item) {
                             on_event(StreamEvent::Text(text))?;
                         }
@@ -752,6 +755,11 @@ impl SseParser for OpenAiResponsesSseParser {
         }
         Ok(())
     }
+}
+
+/// The output item an event is about.
+fn output_index(event: &Value) -> Option<u64> {
+    event.get("output_index").and_then(Value::as_u64)
 }
 
 pub(crate) fn parse_openai_responses_function_call(item: &Value) -> Option<StreamEvent> {
