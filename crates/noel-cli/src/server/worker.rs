@@ -24,7 +24,6 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -45,10 +44,13 @@ use noel_core::plugins::{PluginTool, PluginToolHost, PluginToolOutput};
 use noel_core::{
     expand_input, ReloadableSystems, RunStatus, Runtime, SessionError, SessionStore, SubmissionKind,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot, Notify};
+
+use super::protocol::{self, AbortArgs, CommandArgs, SubmitArgs, SubmitType, WithdrawArgs};
 
 use super::errors::{forbidden, refused, unavailable};
 use super::view::{self, View};
@@ -276,14 +278,12 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     refresh(&mut controller);
 
     let parent: Arc<Mutex<Option<ControlSender>>> = Arc::default();
-    let draining = Arc::new(AtomicBool::new(false));
     tokio::spawn(accept_parents(
         listener,
         host.clone(),
         ready.clone(),
         parent.clone(),
         status.clone(),
-        draining.clone(),
     ));
     announce_ready(&ready);
     eprintln!(
@@ -294,7 +294,6 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     tokio::spawn(supervise(Supervision {
         status,
         parent,
-        draining,
         idle_limit,
         host,
         files: Files { socket, record },
@@ -332,31 +331,79 @@ fn announce_ready(ready: &Value) {
 struct Status {
     /// Holds on `noel.chat`.
     holds: usize,
-    /// The active run.
-    running: Option<String>,
+    /// What the session loop has in hand.
+    slot: Slot,
     queued: usize,
-    /// A command that runs no run (a compaction, a configure) is in hand.
-    working: bool,
-    /// The last client quit, as a local `noel` quits: exit once idle.
-    leaving: bool,
+    /// Whether the worker serves new work or is on its way out.
+    phase: Phase,
+}
+
+/// What the worker's session loop has in hand (#134). `Working` and
+/// `Starting` block an exit as `Running` does: a start accepted and not yet
+/// running is not idle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Slot {
+    #[default]
+    Idle,
+    /// A command is in hand (a compaction, a configure, a slash command).
+    Working,
+    /// A command accepted a start; its run has not reported starting.
+    Starting,
+    /// Run `0` is active.
+    Running(String),
+}
+
+/// Whether the worker takes new work (#134).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Phase {
+    #[default]
+    Serving,
+    /// The server asked it to shut down once nothing is in hand; a new
+    /// server connection makes it serve again.
+    Draining,
+    /// The last client quit (its extension hosts are shut down): it takes
+    /// no new work and exits once no client holds the session.
+    Leaving,
 }
 
 impl Status {
     fn idle(&self) -> bool {
-        self.holds == 0 && self.running.is_none() && self.queued == 0 && !self.working
+        self.holds == 0 && self.slot == Slot::Idle && self.queued == 0
     }
 
-    fn control(&self) -> Value {
-        let mut message = json!({
-            "type": "status",
-            "viewers": self.holds,
-            "running": self.running.is_some(),
-            "queued": self.queued,
-            "working": self.working,
-        });
-        if let Some(run_id) = &self.running {
-            message["runId"] = json!(run_id);
+    /// Why the worker exits now, if it does: the one place that decides.
+    fn exit_reason(
+        &self,
+        idle_for: Option<Duration>,
+        idle_limit: Duration,
+    ) -> Option<&'static str> {
+        if self.slot != Slot::Idle {
+            return None;
         }
+        match self.phase {
+            Phase::Draining => Some("shut down by the server"),
+            // Once the quitting client let go: a hold left would bind the
+            // session's next worker.
+            Phase::Leaving if self.holds == 0 => Some("its last client quit"),
+            _ if idle_for.is_some_and(|idle| idle >= idle_limit) => Some("idle"),
+            _ => None,
+        }
+    }
+
+    /// The `status` line the server reads ([`WorkerStatus`]).
+    fn control(&self) -> Value {
+        let status = protocol::WorkerStatus {
+            viewers: self.holds as u64,
+            running: matches!(self.slot, Slot::Running(_)),
+            queued: self.queued as u64,
+            working: matches!(self.slot, Slot::Working | Slot::Starting),
+            run_id: match &self.slot {
+                Slot::Running(run_id) => Some(run_id.clone()),
+                _ => None,
+            },
+        };
+        let mut message = protocol::to_args(&status);
+        message["type"] = json!("status");
         message
     }
 }
@@ -522,7 +569,6 @@ async fn accept_parents(
     ready: Value,
     parent: Arc<Mutex<Option<ControlSender>>>,
     status: Arc<StatusBoard>,
-    draining: Arc<AtomicBool>,
 ) {
     loop {
         let stream = match listener.accept().await {
@@ -557,13 +603,23 @@ async fn accept_parents(
             },
         );
         eprintln!("noel worker: a server connected");
-        let (status, draining) = (status.clone(), draining.clone());
+        // A server that connects again wants the worker: a drain asked by
+        // the one before it is over.
+        status.update(|status| {
+            if status.phase == Phase::Draining {
+                status.phase = Phase::Serving;
+            }
+        });
+        let status = status.clone();
         tokio::spawn(async move {
             while let Some(message) = controls.recv().await {
                 if message.get("type").and_then(Value::as_str) == Some("shutdown") {
                     eprintln!("noel worker: asked to shut down once no run is active");
-                    draining.store(true, Ordering::SeqCst);
-                    status.changed.notify_one();
+                    status.update(|status| {
+                        if status.phase == Phase::Serving {
+                            status.phase = Phase::Draining;
+                        }
+                    });
                 }
             }
             eprintln!("noel worker: the server's link ended");
@@ -595,7 +651,6 @@ impl Files {
 struct Supervision {
     status: Arc<StatusBoard>,
     parent: Arc<Mutex<Option<ControlSender>>>,
-    draining: Arc<AtomicBool>,
     idle_limit: Duration,
     host: Host,
     files: Files,
@@ -609,7 +664,6 @@ async fn supervise(supervision: Supervision) {
     let Supervision {
         status,
         parent,
-        draining,
         idle_limit,
         host,
         files,
@@ -644,18 +698,8 @@ async fn supervise(supervision: Supervision) {
             }
             sent = Some(report);
         }
-        let idle_since = status.idle_since();
-        let done = if draining.load(Ordering::SeqCst) && now.running.is_none() && !now.working {
-            Some("shut down by the server")
-        } else if now.leaving && now.holds == 0 && now.running.is_none() && !now.working {
-            // Once the quitting client let go: a hold left would bind the
-            // session's next worker.
-            Some("its last client quit")
-        } else if idle_since.is_some_and(|since| since.elapsed() >= idle_limit) {
-            Some("idle")
-        } else {
-            None
-        };
+        let idle_for = status.idle_since().map(|since| since.elapsed());
+        let done = now.exit_reason(idle_for, idle_limit);
         if let Some(why) = done {
             eprintln!("noel worker: exiting ({why})");
             if let Some(parent) = &*lock(&parent) {
@@ -727,7 +771,8 @@ impl ControllerHost for WorkerHost {
         match &event {
             Event::RunStarted { run_id, .. } => {
                 let run_id = (*run_id).to_owned();
-                self.status.update(|status| status.running = Some(run_id));
+                self.status
+                    .update(|status| status.slot = Slot::Running(run_id));
             }
             Event::QueueChanged { queue } | Event::CallReturned { queue, .. } => {
                 let pending = queue.pending();
@@ -739,7 +784,7 @@ impl ControllerHost for WorkerHost {
         lock(&self.view).event(&event);
         if let Event::RunSettled { run_id, outcome } = &event {
             eprintln!("noel worker: run {run_id} settled: {:?}", outcome.status());
-            self.status.update(|status| status.running = None);
+            self.status.update(|status| status.slot = Slot::Idle);
             for (reply, withdrawn) in self.aborts.drain(..) {
                 let _ = reply.send(Ok(json!({"runId": run_id, "withdrawn": withdrawn})));
             }
@@ -803,18 +848,23 @@ async fn drive(
                 None => break,
             },
         };
-        controller
-            .host()
-            .status
-            .update(|status| status.working = true);
+        let status = controller.host().status.clone();
+        status.update(|status| status.slot = Slot::Working);
         let start = idle_command(&mut controller, command).await;
         refresh(&mut controller);
-        controller
-            .host()
-            .status
-            .update(|status| status.working = false);
+        // A start in hand blocks an exit until its run reports starting
+        // (#134: the status used to read idle in between).
+        status.update(|status| {
+            status.slot = if start.is_some() {
+                Slot::Starting
+            } else {
+                Slot::Idle
+            }
+        });
         if let Some(start) = start {
-            if !run_session(&mut controller, start, &mut inbox).await {
+            let finished = run_session(&mut controller, start, &mut inbox).await;
+            status.update(|status| status.slot = Slot::Idle);
+            if !finished {
                 return;
             }
         }
@@ -917,6 +967,19 @@ async fn idle_command(
     controller: &mut SessionController<WorkerHost>,
     command: Command,
 ) -> Option<Start> {
+    // After `/quit` the session's extension hosts are shut down: nothing
+    // new starts (#134); a client attaching again gets the next worker.
+    if controller.host().status.get().phase == Phase::Leaving {
+        if let Command::Submit(_, reply) | Command::Run(_, reply) | Command::Resume(_, reply) =
+            command
+        {
+            let _ = reply.send(Err(refused(
+                "closing",
+                "the session is closing; attach to it again to continue",
+            )));
+            return None;
+        }
+    }
     match command {
         Command::Submit(args, reply) => {
             let (submission, _, reject_when_idle) = match submission(&args) {
@@ -959,11 +1022,14 @@ async fn idle_command(
             }
         }
         Command::Withdraw(args, reply) => {
-            let id = text(&args, "submissionId");
+            let id = WithdrawArgs::deserialize(&args)
+                .map(|args| args.submission_id)
+                .unwrap_or_default();
             let _ = reply.send(withdrawn(controller.withdraw(&id)));
         }
         Command::Abort(args, reply) => {
-            let expected = args.get("expectedRunId").and_then(Value::as_str);
+            let abort = AbortArgs::deserialize(&args).unwrap_or_default();
+            let expected = abort.expected_run_id.as_deref();
             let policy = abort_policy(&args);
             let queued = match policy {
                 AbortPolicy::WithdrawQueue => controller.queue().pending(),
@@ -1001,13 +1067,10 @@ async fn idle_command(
             }
         }
         Command::Run(args, reply) => {
-            // Working while it runs; the status change it ends with also
-            // has the server read its directory again (a fork, a new
-            // session).
-            let status = controller.parts().1.status.clone();
-            status.update(|status| status.working = true);
+            // The loop holds the slot (Working) while it runs; the status
+            // change it ends with also has the server read its directory
+            // again (a fork, a new session).
             let (answer, start) = run_command(controller, &args).await;
-            status.update(|status| status.working = false);
             let _ = reply.send(Ok(answer));
             if start.is_some() {
                 return start;
@@ -1075,7 +1138,11 @@ async fn run_command(
     controller: &mut SessionController<WorkerHost>,
     args: &Value,
 ) -> (Value, Option<Start>) {
-    let line = text(args, "line");
+    let CommandArgs {
+        line,
+        request_id,
+        errors,
+    } = CommandArgs::deserialize(args).unwrap_or_default();
     let mut output = CommandOutput::default();
     let mut next = Value::Null;
     let mut start = None;
@@ -1088,10 +1155,7 @@ async fn run_command(
         let content = controller.parts().1.expand(text);
         let submission = Submission {
             kind: SubmissionKind::FollowUp,
-            request_id: args
-                .get("requestId")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            request_id: request_id.clone(),
             content,
             images: Vec::new(),
             expected_run_id: None,
@@ -1199,7 +1263,7 @@ async fn run_command(
                     .into_iter()
                     .map(|text| json!({"kind": "error", "text": text})),
             );
-            host.status.update(|status| status.leaving = true);
+            host.status.update(|status| status.phase = Phase::Leaving);
             return (json!({"entries": entries, "leaving": true}), None);
         }
         return (json!({"entries": entries}), None);
@@ -1207,8 +1271,7 @@ async fn run_command(
     // `/bug`: the report goes into the session's directory, with the error
     // rows the client shows (`errors`).
     if line.split_whitespace().next() == Some("/bug") {
-        let errors: Vec<String> =
-            serde_json::from_value(args["errors"].clone()).unwrap_or_default();
+        let errors = errors.unwrap_or_default();
         let errors = errors.iter().map(String::as_str).collect::<Vec<_>>();
         let (runtime, host) = controller.parts();
         let dir = std::env::current_dir().unwrap_or_else(|_| runtime.session().cwd.clone());
@@ -1401,11 +1464,14 @@ fn busy_command(command: Command, busy: &mut Busy<'_, WorkerHost>) {
             let _ = reply.send(result);
         }
         Command::Withdraw(args, reply) => {
-            let id = text(&args, "submissionId");
+            let id = WithdrawArgs::deserialize(&args)
+                .map(|args| args.submission_id)
+                .unwrap_or_default();
             let _ = reply.send(withdrawn(busy.withdraw(&id)));
         }
         Command::Abort(args, reply) => {
-            let expected = args.get("expectedRunId").and_then(Value::as_str);
+            let abort = AbortArgs::deserialize(&args).unwrap_or_default();
+            let expected = abort.expected_run_id.as_deref();
             let policy = abort_policy(&args);
             let queued = match policy {
                 AbortPolicy::WithdrawQueue => busy.queue().pending(),
@@ -1443,7 +1509,7 @@ fn text(args: &Value, key: &str) -> String {
 /// What an abort does to the queue: Durable's rule, everything queued is
 /// withdrawn, unless `keepQueue` (`noel`'s interrupt, which keeps it).
 fn abort_policy(args: &Value) -> AbortPolicy {
-    if args.get("keepQueue").and_then(Value::as_bool) == Some(true) {
+    if AbortArgs::deserialize(args).is_ok_and(|args| args.keep_queue) {
         AbortPolicy::KeepQueue
     } else {
         AbortPolicy::WithdrawQueue
@@ -1451,33 +1517,17 @@ fn abort_policy(args: &Value) -> AbortPolicy {
 }
 
 /// `prompt`, `steer` and `follow_up` do over RPC; `type: "continue"` is
-/// Durable's continue. The flag is `whenIdle: "reject"`.
+/// Durable's continue. The flag is `whenIdle: "reject"`. The arguments are
+/// [`SubmitArgs`], the type the client sends (#164).
 fn submission(args: &Value) -> Result<(Submission, WhenBusy, bool), WireError> {
-    let reject_when_idle = match args.get("whenIdle").and_then(Value::as_str) {
-        None => false,
-        Some("reject") => true,
-        Some(other) => {
-            return Err(
-                ChordError::invalid("args", format!("whenIdle {other:?} is not reject")).into(),
-            )
-        }
-    };
-    let continuing = match args.get("type").and_then(Value::as_str) {
-        None | Some("input") => false,
-        Some("continue") => true,
-        Some(other) => {
-            return Err(ChordError::invalid(
-                "args",
-                format!("type {other:?} is not input or continue"),
-            )
-            .into())
-        }
-    };
-    if continuing {
+    let args = SubmitArgs::deserialize(args)
+        .map_err(|error| WireError::from(ChordError::invalid("args", error.to_string())))?;
+    let reject_when_idle = args.when_idle.is_some();
+    if args.kind == Some(SubmitType::Continue) {
         return Ok((
             Submission {
                 kind: SubmissionKind::Continue,
-                request_id: Some(text(args, "requestId")),
+                request_id: Some(args.request_id),
                 content: String::new(),
                 images: Vec::new(),
                 expected_run_id: None,
@@ -1486,43 +1536,32 @@ fn submission(args: &Value) -> Result<(Submission, WhenBusy, bool), WireError> {
             reject_when_idle,
         ));
     }
-    if !args.get("text").is_some_and(Value::is_string) {
+    let Some(content) = args.text else {
         return Err(ChordError::invalid("args", "an input needs its text").into());
-    }
-    let (kind, when_busy) = match args.get("whenBusy").and_then(Value::as_str) {
-        None | Some("reject") => (SubmissionKind::Prompt, WhenBusy::Reject),
-        Some("steer") => (SubmissionKind::Steer, WhenBusy::Steer),
-        Some("followUp") => (SubmissionKind::FollowUp, WhenBusy::FollowUp),
-        Some(other) => {
-            return Err(ChordError::invalid(
-                "args",
-                format!("whenBusy {other:?} is not reject, steer or followUp"),
-            )
-            .into())
-        }
+    };
+    let when_busy = args.when_busy.unwrap_or_default();
+    let kind = match when_busy {
+        protocol::WhenBusy::Reject => SubmissionKind::Prompt,
+        protocol::WhenBusy::Steer => SubmissionKind::Steer,
+        protocol::WhenBusy::FollowUp => SubmissionKind::FollowUp,
     };
     let images = args
-        .get("images")
-        .and_then(Value::as_array)
-        .map(|images| {
-            images
-                .iter()
-                .map(|image| Image {
-                    data: text(image, "data"),
-                    mime_type: text(image, "mimeType"),
-                })
-                .collect()
+        .images
+        .into_iter()
+        .map(|image| Image {
+            data: image.data,
+            mime_type: image.mime_type,
         })
-        .unwrap_or_default();
+        .collect();
     Ok((
         Submission {
             kind,
-            request_id: Some(text(args, "requestId")),
-            content: text(args, "text"),
+            request_id: Some(args.request_id),
+            content,
             images,
             expected_run_id: None,
         },
-        when_busy,
+        when_busy.core(),
         reject_when_idle,
     ))
 }
@@ -1684,6 +1723,53 @@ pub(crate) fn model_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #134: one function decides the exit, and a start in hand blocks it.
+    #[test]
+    fn the_worker_exits_only_with_nothing_in_hand() {
+        let limit = Duration::from_secs(60);
+        let draining = Status {
+            phase: Phase::Draining,
+            ..Status::default()
+        };
+        assert_eq!(
+            draining.exit_reason(None, limit),
+            Some("shut down by the server")
+        );
+        // The race: a start accepted and not running yet is not idle.
+        for slot in [Slot::Working, Slot::Starting, Slot::Running("r1".into())] {
+            let busy = Status {
+                slot: slot.clone(),
+                ..draining.clone()
+            };
+            assert_eq!(busy.exit_reason(Some(limit), limit), None, "{slot:?}");
+            assert!(!busy.idle(), "{slot:?}");
+        }
+        let leaving = Status {
+            phase: Phase::Leaving,
+            holds: 1,
+            ..Status::default()
+        };
+        assert_eq!(leaving.exit_reason(None, limit), None);
+        let left = Status {
+            holds: 0,
+            ..leaving
+        };
+        assert_eq!(left.exit_reason(None, limit), Some("its last client quit"));
+        let serving = Status::default();
+        assert_eq!(
+            serving.exit_reason(Some(Duration::from_secs(1)), limit),
+            None
+        );
+        assert_eq!(serving.exit_reason(Some(limit), limit), Some("idle"));
+        // Starting reports as working to the server.
+        let starting = Status {
+            slot: Slot::Starting,
+            ..Status::default()
+        };
+        assert_eq!(starting.control()["working"], true);
+        assert_eq!(starting.control()["running"], false);
+    }
 
     #[test]
     fn when_busy_names_the_kind_of_a_submission() {

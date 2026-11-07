@@ -117,11 +117,11 @@ struct Live {
     run: Option<RunDoc>,
     generation: Option<Generation>,
     tools: Vec<ToolSlot>,
-    /// The running compaction's trigger: `manual`, `threshold` or
-    /// `overflow` (Durable's `CompactionStatus.trigger`).
-    compaction: Option<&'static str>,
+    /// The running compaction's trigger (Durable's
+    /// `CompactionStatus.trigger`).
+    compaction: Option<CompactionTrigger>,
     /// The last compaction failed: its trigger and error.
-    compaction_failure: Option<(&'static str, String)>,
+    compaction_failure: Option<(CompactionTrigger, String)>,
     /// The reply ran out of context: the next compaction is an overflow's.
     overflowed: bool,
     /// Why the last run ended without an answer; kept until a run starts.
@@ -146,10 +146,51 @@ struct Generation {
     retry: Option<(u64, String, u64, u64)>,
 }
 
+/// What started a compaction (#145).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionTrigger {
+    Manual,
+    Threshold,
+    Overflow,
+}
+
+impl CompactionTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Threshold => "threshold",
+            Self::Overflow => "overflow",
+        }
+    }
+}
+
+/// Where a tool call of the round is (#145): `pi.live`'s tool `status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolPhase {
+    /// Asked for, not started.
+    Pending,
+    Running,
+    /// Its result is saved: output belongs to the entry now.
+    Done,
+    /// Cut off by a stop and not run again.
+    Interrupted,
+}
+
+impl ToolPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
 struct ToolSlot {
     call_id: String,
     name: String,
-    status: &'static str,
+    status: ToolPhase,
     output: String,
     truncated: bool,
     /// The history entry of the call's result, once saved.
@@ -283,12 +324,16 @@ impl View {
                 true
             }
             Event::CompactionStarted => {
-                self.live.compaction = Some("manual");
+                self.live.compaction = Some(CompactionTrigger::Manual);
                 self.live.compaction_failure = None;
                 true
             }
-            Event::CompactionEnded { .. } => {
-                self.live.compaction = None;
+            Event::CompactionEnded { result } => {
+                // A manual compaction's failure is shown as a threshold's
+                // or an overflow's is (#145: it was dropped).
+                if let (Some(trigger), Err(error)) = (self.live.compaction.take(), result) {
+                    self.live.compaction_failure = Some((trigger, (*error).to_owned()));
+                }
                 true
             }
             Event::SaveFailed { .. } => false,
@@ -358,7 +403,11 @@ impl View {
                 append,
                 ..
             } => {
-                let slot = self.slot(call_id, None);
+                // Progress for a call already done is late: its output is
+                // the saved result's now (#145).
+                let Some(slot) = self.slot(call_id, None) else {
+                    return;
+                };
                 if *append {
                     slot.output.push_str(output);
                 } else {
@@ -454,9 +503,9 @@ impl View {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
                 status: if *replay_safe {
-                    "pending"
+                    ToolPhase::Pending
                 } else {
-                    "interrupted"
+                    ToolPhase::Interrupted
                 },
                 output: saved.map(|saved| saved.output.clone()).unwrap_or_default(),
                 truncated: saved.is_some_and(|saved| saved.truncated),
@@ -490,7 +539,9 @@ impl View {
                     attempt: 1,
                     ..Generation::default()
                 });
-                self.live.tools.retain(|slot| slot.status == "pending");
+                self.live
+                    .tools
+                    .retain(|slot| slot.status == ToolPhase::Pending);
                 true
             }
             TurnEvent::RoundResumed(_) => false,
@@ -508,7 +559,7 @@ impl View {
                         .map(|call| ToolSlot {
                             call_id: call.id.clone(),
                             name: call.name.clone(),
-                            status: "pending",
+                            status: ToolPhase::Pending,
                             output: String::new(),
                             truncated: false,
                             entry: None,
@@ -549,23 +600,25 @@ impl View {
                 true
             }
             TurnEvent::ToolStarted { call } => {
-                let slot = self.slot(&call.id, Some(&call.name));
-                slot.status = "running";
+                if let Some(slot) = self.slot(&call.id, Some(&call.name)) {
+                    slot.status = ToolPhase::Running;
+                }
                 true
             }
             TurnEvent::ToolFinished { .. } => false,
             TurnEvent::ToolOutput { call, .. } => {
-                let slot = self.slot(&call.id, Some(&call.name));
-                slot.status = "done";
-                slot.output.clear();
-                slot.truncated = false;
+                if let Some(slot) = self.slot(&call.id, Some(&call.name)) {
+                    slot.status = ToolPhase::Done;
+                    slot.output.clear();
+                    slot.truncated = false;
+                }
                 true
             }
             TurnEvent::CompactionStarted => {
                 let trigger = if std::mem::take(&mut self.live.overflowed) {
-                    "overflow"
+                    CompactionTrigger::Overflow
                 } else {
-                    "threshold"
+                    CompactionTrigger::Threshold
                 };
                 self.live.compaction = Some(trigger);
                 self.live.compaction_failure = None;
@@ -594,7 +647,10 @@ impl View {
         }
     }
 
-    fn slot(&mut self, call_id: &str, name: Option<&str>) -> &mut ToolSlot {
+    /// The round's slot for call `call_id`, made for a call the round did
+    /// not list (it is running, then), or `None` once the call is done:
+    /// what arrives for it after its result is late.
+    fn slot(&mut self, call_id: &str, name: Option<&str>) -> Option<&mut ToolSlot> {
         let index = match self
             .live
             .tools
@@ -606,7 +662,7 @@ impl View {
                 self.live.tools.push(ToolSlot {
                     call_id: call_id.to_owned(),
                     name: String::new(),
-                    status: "running",
+                    status: ToolPhase::Running,
                     output: String::new(),
                     truncated: false,
                     entry: None,
@@ -615,10 +671,13 @@ impl View {
             }
         };
         let slot = &mut self.live.tools[index];
+        if slot.status == ToolPhase::Done {
+            return None;
+        }
         if let Some(name) = name {
             name.clone_into(&mut slot.name);
         }
-        slot
+        Some(slot)
     }
 
     /// Appends a new entry to the window; past [`WINDOW_MAX`] the oldest
@@ -681,7 +740,7 @@ impl View {
                 .iter()
                 .map(|slot| {
                     let mut doc =
-                        json!({"callId": slot.call_id, "name": slot.name, "status": slot.status});
+                        json!({"callId": slot.call_id, "name": slot.name, "status": slot.status.as_str()});
                     if !slot.output.is_empty() {
                         doc["output"] = json!(slot.output);
                     }
@@ -697,12 +756,12 @@ impl View {
             live.insert("tools".into(), Value::Array(tools));
         }
         if let Some(trigger) = self.live.compaction {
-            live.insert("compactions".into(), json!([{"trigger": trigger}]));
+            live.insert("compactions".into(), json!([{"trigger": trigger.as_str()}]));
         }
         if let Some((trigger, error)) = &self.live.compaction_failure {
             live.insert(
                 "compactionFailure".into(),
-                json!({"trigger": trigger, "error": error}),
+                json!({"trigger": trigger.as_str(), "error": error}),
             );
         }
         if let Some(failure) = &self.live.run_failure {
@@ -1202,5 +1261,71 @@ mod tests {
             runtime: &runtime,
         });
         assert!(live(&view).get("runFailure").is_none());
+    }
+
+    /// #145: progress for a tool already done does not refill its output,
+    /// and a manual compaction's failure is shown.
+    #[test]
+    fn late_tool_progress_is_ignored_and_a_manual_compaction_failure_shows() {
+        let session = SessionState::new("s1".to_owned(), PathBuf::from("/w"));
+        let runtime = Runtime::new(session.clone(), ReloadableSystems::default());
+        let mut view = View::new(&session, &[]);
+        view.refresh(&runtime, json!({}), &[]);
+        let queue = noel_core::controller::Queue::default();
+        let report = |view: &mut View, event: TurnEvent| {
+            view.event(&Event::Turn {
+                event: &event,
+                queue: &queue,
+            })
+        };
+        let live = |view: &View| view.value()["docs"]["pi.live"].clone();
+        view.event(&Event::RunStarted {
+            run_id: "r1",
+            runtime: &runtime,
+        });
+        report(&mut view, TurnEvent::RoundStarted);
+        let call = noel_ai::ChatToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        report(&mut view, TurnEvent::ToolStarted { call: call.clone() });
+        let progress = |output: &str| SavedProgress::ToolOutput {
+            run_id: Some("r1".into()),
+            call_id: "c1".into(),
+            output: output.into(),
+            truncated: false,
+            append: true,
+        };
+        view.saved(&progress("partial"));
+        assert_eq!(live(&view)["tools"][0]["output"], "partial");
+        report(
+            &mut view,
+            TurnEvent::ToolOutput {
+                call: call.clone(),
+                output: "done".into(),
+                images: Vec::new(),
+                is_error: false,
+                duration: None,
+            },
+        );
+        assert_eq!(live(&view)["tools"][0]["status"], "done");
+        // Late: the call is done, so its slot keeps no output.
+        view.saved(&progress(" more"));
+        assert!(live(&view)["tools"][0].get("output").is_none());
+        report(&mut view, TurnEvent::RoundFinished);
+        view.event(&Event::RunSettled {
+            run_id: "r1",
+            outcome: &Outcome::Completed,
+        });
+        view.event(&Event::CompactionStarted);
+        assert_eq!(live(&view)["compactions"], json!([{"trigger": "manual"}]));
+        view.event(&Event::CompactionEnded {
+            result: Err("nothing to compact"),
+        });
+        assert_eq!(
+            live(&view)["compactionFailure"],
+            json!({"trigger": "manual", "error": "nothing to compact"})
+        );
     }
 }
