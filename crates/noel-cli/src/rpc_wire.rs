@@ -1232,6 +1232,8 @@ impl Recorder {
                 let content = Content::text_and_images(output, images);
                 self.tool_output(call, content, *is_error, duration.map(millis), sink);
             }
+            // The compaction's end reports it.
+            TurnEvent::HistoryRewritten(_) => {}
             TurnEvent::CompactionStarted => {
                 self.compaction = CompactionPhase::Running {
                     overflow: self.compaction == CompactionPhase::Overflowed,

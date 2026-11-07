@@ -204,10 +204,12 @@ impl ReplyProgress {
         }
     }
 
-    /// The reply is dropped and asked for again (a retry, or a compaction
-    /// after an overflow): what was saved of it no longer stands. The next
-    /// attempt starts empty.
-    pub fn dropped(&mut self) -> Result<(), SessionError> {
+    /// The reply is dropped and asked for again: what was saved of it no
+    /// longer stands, and the next attempt starts empty. The attempt counts
+    /// retries only: after a retry the next is one more, after a
+    /// compaction (an overflow) the request is a first attempt again, as
+    /// the retries were reset.
+    pub fn dropped(&mut self, after: Dropped) -> Result<(), SessionError> {
         if self.started {
             // An empty record supersedes the dropped one: a stop now
             // leaves nothing to recover.
@@ -219,7 +221,10 @@ impl ReplyProgress {
                 append: false,
             });
         }
-        self.reset(self.attempt + 1);
+        self.reset(match after {
+            Dropped::Retry => self.attempt + 1,
+            Dropped::Compaction => 1,
+        });
         self.take_error().map_or(Ok(()), Err)
     }
 
@@ -467,6 +472,15 @@ pub(crate) fn drop_superseded(journal: &[u8], pending: &BTreeSet<String>) -> Vec
         .collect()
 }
 
+/// Why a reply was dropped to be asked for again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dropped {
+    /// A transient failure, retried after a backoff.
+    Retry,
+    /// A context overflow, compacted.
+    Compaction,
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -577,12 +591,18 @@ mod tests {
 
         // A reply dropped to ask again is superseded by an empty record, and
         // the next attempt starts over.
-        reply.dropped().unwrap();
+        reply.dropped(Dropped::Retry).unwrap();
         let partial = SessionStore::read(store.path()).unwrap().partial.unwrap();
         assert_eq!(partial.aborted_message(), None);
         assert!(!reply.observe(&text("Again"), start + ms(400)));
         let partial = SessionStore::read(store.path()).unwrap().partial.unwrap();
         assert_eq!((partial.attempt, partial.text.as_str()), (2, "Again"));
+        // #141: a compaction after an overflow is not a retry: the request
+        // after it is a first attempt, as a resume would charge it.
+        reply.dropped(Dropped::Compaction).unwrap();
+        assert!(!reply.observe(&text("Smaller"), start + ms(800)));
+        let partial = SessionStore::read(store.path()).unwrap().partial.unwrap();
+        assert_eq!((partial.attempt, partial.text.as_str()), (1, "Smaller"));
         // The reply, once saved, supersedes them all.
         store
             .record_message(message(MessageRole::Assistant, "Again and again"))

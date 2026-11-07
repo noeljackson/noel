@@ -334,6 +334,37 @@ async fn ending_a_backoff_early_ends_the_turn_with_the_failure_it_would_have_ret
     assert!(!run.retry.abort());
 }
 
+/// #142: a copy of the session kept from a run's events (the controller's,
+/// for reads while the run is active) is the saved session after a
+/// compaction rewrote the history.
+#[tokio::test]
+async fn a_session_kept_from_the_events_follows_a_compaction() {
+    let (mut runtime, _store, _base) = session("overflow-mirror", ONE_TURN);
+    let provider = Steps::new([
+        broken(Vec::new(), OVERFLOW),
+        says("Summary of the first turn."),
+        says("Second answer."),
+    ]);
+    let mut copy = runtime.session().clone();
+    let mut events = Vec::new();
+    let run = RunControl::default();
+    let turn = run_user_turn_streaming_events_with_media(
+        &mut runtime,
+        &provider,
+        "second".into(),
+        Vec::new(),
+        &run,
+        |event: &TurnEvent| events.push(event.clone()),
+    );
+    turn.await.unwrap();
+    for event in &events {
+        crate::controller::mirror(&mut copy, event);
+    }
+    assert_eq!(copy.messages, runtime.session().messages);
+    assert_eq!(copy.compactions, runtime.session().compactions);
+    assert_eq!(copy.todos, runtime.session().todos);
+}
+
 #[tokio::test]
 async fn a_context_overflow_is_answered_by_one_compaction_and_one_retry() {
     let (mut runtime, store, base) = session("overflow", ONE_TURN);
