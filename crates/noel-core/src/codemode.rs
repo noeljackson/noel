@@ -495,7 +495,7 @@ impl Nested {
             }
         }
         let (output, is_error) = match self.extension_tools.get(name) {
-            Some(tool) if tool.protocol == "2" => {
+            Some(tool) if tool.protocol == crate::ExtensionToolProtocol::V2 => {
                 let mut hosts = self.hosts.lock().await;
                 match hosts
                     .call(

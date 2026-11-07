@@ -1278,46 +1278,11 @@ impl Remote {
             "/diff" if app.diff_panel.is_some() => app.diff_panel = None,
             "/changelog" => app.push(TuiEntryKind::System, crate::format_changelog()),
             "/themes" => app.push(TuiEntryKind::System, crate::format_themes(config)),
-            "/theme" => {
-                let items = crate::theme_names(config).into_iter().map(|name| {
-                    let active = config.settings.theme.as_deref().unwrap_or("system") == name
-                        || (name == "system"
-                            && config.settings.theme.as_deref() == Some("default"));
-                    json!({"label": name, "value": name, "active": active})
-                });
-                let selector = json!({
-                    "kind": "theme",
-                    "title": "theme",
-                    "items": items.collect::<Vec<_>>(),
-                });
-                if let Some(selector) = crate::TuiSelectorState::from_json(&selector) {
-                    app.push(TuiEntryKind::System, format!("{} selector", selector.title));
-                    app.selector = Some(selector);
-                }
-            }
+            "/theme" => self.theme_selector(app, config),
             "/copy" if app.transcript_view.borrow().has_selection() => {
                 app.transcript_view.get_mut().request_copy();
             }
-            "/copy" => {
-                let last = entries(&self.view)
-                    .iter()
-                    .rev()
-                    .map(message_of)
-                    .find(|message| message["role"] == "assistant")
-                    .map(|message| blocks(message, "text"));
-                match last {
-                    None => app.push(TuiEntryKind::System, "no assistant message"),
-                    Some(text) => {
-                        let copied = crate::clipboard::copy_text(&text).await;
-                        match copied {
-                            Ok(status) => {
-                                app.push(TuiEntryKind::System, format!("{text}\n{status}"))
-                            }
-                            Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
-                        }
-                    }
-                }
-            }
+            "/copy" => self.copy_last_reply(app).await,
             // The external editor is this terminal's.
             "/editor" => {
                 let initial = line.trim_start_matches("/editor").trim();
@@ -1335,20 +1300,7 @@ impl Remote {
                 );
             }
             // While a run is active, as the in-process TUI does mid-turn.
-            "/queue" if app.turn_running && line == "/queue" => {
-                let pending = inbox(&self.view);
-                if pending.is_empty() {
-                    app.push(TuiEntryKind::System, "no pending follow-ups");
-                } else {
-                    let list = pending
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (_, _, text))| format!("{}. {text}", index + 1))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    app.push(TuiEntryKind::System, format!("pending follow-ups:\n{list}"));
-                }
-            }
+            "/queue" if app.turn_running && line == "/queue" => self.list_pending(app),
             "/queue" if app.turn_running => {
                 let text = line.trim_start_matches("/queue").trim();
                 if !text.is_empty() {
@@ -1356,59 +1308,17 @@ impl Remote {
                 }
             }
             "/todos" if app.turn_running => app.todos_expanded = !app.todos_expanded,
-            "/queue-clear" if app.turn_running => {
-                let pending = inbox(&self.view);
-                let cleared = pending.len();
-                for (id, _, text) in pending {
-                    self.withdraw(id, text, false);
-                }
-                app.push(
-                    TuiEntryKind::System,
-                    format!("cleared {cleared} pending follow-up(s)"),
-                );
-            }
+            "/queue-clear" if app.turn_running => self.clear_pending(app),
             "/interrupt" if app.turn_running => self.abort(),
             "!!" if app.last_shell_command.is_none() => {
                 app.push(TuiEntryKind::System, "no previous shell command")
             }
             "!" if line == "!" => app.push(TuiEntryKind::System, "usage: ! <command>"),
-            _ if name.starts_with('!') => {
-                match crate::resolve_bang_command(line, &app.last_shell_command) {
-                    Some(command) if !app.turn_running && self.shell_row.is_none() => {
-                        app.last_shell_command = Some(command.clone());
-                        app.previews_expanded = false;
-                        let index = app.push_placeholder(
-                            TuiEntryKind::Tool,
-                            crate::format_bash_running(&command),
-                        );
-                        let pending = self.run_command(format!("!{command}"));
-                        self.shell_row = Some(ShellRow { index, pending });
-                    }
-                    Some(_) => app.push(
-                        TuiEntryKind::System,
-                        "! commands wait for the run to settle",
-                    ),
-                    None => self.prompt(app, line.to_owned(), steer),
-                }
-            }
+            _ if name.starts_with('!') => self.shell(app, line, steer),
             "/image" if line == "/image" => {
                 app.push(TuiEntryKind::System, "usage: /image <path> [prompt]")
             }
-            "/image" => {
-                let rest = line.trim_start_matches("/image").trim();
-                let (path, prompt) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-                let cwd = std::env::current_dir().unwrap_or_default();
-                match crate::load_media_input(&cwd, std::path::Path::new(path), config) {
-                    Ok(media) => {
-                        app.push(TuiEntryKind::System, crate::format_media_fallback(&media));
-                        app.input_media.push(media);
-                        if !prompt.trim().is_empty() {
-                            self.prompt(app, prompt.trim().to_owned(), steer);
-                        }
-                    }
-                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
-                }
-            }
+            "/image" => self.attach_image(app, config, line, steer),
             // While a run is active a prompt-like command queues as a
             // prompt; otherwise the worker runs it as `noel` would (an
             // extension's command, a skill, a template, a tool command).
@@ -1428,26 +1338,132 @@ impl Remote {
                 self.sessions_command(line.to_owned());
             }
             // `/bug` takes the error rows shown here into its report.
-            _ if line.split_whitespace().next() == Some("/bug") => {
-                let errors = app
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.kind == TuiEntryKind::Error)
-                    .map(|entry| entry.text.clone())
-                    .collect::<Vec<_>>();
-                let pending = self.pend();
-                let args = to_args(&CommandArgs {
-                    line: line.to_owned(),
-                    request_id: Some(new_request_id()),
-                    errors: Some(errors),
-                });
-                self.call(Call::Command(line.to_owned(), pending), args);
-            }
+            _ if line.split_whitespace().next() == Some("/bug") => self.bug(app, line),
             _ => {
                 self.run_command(line.to_owned());
             }
         }
         Action::None
+    }
+
+    /// `/theme` alone: the theme picker, this terminal's.
+    fn theme_selector(&self, app: &mut TuiApp, config: &LoadedConfig) {
+        let items = crate::theme_names(config).into_iter().map(|name| {
+            let active = config.settings.theme.as_deref().unwrap_or("system") == name
+                || (name == "system" && config.settings.theme.as_deref() == Some("default"));
+            json!({"label": name, "value": name, "active": active})
+        });
+        let selector = json!({
+            "kind": "theme",
+            "title": "theme",
+            "items": items.collect::<Vec<_>>(),
+        });
+        if let Some(selector) = crate::TuiSelectorState::from_json(&selector) {
+            app.push(TuiEntryKind::System, format!("{} selector", selector.title));
+            app.selector = Some(selector);
+        }
+    }
+
+    /// `/copy` without a selection: the last assistant reply.
+    async fn copy_last_reply(&self, app: &mut TuiApp) {
+        let last = entries(&self.view)
+            .iter()
+            .rev()
+            .map(message_of)
+            .find(|message| message["role"] == "assistant")
+            .map(|message| blocks(message, "text"));
+        match last {
+            None => app.push(TuiEntryKind::System, "no assistant message"),
+            Some(text) => {
+                let copied = crate::clipboard::copy_text(&text).await;
+                match copied {
+                    Ok(status) => app.push(TuiEntryKind::System, format!("{text}\n{status}")),
+                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                }
+            }
+        }
+    }
+
+    /// `/queue` during a run: the pending follow-ups.
+    fn list_pending(&self, app: &mut TuiApp) {
+        let pending = inbox(&self.view);
+        if pending.is_empty() {
+            app.push(TuiEntryKind::System, "no pending follow-ups");
+        } else {
+            let list = pending
+                .iter()
+                .enumerate()
+                .map(|(index, (_, _, text))| format!("{}. {text}", index + 1))
+                .collect::<Vec<_>>()
+                .join("\n");
+            app.push(TuiEntryKind::System, format!("pending follow-ups:\n{list}"));
+        }
+    }
+
+    /// `/queue-clear` during a run: every pending follow-up withdrawn.
+    fn clear_pending(&mut self, app: &mut TuiApp) {
+        let pending = inbox(&self.view);
+        let cleared = pending.len();
+        for (id, _, text) in pending {
+            self.withdraw(id, text, false);
+        }
+        app.push(
+            TuiEntryKind::System,
+            format!("cleared {cleared} pending follow-up(s)"),
+        );
+    }
+
+    /// `!command` and `!!`: run on the worker, its row filled when it answers.
+    fn shell(&mut self, app: &mut TuiApp, line: &str, steer: bool) {
+        match crate::resolve_bang_command(line, &app.last_shell_command) {
+            Some(command) if !app.turn_running && self.shell_row.is_none() => {
+                app.last_shell_command = Some(command.clone());
+                app.previews_expanded = false;
+                let index =
+                    app.push_placeholder(TuiEntryKind::Tool, crate::format_bash_running(&command));
+                let pending = self.run_command(format!("!{command}"));
+                self.shell_row = Some(ShellRow { index, pending });
+            }
+            Some(_) => app.push(
+                TuiEntryKind::System,
+                "! commands wait for the run to settle",
+            ),
+            None => self.prompt(app, line.to_owned(), steer),
+        }
+    }
+
+    /// `/image <path> [prompt]`: the image goes with the next prompt.
+    fn attach_image(&mut self, app: &mut TuiApp, config: &LoadedConfig, line: &str, steer: bool) {
+        let rest = line.trim_start_matches("/image").trim();
+        let (path, prompt) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let cwd = std::env::current_dir().unwrap_or_default();
+        match crate::load_media_input(&cwd, std::path::Path::new(path), config) {
+            Ok(media) => {
+                app.push(TuiEntryKind::System, crate::format_media_fallback(&media));
+                app.input_media.push(media);
+                if !prompt.trim().is_empty() {
+                    self.prompt(app, prompt.trim().to_owned(), steer);
+                }
+            }
+            Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+        }
+    }
+
+    /// `/bug`: the error rows shown here go into the report.
+    fn bug(&mut self, app: &mut TuiApp, line: &str) {
+        let errors = app
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == TuiEntryKind::Error)
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        let pending = self.pend();
+        let args = to_args(&CommandArgs {
+            line: line.to_owned(),
+            request_id: Some(new_request_id()),
+            errors: Some(errors),
+        });
+        self.call(Call::Command(line.to_owned(), pending), args);
     }
 
     /// Runs `line` on the session's worker; the TUI shows it working until
