@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["apps/desktop"]
+exclude = ["apps"]
 members = [
     "crates/noel-agent",
     "crates/noel-ai",

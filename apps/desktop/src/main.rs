@@ -104,7 +104,7 @@ fn smoke(mut events: futures::channel::mpsc::UnboundedReceiver<Event>, want_view
                     Some(Event::Plugins(list)) => plugins = Some(list.len()),
                     Some(Event::View { session, entries, .. }) => view = Some(json!({"session": session, "entries": entries.len()})),
                     Some(Event::Status(status)) => statuses.push(status),
-                    Some(Event::Connected) => {}
+                    Some(Event::Connected | Event::Reconnecting) => {}
                     None => break,
                 },
                 () = deadline => break,

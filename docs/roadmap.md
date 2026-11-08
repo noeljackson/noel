@@ -131,6 +131,9 @@ from `main`; Chord v2 has its own pin, `CHORD2_REFERENCE_REF`
   are unchanged. Spec §14.
 - Done: `scripts/app-smoke.sh` runs it against a real server locally,
   through `noel app` and through ssh, and draws the window under Xvfb.
+  `make app-bundle` packages `Noel.app`; `make app-window-smoke` verifies a
+  real macOS window. Platform-neutral transcript and panel components live in
+  `apps/shared/gpui-ui` for the desktop and GPUI iOS shells.
 
 ### 10. `noel-ffi` and iOS (Done, #125)
 - `crates/noel-ffi`: noel-client's app link through UniFFI, over a byte
@@ -140,6 +143,10 @@ from `main`; Chord v2 has its own pin, `CHORD2_REFERENCE_REF`
   (`make ios-libs`). `noel-client::app` is shared with the desktop app.
 - `apps/ios`: NoelKit and the SwiftUI app (sessions, chat, plugin panels),
   `make ios` and `.github/workflows/ios.yml` (macOS runner). Spec §15.
+- A separate GPUI iOS shell uses `apps/shared/gpui-ui` and `noel-client`
+  directly, with a `russh` bridge and first-use host-key fingerprints;
+  `make ios-gpui` packages its simulator app. The SwiftUI path remains while
+  the GPUI path is being validated.
 - The macOS workflow (`macos-15`, Xcode 16) builds the static libraries,
   the xcframework, NoelKit and the app for the arm64 simulator. Citadel is
   pinned by commit for `withExec` (not in a tagged release yet). The app

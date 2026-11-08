@@ -268,6 +268,13 @@ app:
 	cd apps/desktop && CARGO_TARGET_DIR="$(CURDIR)/target/desktop" $(CARGO) build --release
 	@echo "noel-app: target/desktop/release/noel-app (put it beside noel, or on the PATH)"
 
+app-bundle: app
+	$(CARGO) build -p noel-cli
+	scripts/app-bundle.sh
+
+app-window-smoke: app-bundle
+	scripts/app-window-smoke.sh
+
 app-check:
 	cd apps/desktop && $(CARGO) fmt -- --check
 	cd apps/desktop && CARGO_TARGET_DIR="$(CURDIR)/target/desktop" $(CARGO) clippy -- -D warnings
@@ -278,6 +285,9 @@ ios-libs:
 
 ios:
 	CARGO="$(CARGO)" scripts/ios-build.sh app
+
+ios-gpui:
+	scripts/ios-gpui-build.sh
 
 chord2-interop:
 	CARGO="$(CARGO)" CHORD2_REFERENCE_DIR="$(CHORD2_REFERENCE_DIR)" scripts/chord2-interop.sh

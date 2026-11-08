@@ -18,8 +18,12 @@ gpui_platform = { package = "gpui_ce_platform", version = "=0.3.0" }
 gpui_elements = { package = "gpui_ce_elements", version = "=0.3.0" }
 noel-chord = { path = "../../crates/noel-chord" }
 noel-client = { path = "../../crates/noel-client" }
+noel-app-ui = { path = "../shared/gpui-ui" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
 
 # Its own workspace: the GPUI dependencies stay out of `make check`.
 [workspace]
+
+[patch.crates-io]
+gpui_ce_macos = { path = "vendor/gpui_ce_macos" }

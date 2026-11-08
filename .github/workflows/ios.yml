@@ -2,9 +2,9 @@ name: ios
 
 on:
   push:
-    paths: ["apps/ios/**", "crates/noel-ffi/**", "crates/noel-client/**", "crates/noel-chord/**", "scripts/ios-build.sh", ".github/workflows/ios.yml"]
+    paths: ["apps/ios/**", "apps/shared/**", "crates/noel-ffi/**", "crates/noel-client/**", "crates/noel-chord/**", "scripts/ios-build.sh", "scripts/ios-gpui-build.sh", ".github/workflows/ios.yml"]
   pull_request:
-    paths: ["apps/ios/**", "crates/noel-ffi/**", "crates/noel-client/**", "crates/noel-chord/**", "scripts/ios-build.sh", ".github/workflows/ios.yml"]
+    paths: ["apps/ios/**", "apps/shared/**", "crates/noel-ffi/**", "crates/noel-client/**", "crates/noel-chord/**", "scripts/ios-build.sh", "scripts/ios-gpui-build.sh", ".github/workflows/ios.yml"]
   workflow_dispatch:
 
 permissions:
@@ -19,3 +19,5 @@ jobs:
         run: brew install xcodegen
       - name: noel-ffi, NoelKit and the app
         run: make ios
+      - name: Shared GPUI components and the iOS app
+        run: make ios-gpui
