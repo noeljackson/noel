@@ -88,8 +88,10 @@ struct NoelApp {
     entries: Vec<Value>,
     plugins: Vec<Value>,
     composer: Entity<EditableTextState>,
+    session_search: Entity<EditableTextState>,
     palette_input: Entity<EditableTextState>,
     palette_open: bool,
+    plugins_open: bool,
     focus: FocusHandle,
 }
 
@@ -126,8 +128,10 @@ impl NoelApp {
             entries: Vec::new(),
             plugins: Vec::new(),
             composer: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
+            session_search: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
             palette_input: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
             palette_open: false,
+            plugins_open: false,
             focus,
         }
     }
@@ -241,6 +245,7 @@ impl NoelApp {
     }
 
     fn sidebar(&self, colors: &Colors, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.session_search.read(cx).as_str().trim().to_lowercase();
         let mut list = div()
             .id("sessions")
             .flex()
@@ -249,6 +254,9 @@ impl NoelApp {
             .overflow_y_scroll()
             .flex_1();
         for session in &self.sessions {
+            if !query.is_empty() && !session_title(session).to_lowercase().contains(&query) {
+                continue;
+            }
             let id = session["sessionId"].as_str().unwrap_or_default().to_owned();
             let selected = self.selected.as_deref() == Some(id.as_str());
             let busy = session["live"]["busy"] == Value::Bool(true);
@@ -260,7 +268,7 @@ impl NoelApp {
                     .py_1()
                     .rounded_md()
                     .cursor_pointer()
-                    .when(selected, |row| row.bg(gpui::rgb(0x2a2d31)))
+                    .when(selected, |row| row.bg(colors.selected))
                     .hover(|row| row.opacity(0.85))
                     .child(div().text_sm().child(session_title(session)))
                     .child(
@@ -285,27 +293,43 @@ impl NoelApp {
             );
         }
         div()
-            .w(px(260.))
+            .w(px(264.))
             .flex()
             .flex_col()
             .gap_2()
             .p_2()
             .border_r_1()
             .border_color(colors.border)
-            .bg(colors.container)
+            .bg(gpui::rgb(0x0d0d0d))
             .child(
                 div()
-                    .text_lg()
+                    .h(px(48.))
+                    .text_size(px(16.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("noel"),
             )
             .child(
                 button("new-session", "New session", colors)
+                    .h(px(30.))
                     .on_click(cx.listener(|app, _, _, cx| app.new_session(cx))),
             )
             .child(
+                text_input("session-search")
+                    .state(self.session_search.downgrade())
+                    .placeholder("Search")
+                    .placeholder_color(colors.disabled)
+                    .caret_color(gpui::rgb_to_hsla(colors.text))
+                    .h(px(32.))
+                    .whitespace_nowrap()
+                    .px_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.container),
+            )
+            .child(
                 div()
-                    .pt_2()
+                    .pt_6()
                     .text_xs()
                     .text_color(colors.disabled)
                     .child("SESSIONS"),
@@ -318,8 +342,8 @@ impl NoelApp {
             .id("transcript")
             .flex()
             .flex_col()
-            .gap_3()
-            .p_3()
+            .gap_4()
+            .p_4()
             .flex_1()
             .overflow_y_scroll();
         if self.selected.is_none() {
@@ -351,18 +375,18 @@ impl NoelApp {
         div()
             .flex()
             .justify_center()
-            .child(column.max_w(px(900.)).w_full())
+            .child(column.max_w(px(760.)).w_full())
     }
 
     fn composer(&self, colors: &Colors, cx: &mut Context<Self>) -> impl IntoElement {
         div().flex().justify_center().p_3().child(
             div()
-                .max_w(px(900.))
+                .max_w(px(760.))
                 .w_full()
                 .flex()
                 .gap_2()
                 .p_2()
-                .rounded_xl()
+                .rounded_2xl()
                 .border_1()
                 .border_color(colors.border)
                 .bg(colors.container)
@@ -373,7 +397,7 @@ impl NoelApp {
                         .placeholder_color(colors.disabled)
                         .caret_color(gpui::rgb_to_hsla(colors.text))
                         .flex_1()
-                        .h(px(72.))
+                        .h(px(84.))
                         .whitespace_normal()
                         .overflow_y_scroll()
                         .px_3()
@@ -528,7 +552,7 @@ impl NoelApp {
 
 impl Render for NoelApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = Colors::for_appearance(window);
+        let colors = desktop_colors(window);
         let title = match (&self.endpoint.remote, &self.selected) {
             (Some(remote), _) => format!("noel on {remote}"),
             (None, Some(session)) => format!("noel / {session}"),
@@ -536,14 +560,16 @@ impl Render for NoelApp {
         };
         let header = div()
             .flex()
-            .justify_between()
+            .items_center()
+            .gap_2()
+            .h(px(48.))
             .px_3()
-            .py_2()
             .border_b_1()
             .border_color(colors.border)
             .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
             .child(
                 div()
+                    .flex_1()
                     .text_sm()
                     .text_color(if self.connected {
                         colors.text
@@ -551,6 +577,14 @@ impl Render for NoelApp {
                         colors.disabled
                     })
                     .child(self.status.clone()),
+            )
+            .child(
+                button("toggle-plugins", "Plugins", &colors).on_click(cx.listener(
+                    |app, _, _, cx| {
+                        app.plugins_open = !app.plugins_open;
+                        cx.notify();
+                    },
+                )),
             );
         let main = div()
             .flex()
@@ -586,10 +620,30 @@ impl Render for NoelApp {
                     .min_h(px(0.))
                     .child(self.sidebar(&colors, cx))
                     .child(main)
-                    .child(self.plugins_column(&colors, cx)),
+                    .when(self.plugins_open, |root| {
+                        root.child(self.plugins_column(&colors, cx))
+                    }),
             )
             .when(self.palette_open, |root| {
                 root.child(self.palette(&colors, cx))
             })
     }
+}
+
+fn desktop_colors(window: &Window) -> Colors {
+    let mut colors = Colors::for_appearance(window);
+    if matches!(
+        window.appearance(),
+        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+    ) {
+        colors.background = gpui::rgb(0x121212);
+        colors.container = gpui::rgb(0x1f1f1f);
+        colors.border = gpui::rgb(0x2e2e2e);
+        colors.separator = colors.border;
+        colors.text = gpui::rgb(0xd6d6d6);
+        colors.disabled = gpui::rgb(0x6b6b6b);
+        colors.selected = gpui::rgb(0x2b2b2b);
+        colors.selected_text = colors.text;
+    }
+    colors
 }
