@@ -18,6 +18,8 @@ toolchain="$(rustup show active-toolchain | cut -d' ' -f1)"
 toolchain_bin="$(dirname "$(rustup which rustc)")"
 PATH="${toolchain_bin}:${PATH}"
 export PATH
+CARGO_TARGET_DIR="${target_dir}"
+export CARGO_TARGET_DIR
 IPHONEOS_DEPLOYMENT_TARGET=17.0 \
   rustup run "${toolchain}" "${CARGO:-cargo}" build \
   --manifest-path "${repo_root}/apps/ios/Cargo.toml" \

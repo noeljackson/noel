@@ -260,16 +260,14 @@ impl NoelApp {
                     .py_1()
                     .rounded_md()
                     .cursor_pointer()
-                    .when(selected, |row| {
-                        row.bg(colors.selected).text_color(colors.selected_text)
-                    })
+                    .when(selected, |row| row.bg(gpui::rgb(0x2a2d31)))
                     .hover(|row| row.opacity(0.85))
                     .child(div().text_sm().child(session_title(session)))
                     .child(
                         div()
                             .text_xs()
                             .text_color(if selected {
-                                colors.selected_text
+                                colors.text
                             } else {
                                 colors.disabled
                             })
@@ -295,10 +293,22 @@ impl NoelApp {
             .border_r_1()
             .border_color(colors.border)
             .bg(colors.container)
-            .child(div().font_weight(FontWeight::SEMIBOLD).child("Sessions"))
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("noel"),
+            )
             .child(
                 button("new-session", "New session", colors)
                     .on_click(cx.listener(|app, _, _, cx| app.new_session(cx))),
+            )
+            .child(
+                div()
+                    .pt_2()
+                    .text_xs()
+                    .text_color(colors.disabled)
+                    .child("SESSIONS"),
             )
             .child(list)
     }
@@ -338,47 +348,52 @@ impl NoelApp {
                 )));
             }
         }
-        column
+        div()
+            .flex()
+            .justify_center()
+            .child(column.max_w(px(900.)).w_full())
     }
 
     fn composer(&self, colors: &Colors, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .gap_2()
-            .p_2()
-            .border_t_1()
-            .border_color(colors.border)
-            .child(
-                text_area("composer")
-                    .state(self.composer.downgrade())
-                    .placeholder("Message (secondary-enter sends)")
-                    .placeholder_color(colors.disabled)
-                    .caret_color(gpui::rgb_to_hsla(colors.text))
-                    .flex_1()
-                    .h(px(72.))
-                    .whitespace_normal()
-                    .overflow_y_scroll()
-                    .px_3()
-                    .py_2()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(colors.border)
-                    .bg(colors.container),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        button("send", "Send", colors)
-                            .on_click(cx.listener(|app, _, _, cx| app.submit(cx))),
-                    )
-                    .child(
-                        button("abort", "Abort", colors)
-                            .on_click(cx.listener(|app, _, _, _| app.send(Command::Abort))),
-                    ),
-            )
+        div().flex().justify_center().p_3().child(
+            div()
+                .max_w(px(900.))
+                .w_full()
+                .flex()
+                .gap_2()
+                .p_2()
+                .rounded_xl()
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.container)
+                .child(
+                    text_area("composer")
+                        .state(self.composer.downgrade())
+                        .placeholder("Type a message…")
+                        .placeholder_color(colors.disabled)
+                        .caret_color(gpui::rgb_to_hsla(colors.text))
+                        .flex_1()
+                        .h(px(72.))
+                        .whitespace_normal()
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py_2(),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            button("send", "Send", colors)
+                                .on_click(cx.listener(|app, _, _, cx| app.submit(cx))),
+                        )
+                        .child(
+                            button("abort", "Abort", colors)
+                                .on_click(cx.listener(|app, _, _, _| app.send(Command::Abort))),
+                        ),
+                ),
+        )
     }
 
     fn plugins_column(&self, colors: &Colors, cx: &mut Context<Self>) -> impl IntoElement {
@@ -514,9 +529,10 @@ impl NoelApp {
 impl Render for NoelApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = Colors::for_appearance(window);
-        let title = match &self.endpoint.remote {
-            Some(remote) => format!("noel on {remote}"),
-            None => "noel".to_owned(),
+        let title = match (&self.endpoint.remote, &self.selected) {
+            (Some(remote), _) => format!("noel on {remote}"),
+            (None, Some(session)) => format!("noel / {session}"),
+            (None, None) => "noel".to_owned(),
         };
         let header = div()
             .flex()
