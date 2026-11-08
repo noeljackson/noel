@@ -1926,6 +1926,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "noel-markdown"
+version = "0.3.0"
+
+[[package]]
 name = "noel-parity"
 version = "0.3.0"
 dependencies = [

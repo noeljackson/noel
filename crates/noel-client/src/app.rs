@@ -50,6 +50,7 @@ pub enum Command {
     New {
         cwd: String,
     },
+    Delete(String),
     Abort,
     PluginRun {
         plugin: String,
@@ -166,6 +167,16 @@ pub async fn run(
                         events.clone(),
                     )));
                 }
+            }
+            Command::Delete(session) => {
+                let status = match client
+                    .sessions_call("delete", json!({"sessionId": session}))
+                    .await
+                {
+                    Ok(_) => format!("deleted {session}"),
+                    Err(error) => format!("delete: {error:#}"),
+                };
+                let _ = events.unbounded_send(Event::Status(status));
             }
             Command::Abort => {
                 let Some(session) = selected.clone() else {

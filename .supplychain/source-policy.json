@@ -52,6 +52,22 @@
       "reason": "The latest GPUI 0.3.0 Linux accessibility stack still uses zvariant_derive; no fixed release is available.",
       "owner": "@noeljackson",
       "expires": "2027-02-07"
+    },
+    {
+      "kind": "osv",
+      "advisory_id": "RUSTSEC-2025-0141",
+      "package": "bincode",
+      "reason": "syntect 5.3.0 uses bincode for compiled syntax and theme caches; this is an unmaintained notice with no fixed release available.",
+      "owner": "@noeljackson",
+      "expires": "2027-02-07"
+    },
+    {
+      "kind": "osv",
+      "advisory_id": "RUSTSEC-2024-0320",
+      "package": "yaml-rust",
+      "reason": "syntect 5.3.0 uses yaml-rust for grammar loading; this is an unmaintained notice with no fixed release available.",
+      "owner": "@noeljackson",
+      "expires": "2027-02-07"
     }
   ]
 }
