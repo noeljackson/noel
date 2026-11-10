@@ -1385,6 +1385,11 @@
           },
           {
             "provider": "anthropic",
+            "id": "claude-fable-5-2",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
             "id": "claude-haiku-4-5",
             "thinkingLevel": null
           },
@@ -1486,6 +1491,11 @@
           },
           {
             "provider": "anthropic",
+            "id": "claude-fable-5-2",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
             "id": "claude-haiku-4-5",
             "thinkingLevel": null
           },
@@ -1571,6 +1581,11 @@
           },
           {
             "provider": "openrouter",
+            "id": "anthropic/claude-fable-5.2",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
             "id": "anthropic/claude-haiku-4.5",
             "thinkingLevel": null
           },
@@ -1642,6 +1657,11 @@
           {
             "provider": "openrouter",
             "id": "anthropic/claude-fable-5.1:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-fable-5.2:batch",
             "thinkingLevel": null
           },
           {
@@ -1733,6 +1753,11 @@
           {
             "provider": "anthropic",
             "id": "claude-fable-5-1",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-fable-5-2",
             "thinkingLevel": null
           },
           {
@@ -1996,6 +2021,11 @@
           },
           {
             "provider": "openrouter",
+            "id": "anthropic/claude-fable-5.2",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
             "id": "anthropic/claude-haiku-4.5",
             "thinkingLevel": null
           },
@@ -2067,6 +2097,11 @@
           {
             "provider": "openrouter",
             "id": "anthropic/claude-fable-5.1:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-fable-5.2:batch",
             "thinkingLevel": null
           },
           {
