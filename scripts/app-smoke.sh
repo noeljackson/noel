@@ -73,6 +73,13 @@ check "noel app" "${work}/noel-app.out"
 PATH="${work}/bin:${PATH}" timeout 60 "${app}" --smoke --remote devbox --noel "${noel}" \
   --session "${session}" >"${work}/remote.out"
 check "remote" "${work}/remote.out"
+timeout 60 "${app}" --smoke-new --noel "${noel}" >"${work}/new.out"
+if ! grep -Eq '"sessions":2,"plugins":1,"view":\{"session":"s-[^"]+","entries":0\}' "${work}/new.out"; then
+  echo "app-smoke: new session:" >&2
+  cat "${work}/new.out" >&2
+  exit 1
+fi
+echo "app-smoke: new session: ok"
 
 if [ -n "${SCREENSHOT:-}" ]; then
   export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/lvp_icd.json}"

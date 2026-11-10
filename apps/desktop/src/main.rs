@@ -3,12 +3,12 @@
 //! transcript, a composer, a command palette and the plugins' panels.
 //!
 //! ```text
-//! noel-app [--remote <ssh-destination>] [--noel <program>] [--session <id>] [--smoke]
+//! noel-app [--remote <ssh-destination>] [--noel <program>] [--session <id>] [--smoke] [--smoke-new]
 //! ```
 //!
 //! `noel app` runs it. `--smoke` connects, waits for the directory (and the
-//! session's view with `--session`), prints what it saw as JSON and exits:
-//! the app's link without a window, for tests.
+//! session's view with `--session`), prints what it saw as JSON and exits.
+//! `--smoke-new` also creates a session and waits for its view.
 
 mod backend;
 mod ui;
@@ -23,6 +23,7 @@ struct Args {
     endpoint: Endpoint,
     session: Option<String>,
     smoke: bool,
+    smoke_new: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -31,14 +32,19 @@ fn parse_args() -> Result<Args, String> {
     let mut program = None;
     let mut session = None;
     let mut smoke = false;
+    let mut smoke_new = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--remote" => remote = Some(args.next().ok_or("--remote needs a destination")?),
             "--noel" => program = Some(args.next().ok_or("--noel needs a program")?),
             "--session" => session = Some(args.next().ok_or("--session needs an id")?),
             "--smoke" => smoke = true,
+            "--smoke-new" => {
+                smoke = true;
+                smoke_new = true;
+            }
             "-h" | "--help" => {
-                println!("noel-app [--remote <ssh-destination>] [--noel <program>] [--session <id>] [--smoke]");
+                println!("noel-app [--remote <ssh-destination>] [--noel <program>] [--session <id>] [--smoke] [--smoke-new]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other}")),
@@ -56,6 +62,7 @@ fn parse_args() -> Result<Args, String> {
         endpoint: Endpoint { program, remote },
         session,
         smoke,
+        smoke_new,
     })
 }
 
@@ -82,8 +89,16 @@ fn main() {
     if let Some(session) = &args.session {
         let _ = commands.send(Command::Select(session.clone()));
     }
+    if args.smoke_new {
+        let cwd = std::env::current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_else(|_| "/".to_owned());
+        if let Err(error) = commands.send(Command::New { cwd }) {
+            eprintln!("could not queue new session: {error}");
+        }
+    }
     if args.smoke {
-        std::process::exit(smoke(events, args.session.is_some()));
+        std::process::exit(smoke(events, args.session.is_some() || args.smoke_new));
     }
     ui::run(events, commands, args.endpoint);
 }
@@ -116,7 +131,7 @@ fn smoke(mut events: futures::channel::mpsc::UnboundedReceiver<Event>, want_view
         json!({"sessions": sessions, "plugins": plugins, "view": view, "statuses": statuses})
     });
     println!("{outcome}");
-    if outcome["sessions"].is_null() {
+    if outcome["sessions"].is_null() || (want_view && outcome["view"].is_null()) {
         1
     } else {
         0

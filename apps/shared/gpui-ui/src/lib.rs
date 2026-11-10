@@ -1,14 +1,22 @@
+pub mod design;
+pub mod icons;
 pub mod sessions;
 
+use crate::icons::{icon, Icon};
 use gpui::{
-    colors::Colors, div, prelude::*, px, AnyElement, FontStyle, FontWeight, HighlightStyle,
-    SharedString, StrikethroughStyle, StyledText, UnderlineStyle,
+    colors::Colors, div, prelude::*, px, AnyElement, ClipboardItem, FontStyle, FontWeight,
+    HighlightStyle, SharedString, StrikethroughStyle, StyledText, UnderlineStyle,
 };
 use noel_markdown::{
     block_render, classify_line, display_inline, fence_marker, BlockKind, DisplayLine, SpanStyle,
 };
 use serde_json::Value;
-use std::{ops::Range, sync::OnceLock};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    ops::Range,
+    sync::OnceLock,
+};
 use syntect::{
     easy::HighlightLines,
     highlighting::{FontStyle as SyntectFontStyle, ThemeSet},
@@ -67,8 +75,8 @@ pub fn entry_element(entry: &Value, colors: &Colors) -> AnyElement {
         _ => String::new(),
     };
     match entry["kind"].as_str() {
-        Some("pi.user") => plain_block("you", &text, colors),
-        Some("pi.assistant") => block("assistant", &text, colors, false),
+        Some("pi.user") => plain_block("", &text, colors),
+        Some("pi.assistant") => block("", &text, colors, false),
         Some("pi.tool-result") => {
             let label = format!(
                 "{}{}",
@@ -116,24 +124,32 @@ fn labelled_block(label: &str, body: gpui::Div, colors: &Colors, tool: bool) -> 
     div()
         .flex()
         .flex_col()
-        .gap_1()
-        .p_2()
         .rounded_md()
         .when(tool, |block| {
-            block.bg(colors.container).font_family("monospace")
+            block
+                .gap_1()
+                .p_2()
+                .bg(colors.container)
+                .font_family("monospace")
         })
-        .child(
-            div()
-                .text_xs()
-                .text_color(colors.disabled)
-                .child(label.to_owned()),
-        )
+        .when(!label.is_empty(), |block| {
+            block.child(
+                div()
+                    .text_xs()
+                    .text_color(colors.disabled)
+                    .child(label.to_owned()),
+            )
+        })
         .child(body)
         .into_any_element()
 }
 
 fn plain_body(text: &str, tool: bool) -> gpui::Div {
-    let mut body = div().flex().flex_col().text_sm();
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .text_size(px(14.))
+        .line_height(px(22.));
     for line in text.lines() {
         let color = if tool && line.starts_with('+') && !line.starts_with("+++") {
             Some(gpui::rgb(0x3fa65a))
@@ -209,7 +225,12 @@ fn markdown_segments(text: &str) -> Vec<MarkdownSegment> {
 }
 
 fn markdown_body(text: &str, colors: &Colors) -> gpui::Div {
-    let mut body = div().flex().flex_col().gap_1().text_sm();
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_size(px(14.))
+        .line_height(px(22.));
     for segment in markdown_segments(text) {
         body = body.child(match segment {
             MarkdownSegment::Line { kind, text } => markdown_line(&kind, &text, colors),
@@ -374,13 +395,22 @@ fn highlight_code(language: &str, code: &str, dark: bool) -> Vec<HighlightedLine
 
 fn code_card(language: &str, code: &str, colors: &Colors) -> gpui::Div {
     let background = gpui::rgb_to_hsla(colors.background);
-    let highlighted = highlight_code(language, code, background.lightness < 0.5);
+    let dark = background.lightness < 0.5;
+    let highlighted = highlight_code(language, code, dark);
+    let mut hasher = DefaultHasher::new();
+    code.hash(&mut hasher);
+    let id = hasher.finish();
     let mut lines = div()
+        .id(SharedString::from(format!("code-body-{id}")))
         .flex()
         .flex_col()
         .w_full()
+        .overflow_x_scroll()
+        .px_4()
+        .pb_4()
         .font_family("monospace")
-        .text_sm()
+        .text_size(px(14.))
+        .line_height(px(22.))
         .whitespace_nowrap();
     for line in highlighted {
         let highlights = line
@@ -409,25 +439,52 @@ fn code_card(language: &str, code: &str, colors: &Colors) -> gpui::Div {
                 .child(StyledText::new(text).with_highlights(highlights)),
         );
     }
+    let copied = code.to_owned();
     div()
         .flex()
         .flex_col()
-        .gap_2()
-        .my_1()
-        .p_3()
-        .rounded_lg()
+        .my_3()
+        .rounded_xl()
         .border_1()
         .border_color(colors.border)
-        .bg(colors.container)
+        .bg(if dark {
+            gpui::rgb(0x292929)
+        } else {
+            colors.container
+        })
         .child(
             div()
-                .text_xs()
-                .text_color(colors.disabled)
-                .child(if language.is_empty() {
-                    "code".to_owned()
-                } else {
-                    language.to_owned()
-                }),
+                .flex()
+                .items_center()
+                .gap_2()
+                .pl_4()
+                .pr_2()
+                .py_2()
+                .child(icon(Icon::Code, 14., colors.disabled))
+                .child(div().text_size(px(14.)).text_color(colors.text).child(
+                    if language.is_empty() {
+                        "Code".to_owned()
+                    } else {
+                        language.to_owned()
+                    },
+                ))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id(SharedString::from(format!("code-copy-{id}")))
+                        .w(px(26.))
+                        .h(px(26.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|button| button.bg(colors.selected))
+                        .child(icon(Icon::Copy, 14., colors.disabled))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+                        }),
+                ),
         )
         .child(lines)
 }
