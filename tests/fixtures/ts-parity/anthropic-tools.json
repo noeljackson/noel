@@ -14,7 +14,7 @@
       "anthropic-dangerous-direct-browser-access": "true",
       "anthropic-version": "2023-06-01",
       "content-type": "application/json",
-      "user-agent": "pi/1.5.1 (linux; node/v26.13.0; x64)",
+      "user-agent": "pi/1.5.2 (linux; node/v26.13.0; x64)",
       "x-api-key": "<redacted>",
       "x-stainless-arch": "x64",
       "x-stainless-lang": "js",

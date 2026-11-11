@@ -16,7 +16,7 @@
       "anthropic-version": "2023-06-01",
       "authorization": "Bearer <redacted>",
       "content-type": "application/json",
-      "user-agent": "claude-cli/2.1.280",
+      "user-agent": "claude-cli/2.1.322",
       "x-app": "cli",
       "x-stainless-arch": "x64",
       "x-stainless-lang": "js",
