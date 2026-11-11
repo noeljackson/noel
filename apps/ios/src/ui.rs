@@ -10,6 +10,7 @@ use gpui_elements::editable_text::{
 };
 use noel_app_ui::{block, button, entry_element, panel_element, session_title, text_of_parts};
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::backend::{Command, Endpoint, Event};
@@ -55,7 +56,7 @@ struct IosApp {
     sessions: Vec<Value>,
     selected: Option<String>,
     view: Value,
-    entries: Vec<Value>,
+    entries: Arc<Vec<Value>>,
     plugins: Vec<Value>,
     host: Entity<EditableTextState>,
     user: Entity<EditableTextState>,
@@ -100,7 +101,7 @@ impl IosApp {
             sessions: Vec::new(),
             selected: None,
             view: Value::Null,
-            entries: Vec::new(),
+            entries: Arc::default(),
             plugins: Vec::new(),
             host: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
             user: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
@@ -174,7 +175,7 @@ impl IosApp {
 
     fn select(&mut self, session: String) {
         self.selected = Some(session.clone());
-        self.entries.clear();
+        self.entries = Arc::default();
         self.view = Value::Null;
         self.send(Command::Select(session));
         self.screen = Screen::Chat;
@@ -341,7 +342,7 @@ impl IosApp {
                     .child("Pick a session or make a new one."),
             );
         }
-        for entry in &self.entries {
+        for entry in self.entries.iter() {
             column = column.child(entry_element(entry, colors));
         }
         let live = &self.view["docs"]["pi.live"];

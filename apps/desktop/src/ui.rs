@@ -20,9 +20,9 @@ use noel_app_ui::{
         COMPOSER_RADIUS, CONTENT_WIDTH, FONT_ACTION, FONT_BODY, FONT_META, SELECTOR_CHIP,
         SESSION_INDENT, WEIGHT_CAPTION, WEIGHT_OPTION,
     },
-    entry_element,
     icons::{icon, Icon},
     panel_element, session_title, text_of_parts,
+    transcript::Transcript,
 };
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -99,7 +99,7 @@ struct NoelApp {
     sessions: Vec<Value>,
     selected: Option<String>,
     view: Value,
-    entries: Vec<Value>,
+    transcript: Transcript,
     plugins: Vec<Value>,
     composer: Entity<EditableTextState>,
     session_search: Entity<EditableTextState>,
@@ -146,7 +146,7 @@ impl NoelApp {
             sessions: Vec::new(),
             selected: None,
             view: Value::Null,
-            entries: Vec::new(),
+            transcript: Transcript::default(),
             plugins: Vec::new(),
             composer: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
             session_search: cx.new(|cx| EditableTextState::new(StringStorage::default(), cx)),
@@ -190,7 +190,7 @@ impl NoelApp {
             } => {
                 self.selected = Some(session);
                 self.view = view;
-                self.entries = entries;
+                self.transcript.set(entries);
                 self.folder_picker_open = false;
                 self.palette_open = false;
                 self.status = "ready".to_owned();
@@ -207,7 +207,7 @@ impl NoelApp {
 
     fn select(&mut self, session: String) {
         self.selected = Some(session.clone());
-        self.entries.clear();
+        self.transcript.clear();
         self.view = Value::Null;
         self.folder_picker_open = false;
         self.palette_open = false;
@@ -226,7 +226,7 @@ impl NoelApp {
         if archiving && self.selected.as_deref() == Some(session.as_str()) {
             self.selected = None;
             self.view = Value::Null;
-            self.entries.clear();
+            self.transcript.clear();
             self.folder_picker_open = true;
         }
     }
@@ -237,7 +237,7 @@ impl NoelApp {
         if self.selected.as_deref() == Some(session.as_str()) {
             self.selected = None;
             self.view = Value::Null;
-            self.entries.clear();
+            self.transcript.clear();
             self.folder_picker_open = true;
         }
         self.send(Command::Delete(session));
@@ -688,40 +688,36 @@ impl NoelApp {
     }
 
     fn transcript(&self, colors: &Design) -> impl IntoElement {
-        let mut column = div()
-            .id("transcript")
-            .flex()
-            .flex_col()
-            .gap_4()
-            .px_6()
-            .py_4()
-            .flex_1()
-            .overflow_y_scroll();
-        for entry in &self.entries {
-            column = column.child(entry_element(entry, colors));
-        }
-        let live = &self.view["docs"]["pi.live"];
-        if let Some(partial) = live["generation"]["message"]["content"].as_array() {
-            let text = text_of_parts(partial);
-            if !text.is_empty() {
-                column = column.child(block("", &text, colors, false));
+        // What is still streaming, drawn as the row after the last entry.
+        let live = self.view["docs"]["pi.live"].clone();
+        let tail_colors = colors.colors.clone();
+        let tail = move || {
+            let colors = &tail_colors;
+            let mut column = div().flex().flex_col().gap_4();
+            if let Some(partial) = live["generation"]["message"]["content"].as_array() {
+                let text = text_of_parts(partial);
+                if !text.is_empty() {
+                    column = column.child(block("", &text, colors, false));
+                }
             }
-        }
-        if let Some(tools) = live["tools"].as_array() {
-            for tool in tools {
-                column = column.child(div().text_xs().text_color(colors.disabled).child(format!(
-                    "{} {}",
-                    tool["name"].as_str().unwrap_or_default(),
-                    tool["status"].as_str().unwrap_or_default()
-                )));
+            if let Some(tools) = live["tools"].as_array() {
+                for tool in tools {
+                    column =
+                        column.child(div().text_xs().text_color(colors.disabled).child(format!(
+                            "{} {}",
+                            tool["name"].as_str().unwrap_or_default(),
+                            tool["status"].as_str().unwrap_or_default()
+                        )));
+                }
             }
-        }
-        div()
-            .flex()
-            .justify_center()
-            .flex_1()
-            .min_h(px(0.))
-            .child(column.max_w(px(760.)).w_full())
+            column.into_any_element()
+        };
+        div().flex().justify_center().flex_1().min_h(px(0.)).child(
+            self.transcript
+                .element(colors, tail)
+                .max_w(px(760.))
+                .w_full(),
+        )
     }
 
     fn composer(&self, colors: &Design, cx: &mut Context<Self>) -> impl IntoElement {
