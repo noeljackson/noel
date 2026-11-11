@@ -1,6 +1,7 @@
 pub mod design;
 pub mod icons;
 pub mod sessions;
+pub mod transcript;
 
 use crate::icons::{icon, Icon};
 use gpui::{

@@ -505,6 +505,9 @@ async fn reconnect(connector: &dyn Connector, report: &Report) -> Link {
 #[derive(Debug, Clone, Default)]
 pub struct Transcript {
     entries: BTreeMap<u64, Value>,
+    /// Every entry held, oldest first, as last shared; none once an entry
+    /// is added or changes.
+    shared: Option<Arc<Vec<Value>>>,
 }
 
 impl Transcript {
@@ -515,10 +518,32 @@ impl Transcript {
         self.entries.values().cloned().collect()
     }
 
+    /// [`Transcript::merge`] without a copy of the history for each view:
+    /// the entries are the same allocation until one is added or changes.
+    pub fn merge_shared(&mut self, view: &Value) -> Arc<Vec<Value>> {
+        self.add(&view["entries"]);
+        self.shared
+            .get_or_insert_with(|| Arc::new(self.entries.values().cloned().collect()))
+            .clone()
+    }
+
+    /// Takes the entries of `earlier` that this transcript lacks.
+    pub fn absorb(&mut self, earlier: Transcript) {
+        for (id, entry) in earlier.entries {
+            if let std::collections::btree_map::Entry::Vacant(slot) = self.entries.entry(id) {
+                slot.insert(entry);
+                self.shared = None;
+            }
+        }
+    }
+
     fn add(&mut self, entries: &Value) {
         for entry in entries.as_array().into_iter().flatten() {
-            if let Some(id) = entry["id"].as_u64() {
+            if let Some(id) = entry["id"].as_u64()
+                && self.entries.get(&id) != Some(entry)
+            {
                 self.entries.insert(id, entry.clone());
+                self.shared = None;
             }
         }
     }
@@ -531,6 +556,15 @@ impl Transcript {
         session: &str,
         view: &Value,
     ) -> Result<()> {
+        // One hold for every page: a hold per page is a client that comes
+        // and goes, and the session's view tells each follower of both.
+        let chat = client.chat(session);
+        let loaded = self.load_pages(&chat, view).await;
+        chat.release();
+        loaded
+    }
+
+    async fn load_pages(&mut self, chat: &RemoteRef, view: &Value) -> Result<()> {
         let mut next = view["entries"]
             .get(0)
             .and_then(|entry| entry["id"].as_u64());
@@ -538,9 +572,7 @@ impl Transcript {
             if before <= 1 || self.entries.contains_key(&(before - 1)) {
                 break;
             }
-            let page = client
-                .chat_call(session, "entries", json!({ "before": before }), false)
-                .await?;
+            let page = call(chat, "entries", json!({ "before": before })).await?;
             let ids: Vec<u64> = page["entries"]
                 .as_array()
                 .into_iter()
@@ -965,5 +997,25 @@ mod tests {
             .map(|entry| entry["id"].as_u64().unwrap())
             .collect();
         assert_eq!(ids, [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn a_transcript_shares_its_entries_until_they_change() {
+        let entry = |id: u64| json!({"id": id, "kind": "pi.user"});
+        let mut transcript = Transcript::default();
+        let first = transcript.merge_shared(&json!({"entries": [entry(3), entry(4)]}));
+        // The same window again, as each change to the view's documents
+        // brings: no new copy of the history.
+        let again = transcript.merge_shared(&json!({"entries": [entry(3), entry(4)]}));
+        assert!(Arc::ptr_eq(&first, &again));
+        let grown = transcript.merge_shared(&json!({"entries": [entry(4), entry(5)]}));
+        assert_eq!(*grown, [entry(3), entry(4), entry(5)]);
+        // What was loaded from before the window goes in front; an entry
+        // held already stays as it is.
+        let mut earlier = Transcript::default();
+        earlier.add(&json!([entry(1), entry(2), {"id": 3, "kind": "stale"}]));
+        transcript.absorb(earlier);
+        let whole = transcript.merge_shared(&json!({"entries": []}));
+        assert_eq!(*whole, [entry(1), entry(2), entry(3), entry(4), entry(5)]);
     }
 }

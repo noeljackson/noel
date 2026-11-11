@@ -72,11 +72,13 @@ pub enum Event {
     Reconnecting,
     Status(String),
     Sessions(Vec<Value>),
-    /// The selected session's view and every entry seen of its history.
+    /// The selected session's view and every entry seen of its history:
+    /// at first the view's window, then what was loaded from before it.
+    /// The entries are the same allocation until one is added or changes.
     View {
         session: String,
         view: Value,
-        entries: Vec<Value>,
+        entries: Arc<Vec<Value>>,
     },
     Plugins(Vec<Value>),
 }
@@ -291,21 +293,43 @@ async fn follow_session(client: Client, session: String, events: Events) {
         })
     });
     let mut transcript = Transcript::default();
-    let mut loaded_earlier = false;
-    while let Some(view) = incoming.recv().await {
-        if !loaded_earlier {
-            loaded_earlier = true;
-            let _ = transcript.load_earlier(&client, &session, &view).await;
+    // The history before the first view's window, loaded while the window
+    // is already shown: a long session pages back for a second or more.
+    let (loaded, mut earlier) = mpsc::unbounded_channel();
+    let mut loading = None;
+    let mut shown = None;
+    loop {
+        tokio::select! {
+            view = incoming.recv() => {
+                let Some(mut view) = view else { break };
+                // Each view is the whole state, so only the newest is
+                // shown; the entries of each window are kept.
+                while let Ok(newer) = incoming.try_recv() {
+                    transcript.merge_shared(&view);
+                    view = newer;
+                }
+                transcript.merge_shared(&view);
+                if loading.is_none() {
+                    let (client, session) = (client.clone(), session.clone());
+                    let (loaded, view) = (loaded.clone(), view.clone());
+                    loading = Some(AbortOnDrop(tokio::spawn(async move {
+                        let mut earlier = Transcript::default();
+                        // What a failed page leaves loaded is still shown.
+                        let _ = earlier.load_earlier(&client, &session, &view).await;
+                        let _ = loaded.send(earlier);
+                    })));
+                }
+                shown = Some(view);
+            }
+            Some(earlier) = earlier.recv() => transcript.absorb(earlier),
         }
-        let entries = transcript.merge(&view);
-        if events
-            .unbounded_send(Event::View {
-                session: session.clone(),
-                view,
-                entries,
-            })
-            .is_err()
-        {
+        let Some(view) = shown.clone() else { continue };
+        let entries = transcript.merge_shared(&view);
+        if !events.send(Event::View {
+            session: session.clone(),
+            view,
+            entries,
+        }) {
             break;
         }
     }
