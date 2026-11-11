@@ -153,10 +153,14 @@ async fn run_hook(
         .env("NOEL_TOOL", tool);
     let mut child = process.spawn().map_err(|error| error.to_string())?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(format!("{payload}\n").as_bytes())
-            .await
-            .map_err(|error| error.to_string())?;
+        // A hook need not read its stdin: one that exits first closes the
+        // pipe, and that is not a hook that failed to run.
+        match stdin.write_all(format!("{payload}\n").as_bytes()).await {
+            Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => {
+                return Err(error.to_string());
+            }
+            _ => {}
+        }
     }
     let output = child.wait_with_output().await.map_err(|e| e.to_string())?;
     Ok((
