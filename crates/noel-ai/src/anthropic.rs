@@ -22,7 +22,7 @@ impl Provider for AnthropicProvider {
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
         if let Some(events) = parse_sse_body::<AnthropicSseParser>(&body)? {
-            return Ok(events);
+            return Ok(self.own_tool_names(events, &request.tools));
         }
         let response = serde_json::from_str::<Value>(&body)
             .map_err(|_| ProviderError::InvalidResponse(body.clone()))?;
@@ -35,7 +35,7 @@ impl Provider for AnthropicProvider {
                 .unwrap_or("stop")
                 .to_string(),
         });
-        Ok(events)
+        Ok(self.own_tool_names(events, &request.tools))
     }
 
     async fn complete_streaming(
@@ -52,6 +52,16 @@ impl Provider for AnthropicProvider {
             .send()
             .await?;
         let response = error_for_status_with_body(response).await?;
+        let oauth = matches!(&self.config.auth, ProviderAuth::ClaudeCodeOAuth { .. });
+        let mut renaming = |event: StreamEvent| {
+            on_event(if oauth {
+                own_tool_name(event, &request.tools)
+            } else {
+                event
+            })
+        };
+        let on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send) =
+            &mut renaming;
         let Some(body) = stream_sse::<AnthropicSseParser>(response, on_event).await? else {
             return Ok(());
         };
@@ -90,6 +100,101 @@ pub(crate) fn anthropic_messages_url(config: &ProviderConfig) -> Result<String, 
     Ok(format!("{normalized}/v1/messages"))
 }
 
+impl AnthropicProvider {
+    /// The events with each tool call under the name the session gave the
+    /// tool, when the request went out under Claude Code's names.
+    fn own_tool_names(
+        &self,
+        events: Vec<StreamEvent>,
+        tools: &[ToolDefinition],
+    ) -> Vec<StreamEvent> {
+        if !matches!(&self.config.auth, ProviderAuth::ClaudeCodeOAuth { .. }) {
+            return events;
+        }
+        events
+            .into_iter()
+            .map(|event| own_tool_name(event, tools))
+            .collect()
+    }
+}
+
+/// Claude Code's tool names, in its casing (upstream's list, taken from
+/// Claude Code 2.x's prompt).
+const CLAUDE_CODE_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+];
+
+/// `name` in Claude Code's casing when it is one of its tools' names in
+/// any case, as upstream sends tool names under a Claude Code sign-in.
+pub(crate) fn claude_code_tool_name(name: &str) -> &str {
+    CLAUDE_CODE_TOOLS
+        .iter()
+        .find(|tool| tool.eq_ignore_ascii_case(name))
+        .copied()
+        .unwrap_or(name)
+}
+
+/// A tool call under the session's own name for the tool: the declared
+/// tool whose name matches in any case, else the name as it came.
+pub(crate) fn own_tool_name(event: StreamEvent, tools: &[ToolDefinition]) -> StreamEvent {
+    match event {
+        StreamEvent::ToolCall {
+            id,
+            name,
+            arguments,
+        } => StreamEvent::ToolCall {
+            id,
+            name: tools
+                .iter()
+                .find(|tool| tool.name.eq_ignore_ascii_case(&name))
+                .map_or(name, |tool| tool.name.clone()),
+            arguments,
+        },
+        event => event,
+    }
+}
+
+/// Renames the body's tools, and the tool calls of its messages, to
+/// Claude Code's casing.
+fn apply_claude_code_tool_names(body: &mut Value) {
+    let rename = |value: &mut Value| {
+        if let Some(name) = value.get("name").and_then(Value::as_str) {
+            let renamed = claude_code_tool_name(name);
+            if renamed != name {
+                value["name"] = json!(renamed);
+            }
+        }
+    };
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.iter_mut().for_each(rename);
+    }
+    let blocks = body
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get_mut("content").and_then(Value::as_array_mut))
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+    blocks.for_each(rename);
+}
+
 pub(crate) fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     let max_tokens = provider_max_tokens(config, request)
         .unwrap_or(ANTHROPIC_UNCATALOGED_MAX_TOKENS)
@@ -121,6 +226,9 @@ pub(crate) fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest)
         {
             body["thinking"]["budget_tokens"] = json!(budget.min(answer_room.max(1024)));
         }
+    }
+    if matches!(&config.auth, ProviderAuth::ClaudeCodeOAuth { .. }) {
+        apply_claude_code_tool_names(&mut body);
     }
     body
 }

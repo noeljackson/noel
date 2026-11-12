@@ -416,7 +416,11 @@ plain settings, no host program:
 }
 ```
 
-`matcher` is a `|`-separated list of tool names; empty matches every tool.
+`matcher` is a `|`-separated list of tool names; empty or `*` matches every
+tool. Names match in any case, and Claude Code's names work for the tools
+named otherwise here (`Glob` is `find`, `WebFetch` `web_fetch`, `WebSearch`
+`web_search`, `Agent` `task`, `TodoWrite` `todo`, `MultiEdit` `edit`), so a
+matcher written for Claude Code, such as `Edit|Write`, applies unchanged.
 A hook runs in the session's cwd with its shell, one JSON object on stdin
 (`tool`, `arguments`, `matcher`, `cwd`, `sessionId`) and `NOEL_SESSION_ID`/
 `NOEL_TOOL` in its environment. A **pre**-hook that exits 2 blocks the

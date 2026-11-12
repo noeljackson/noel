@@ -2966,3 +2966,37 @@ fn restore_env(name: &str, value: Option<String>) {
         None => unsafe { std::env::remove_var(name) },
     }
 }
+
+/// A hook matcher names tools in any case, takes Claude Code's names for
+/// the tools named otherwise here, and `*` or nothing for every tool.
+#[test]
+fn hook_matchers_take_claude_code_tool_names() {
+    let hook = |matcher: &str| HookCommand {
+        matcher: matcher.to_string(),
+        command: "true".to_string(),
+    };
+    let matches = |matcher: &str, tool: &str| {
+        let hooks = HooksSettings {
+            pre_tool_use: vec![hook(matcher)],
+            post_tool_use: Vec::new(),
+        };
+        hooks.matching("pre", tool).len() == 1
+    };
+    assert!(matches("bash", "bash"));
+    assert!(matches("Bash", "bash"));
+    assert!(matches("Edit|Write", "write"));
+    assert!(matches(" Edit | Write ", "edit"));
+    assert!(matches("Glob", "find"));
+    assert!(matches("WebFetch", "web_fetch"));
+    assert!(matches("Agent", "task"));
+    assert!(matches("Task", "task"));
+    assert!(matches("*", "anything"));
+    assert!(matches("", "anything"));
+    assert!(matches("Bash|*", "read"));
+    assert!(!matches("Bash", "read"));
+    assert!(!matches("Glob", "grep"));
+    // An alias is Claude Code's spelling only, and never a pattern.
+    assert!(!matches("glob", "find"));
+    assert!(!matches("web_*", "web_fetch"));
+    assert!(!matches("Bash", "bash_extra"));
+}

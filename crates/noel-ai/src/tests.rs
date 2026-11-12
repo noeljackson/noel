@@ -4278,3 +4278,120 @@ async fn streams_end_with_their_provider_terminal_or_an_error() {
         }
     }
 }
+
+/// Under a Claude Code sign-in tool names go out in Claude Code's casing
+/// and come back as the session named them (upstream's `toClaudeCodeName`
+/// and `fromClaudeCodeName`); an API key sends them as they are.
+#[test]
+fn claude_code_oauth_sends_tool_names_in_claude_code_casing() {
+    let tool = |name: &str| ToolDefinition {
+        name: name.to_string(),
+        description: String::new(),
+        parameters: json!({"type": "object"}),
+    };
+    let message = |role, tool_calls| ChatMessage {
+        role,
+        content: "hello".to_string(),
+        media: Vec::new(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls,
+    };
+    let request = ProviderRequest {
+        max_output_tokens: None,
+        system_prompt: None,
+        messages: vec![
+            message(ChatRole::User, Vec::new()),
+            message(
+                ChatRole::Assistant,
+                vec![
+                    ChatToolCall {
+                        id: "call_1".to_string(),
+                        name: "bash".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    ChatToolCall {
+                        id: "call_2".to_string(),
+                        name: "web_fetch".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                ],
+            ),
+        ],
+        tools: vec![tool("read"), tool("bash"), tool("web_fetch"), tool("find")],
+    };
+    let config = |auth| ProviderConfig {
+        model: ModelRef {
+            provider: "anthropic".to_string(),
+            id: "claude-opus-4-8".to_string(),
+        },
+        api: ProviderApi::Anthropic,
+        base_url: None,
+        auth,
+        thinking_level: None,
+        thinking_budget_tokens: None,
+        session_id: None,
+        traits: ModelTraits::default(),
+    };
+    let names = |body: &Value| {
+        let tools: Vec<String> = body["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("name").to_string())
+            .collect();
+        let calls: Vec<String> = body["messages"][1]["content"]
+            .as_array()
+            .expect("content")
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .map(|block| block["name"].as_str().expect("name").to_string())
+            .collect();
+        (tools, calls)
+    };
+
+    let oauth = anthropic_body(
+        &config(ProviderAuth::ClaudeCodeOAuth {
+            access_token: "token".to_string(),
+        }),
+        &request,
+    );
+    // Names that are not Claude Code's in another case stay as they are.
+    assert_eq!(
+        names(&oauth),
+        (
+            vec![
+                "Read".into(),
+                "Bash".into(),
+                "web_fetch".into(),
+                "find".into()
+            ],
+            vec!["Bash".into(), "web_fetch".into()]
+        )
+    );
+    let api_key = anthropic_body(&config(ProviderAuth::ApiKey("key".to_string())), &request);
+    assert_eq!(
+        names(&api_key),
+        (
+            vec![
+                "read".into(),
+                "bash".into(),
+                "web_fetch".into(),
+                "find".into()
+            ],
+            vec!["bash".into(), "web_fetch".into()]
+        )
+    );
+
+    let call = |name: &str| StreamEvent::ToolCall {
+        id: "call_1".to_string(),
+        name: name.to_string(),
+        arguments: "{}".to_string(),
+    };
+    assert_eq!(own_tool_name(call("Bash"), &request.tools), call("bash"));
+    assert_eq!(own_tool_name(call("Glob"), &request.tools), call("Glob"));
+    assert_eq!(
+        own_tool_name(StreamEvent::Text("Bash".into()), &request.tools),
+        StreamEvent::Text("Bash".into())
+    );
+}

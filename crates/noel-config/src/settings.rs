@@ -444,7 +444,9 @@ pub struct HooksSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HookCommand {
-    /// Tool names this hook applies to, `|`-separated; empty matches all.
+    /// Tool names this hook applies to, `|`-separated; empty or `*`
+    /// matches all. Names match in any case, and Claude Code's names
+    /// name the tool that does the same here.
     #[serde(default)]
     pub matcher: String,
     /// The shell command. Its stdin is one JSON object: `tool`,
@@ -454,7 +456,7 @@ pub struct HookCommand {
 
 impl HooksSettings {
     /// The hooks of `event` whose matcher names `tool` (an empty matcher
-    /// matches every tool).
+    /// or `*` matches every tool).
     pub fn matching(&self, event: &str, tool: &str) -> Vec<&HookCommand> {
         let hooks = match event {
             "pre" => &self.pre_tool_use,
@@ -464,15 +466,35 @@ impl HooksSettings {
         hooks
             .iter()
             .filter(|hook| {
-                hook.matcher.is_empty()
+                hook.matcher.trim().is_empty()
                     || hook
                         .matcher
                         .split('|')
                         .map(str::trim)
-                        .any(|name| name == tool)
+                        .any(|name| name == "*" || hook_name_matches(name, tool))
             })
             .collect()
     }
+}
+
+/// Claude Code tool names whose tool has another name here, so a matcher
+/// written for Claude Code applies to it.
+const CLAUDE_CODE_HOOK_NAMES: &[(&str, &str)] = &[
+    ("Glob", "find"),
+    ("WebFetch", "web_fetch"),
+    ("WebSearch", "web_search"),
+    ("Agent", "task"),
+    ("TodoWrite", "todo"),
+    ("MultiEdit", "edit"),
+];
+
+/// Whether a hook matcher's `name` names `tool`: the tool's name in any
+/// case (`Bash` is `bash`), or the Claude Code name of the same tool.
+fn hook_name_matches(name: &str, tool: &str) -> bool {
+    name.eq_ignore_ascii_case(tool)
+        || CLAUDE_CODE_HOOK_NAMES
+            .iter()
+            .any(|(theirs, ours)| *theirs == name && *ours == tool)
 }
 
 /// Compaction settings: of the settings file, or of one conversation

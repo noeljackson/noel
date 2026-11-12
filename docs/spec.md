@@ -471,7 +471,8 @@ no host program, as extensions need.
 
 - **Settings:** `hooks.preToolUse` and `hooks.postToolUse`, each a list of
   `{matcher, command}`. `matcher` is a `|`-separated list of tool names;
-  empty matches every tool. The user's settings and a trusted project's
+  empty or `*` matches every tool. Names match in any case, and Claude
+  Code's names name the tool that does the same here (`Glob` is `find`). The user's settings and a trusted project's
   merge per list (the project's list replaces the user's for a kind it
   configures), and `/reload` reloads them.
 - **The run:** a hook is a shell one-liner run in the session's cwd
