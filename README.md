@@ -152,6 +152,18 @@ Install system-wide:
 sudo make install PREFIX="/usr/local"
 ```
 
+### Nix
+
+The repository is a flake (Linux on x86-64 and arm64, macOS on Apple silicon):
+
+```bash
+nix run github:noeljackson/noel          # run noel
+nix profile install github:noeljackson/noel
+nix develop                              # a shell with the toolchain of rust-toolchain.toml, bun, make and tmux
+```
+
+`packages.default` is `noel` built with the Rust of `rust-toolchain.toml`, with what `make install` puts beside it: `noel-bun-host.ts` and, on Linux, the static `noel-env` daemon for remote workspaces of the same architecture (also `packages.noel-env`). `noel bun install` downloads a bun that NixOS cannot run, so the package puts nixpkgs' bun last on noel's `PATH`; `noel.override { withBun = false; }` leaves it out. `overlays.default` adds `noel` to a nixpkgs. The package does not run the tests (`make check` does), and the desktop and iOS apps are not packaged.
+
 ## Run
 
 Interactive mode:

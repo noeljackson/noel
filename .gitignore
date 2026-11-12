@@ -41,3 +41,7 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh
+
+# Nix build output
+result
+result-*
