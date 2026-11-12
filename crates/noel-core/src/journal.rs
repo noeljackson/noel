@@ -144,20 +144,16 @@ pub(crate) fn apply_session_record(state: &mut Option<SessionState>, record: Ses
             }
             // Whatever started a run, a load did not: it was interrupted
             // unless a `run_finished` record follows.
-            state.runs.extend(run.map(|run| {
-                Run::started(
-                    run,
-                    RunStatus::Interrupted,
-                    state.messages.len().saturating_sub(1),
-                )
-            }));
+            state
+                .runs
+                .extend(run.map(|run| Run::started(run, RunStatus::Interrupted)));
             // Submissions are placed only while a run is active: the last.
             let run_id = state.runs.last().map(|run| run.id.clone());
             state.place_queued(placed, run_id.as_deref());
         }
         SessionRecord::MessagesSnapshot { messages } => {
             state.partial = None;
-            state.messages = messages;
+            state.set_messages(messages);
         }
         SessionRecord::Tool { event } => state.tool_history.push(event),
         SessionRecord::ActiveModel { model } => state.active_model = model,
@@ -205,19 +201,14 @@ pub(crate) fn apply_session_record(state: &mut Option<SessionState>, record: Ses
         SessionRecord::Compaction { record } => state.compactions.push(record),
         SessionRecord::CompactionCheckpoint { record, messages } => {
             state.partial = None;
-            state.messages = messages;
+            state.set_messages(messages);
             state.compactions.push(record);
         }
         SessionRecord::BranchSummary { summary } => state.branch_summaries.push(summary),
         SessionRecord::Usage { usage } => state.usage = usage,
         SessionRecord::RetryWait { .. } => {}
         SessionRecord::RunStarted { run } => {
-            let start_message_index = state.messages.len().saturating_sub(1);
-            state.runs.push(Run::started(
-                run,
-                RunStatus::Interrupted,
-                start_message_index,
-            ));
+            state.runs.push(Run::started(run, RunStatus::Interrupted));
         }
         SessionRecord::FileSnapshot {
             id,
@@ -230,7 +221,20 @@ pub(crate) fn apply_session_record(state: &mut Option<SessionState>, record: Ses
             before_sha,
             created,
             message_index: state.messages.len(),
+            after_sha: None,
         }),
+        SessionRecord::FileEdited { id, after_sha } => {
+            // Ids are reused once a rewind has spent a snapshot: the
+            // newest with the id is the one the edit was for.
+            if let Some(snapshot) = state
+                .snapshots
+                .iter_mut()
+                .rev()
+                .find(|snapshot| snapshot.id == id)
+            {
+                snapshot.after_sha = Some(after_sha);
+            }
+        }
         SessionRecord::Rewound { messages, restore } => {
             state.rewind_to(messages, &restore);
         }

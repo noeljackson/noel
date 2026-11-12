@@ -276,11 +276,11 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "/rewind",
-        description: "pick an earlier prompt to rewind to; restores the files changed since",
+        description: "rewind to an earlier prompt, with or without the file changes since; restores its prompt",
     },
     CommandHelp {
         command: "/undo",
-        description: "undo last conversation turn; restore prompt (files unchanged)",
+        description: "undo the last turn and its file changes; restore its prompt",
     },
     CommandHelp {
         command: "/usage",

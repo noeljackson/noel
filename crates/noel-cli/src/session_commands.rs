@@ -114,6 +114,11 @@ pub(crate) enum CommandOutcome {
     Selector(Box<TuiSelectorState>),
     /// Attach to this session instead (a worker's answer to a switch).
     Session(String),
+    /// Put this back in the draft: the prompt a rewind stopped before.
+    Draft {
+        text: String,
+        media: Vec<MediaInput>,
+    },
 }
 
 /// Opens selector `kind`, filtered by `query`: an empty one is a note.
@@ -234,8 +239,13 @@ pub(crate) async fn run(
         }
         "/summaries" => ui.push(TuiEntryKind::System, format_summaries(runtime)),
         // The checkpoints, one per user prompt (spec §9.2); Esc-Esc at an
-        // empty draft asks for the same.
-        "/rewind" => return open_selector(ui, config, runtime, "rewind", ""),
+        // empty draft asks for the same. `/undo` is the nearest of them.
+        "/rewind" => return crate::rewind_commands::open(ui, runtime),
+        "/undo" => return crate::rewind_commands::undo(ui, runtime).await,
+        _ if line.starts_with("/select rewind ") => {
+            let value = line.trim_start_matches("/select rewind ").trim();
+            return crate::rewind_commands::pick(ui, runtime, value).await;
+        }
         "/mcp" => {
             // The configured MCP servers and their live state (§9.7).
             let servers = runtime.systems().mcp_servers.clone();

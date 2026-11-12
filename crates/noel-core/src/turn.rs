@@ -51,7 +51,11 @@ pub async fn run_saved_prompt_streaming_events(
                 command.request,
                 &tool_runtime_options(runtime, Vec::new()),
             ))
-            .await??;
+            .await;
+        if let Some(path) = &edited_path {
+            let _ = runtime.settle_snapshot(path, env.as_ref()).await;
+        }
+        let result = result??;
         if let Some(path) = edited_path {
             runtime.note_edited_files(vec![path])?;
         }

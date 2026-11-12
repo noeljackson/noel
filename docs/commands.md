@@ -52,8 +52,8 @@
 - `/copy`
 - `/share [file]`
 - `/compact [focus]` (model-generated checkpoint, retaining complete recent turns)
-- `/undo` (remove the latest conversation turn and restore its prompt; files unchanged)
-- `/rewind` (the checkpoint picker: restore conversation and code to any earlier prompt; also Esc-Esc at an empty draft)
+- `/undo` (undo the last turn and its file changes; its prompt goes back to the draft)
+- `/rewind` (the checkpoint picker: go back to any earlier prompt, with or without the file changes since; also Esc-Esc at an empty draft)
 - `/usage` (recorded session token totals and account quotas)
 - `/login [provider]`
 - `/logout <provider>`
@@ -154,27 +154,31 @@ uses AppKit via Swift (Xcode command-line tools), and Windows uses PowerShell.
 For remote/headless sessions, `NOEL_CLIPBOARD_IMAGE_COMMAND` can supply encoded
 PNG/JPEG/GIF/WebP bytes on stdout; otherwise use `/image <path>`.
 
-`/undo` changes only conversation context and restores the prompt, including
-images. It does **not** revert file edits, shell effects, tool audit history,
-queued messages, or token usage. `/usage` persists provider-reported token totals
-for completed requests across resume/reload/compaction/undo; old sessions and
+`/undo` and `/rewind` are one mechanism. Every user prompt is a checkpoint, and
+going back to one drops the messages after it and hands its prompt, images
+included, back to the draft. `/undo` goes back to the last prompt and restores
+the files that turn changed. `/rewind` (or Esc pressed twice within 400 ms at
+an empty draft, while no run is active) opens a picker with one row per past
+prompt, newest first under `(current)`, each naming the files the turns from
+it on changed. When there are any, picking a row asks what to restore:
+`conversation and files`, or `conversation only`, which leaves the files as
+they are; a later rewind to an earlier prompt can still take those changes
+back.
+
+Restoring files works from snapshots: every `edit`/`write` (the model's or a
+typed command) first saves the file's bytes into a `*.files` directory beside
+the session journal, and afterwards records what it left. A rewind writes each
+changed file back to what it held before the dropped turns and deletes the
+files they created, through the workspace the tools ran in. A file that no
+longer holds what the session's last edit left there (changed outside the
+session) is not touched and is named. Neither command reverts shell effects,
+tool audit history, queued messages, runs, or token usage, and a rewind does
+not reach past a compaction. The journal stays append-only: a restart loads
+the rewound state while nothing is erased from the file, and the history a
+client shows keeps the dropped entries above a `reset to N messages` line.
+
+`/usage` persists provider-reported token totals
+for completed requests across resume/reload/compaction/undo/rewind; old sessions and
 providers without usage report “no provider token usage reported yet” rather
 than estimated totals. Account quota checks use the same cache as `/accounts`
 and are skipped offline. Dollar costs are not calculated.
-
-`/rewind` (or Esc pressed twice within 400 ms at an empty draft, while no run
-is active) opens a
-checkpoint picker with one checkpoint per past user prompt, newest first:
-`(current)` at the top, then each prompt labeled with the files the turns
-after it changed. Picking one rewinds the conversation to that prompt — the
-messages, runs, saved partial output, and queue after it are dropped — and
-restores the code: every `edit`/`write` (the model's or a typed command)
-snapshots the file's bytes first into a `*.files` directory beside the
-session journal, and a rewind restores each changed file to what it held
-before the dropped range, deleting files that range created. A file whose
-bytes no longer match what the session last left there (changed outside the
-session) is not restored and is named in a notice. Like `/undo`, rewind never
-reverts shell effects, tool audit history, or token usage. The journal stays
-append-only: the rewind is a record, so a restart loads the rewound state
-while nothing is erased from the file, and the history a client shows keeps
-the dropped entries above a `reset to N messages` line, as after `/undo`.

@@ -512,14 +512,19 @@ pub(crate) async fn execute_model_tool_call_with(
                     if let Some(path) = &edited_path {
                         let _ = runtime.snapshot_before_edit(path, env.as_ref()).await;
                     }
-                    let output = match execute_tool_streaming_in(
+                    let executed = execute_tool_streaming_in(
                         env.as_ref(),
                         request,
                         &tool_runtime_options(runtime, bash_session_env(runtime)),
                         on_output,
                     )
-                    .await
-                    {
+                    .await;
+                    // What the edit left, for the rewind's check that the
+                    // file still holds it.
+                    if let Some(path) = &edited_path {
+                        let _ = runtime.settle_snapshot(path, env.as_ref()).await;
+                    }
+                    let output = match executed {
                         Ok(result) => {
                             is_error |= result.is_error;
                             if let Some(path) = edited_path {

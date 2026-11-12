@@ -1223,9 +1223,6 @@ async fn run_command(
     if let Some(answer) = bug_command(controller, &line, errors) {
         return answer;
     }
-    if let Some(answer) = undo_command(controller, &line) {
-        return answer;
-    }
     session_command(controller, args, line).await
 }
 
@@ -1415,28 +1412,6 @@ fn bug_command(
     None
 }
 
-/// `/undo`.
-fn undo_command(
-    controller: &mut SessionController<WorkerHost>,
-    line: &str,
-) -> Option<(Value, Option<Start>)> {
-    if line == "/undo" {
-        // The prompt goes back to the client's draft.
-        let undone = controller.configure(|runtime, _| runtime.undo_last_turn());
-        let answer = match undone {
-            Ok(Some(prompt)) => json!({
-                "entries": [{"kind": "system", "text": "undid the last turn"}],
-                "next": {"type": "draft", "text": prompt.content, "media": prompt.media},
-            }),
-            Ok(None) => json!({"entries": [{"kind": "system", "text": "nothing to undo"}]}),
-            Err(error) => json!({"entries": [{"kind": "error", "text": error.to_string()}]}),
-        };
-        refresh(controller);
-        return Some((answer, None));
-    }
-    None
-}
-
 /// A session switch, or a command `session_commands` runs, and what its
 /// outcome asks of the controller.
 async fn session_command(
@@ -1467,7 +1442,7 @@ async fn session_command(
         .await
     };
     // A rewind dropped entries the view holds: it is built again.
-    if line.starts_with("/select rewind ") {
+    if line == "/undo" || line.starts_with("/select rewind ") {
         refresh(controller);
     }
     match outcome {
@@ -1526,6 +1501,9 @@ async fn session_command(
                 selector["layers"] = crate::provider_model_layers(&host.config, runtime);
             }
             next = json!({"type": "selector", "selector": selector});
+        }
+        Ok(CommandOutcome::Draft { text, media }) => {
+            next = json!({"type": "draft", "text": text, "media": media});
         }
         Ok(CommandOutcome::Session(session)) => {
             next = json!({"type": "session", "session": session});
