@@ -205,8 +205,13 @@ enum ClientCommand {
         #[arg(long)]
         clone: bool,
     },
-    /// Import an exported session (a file on the server's machine).
-    Import { path: String },
+    /// Import an exported session (a file on the server's machine), or
+    /// with `claude` a Claude Code session of this directory: alone it
+    /// lists them, with a number or an id it imports that one.
+    Import {
+        path: String,
+        session: Option<String>,
+    },
     /// The models the server's sessions can use, and the scoped ones.
     Models {
         #[arg(long)]
@@ -532,8 +537,17 @@ async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
             println!("{}", made["sessionId"].as_str().unwrap_or_default());
             Ok(0)
         }
-        ClientCommand::Import { path } => {
-            let path = std::path::absolute(&path).unwrap_or_else(|_| path.into());
+        ClientCommand::Import { path, session } => {
+            let cwd = std::env::current_dir()?;
+            let words = format!("{path} {}", session.unwrap_or_default());
+            let path = match crate::import_source(&cwd, &words)? {
+                crate::ImportSource::File(path) => path,
+                crate::ImportSource::ClaudeCode(sessions) => {
+                    println!("{}", crate::format_claude_code_sessions(&cwd, &sessions));
+                    return Ok(0);
+                }
+            };
+            let path = std::path::absolute(&path).unwrap_or(path);
             let args = json!({"requestId": new_request_id(), "path": path});
             let made = client.sessions_call("import", args).await?;
             println!("{}", made["sessionId"].as_str().unwrap_or_default());

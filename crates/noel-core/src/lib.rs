@@ -1,3 +1,4 @@
+pub mod claude_code;
 mod codemode;
 pub mod history;
 pub use codemode::{NestedCallStatus, NestedToolCall};
@@ -2336,6 +2337,8 @@ impl SessionStore {
             let content = read_journal_bytes(path)?;
             if jsonl_is_ts_session_export(&content) {
                 read_ts_jsonl_export(path, &content)?
+            } else if claude_code::jsonl_is_claude_code_transcript(&content) {
+                claude_code::read_claude_code_transcript(path, &content)?
             } else {
                 SessionExport::from(&read_rust_journal(path, &content)?)
             }
