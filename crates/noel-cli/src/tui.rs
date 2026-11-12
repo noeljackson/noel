@@ -1884,7 +1884,9 @@ pub(crate) fn draw_queue_panel(
             "↑ to edit · ctrl+s queues after this response"
         }
     } else {
-        "↑ to edit · runs after next turn"
+        // Idle: Enter or ctrl+enter sends the pile now, as Durable's
+        // continue, which places what is queued first.
+        "↑ to edit · ctrl+enter or Enter sends now"
     };
     lines.push(Line::from(Span::styled(
         if overflow > 0 {

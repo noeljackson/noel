@@ -1304,13 +1304,21 @@ impl Remote {
         let line = app.input.trim().to_owned();
         if line.is_empty() && app.input_media.is_empty() {
             app.clear_input();
-            // The steer key with an empty draft still means something
-            // while a run is active: every queued follow-up is promoted
-            // into steering (as the in-process TUI drained its queue), so
-            // a pile the user queued lands at the next boundary, not
-            // after the run answers.
-            if steer && app.turn_running {
-                self.promote_queue(app);
+            if app.turn_running {
+                // The steer key with an empty draft still means something
+                // while a run is active: every queued follow-up is promoted
+                // into steering (as the in-process TUI drained its queue),
+                // so a pile the user queued lands at the next boundary,
+                // not after the run answers.
+                if steer {
+                    self.promote_queue(app);
+                }
+            } else if !app.queued_messages.is_empty() {
+                // Idle with a queue: Enter, ctrl+enter or the steer key
+                // sends it now, as Durable's continue, which places what
+                // is queued first. With no run there is nothing to steer,
+                // and an empty queue is never continued.
+                self.continue_turn();
             }
             return Action::None;
         }
@@ -1930,7 +1938,28 @@ impl Remote {
     fn continue_turn(&mut self) {
         let pending = self.pend();
         let args = to_args(&SubmitArgs::continuing(new_request_id()));
-        self.call(Call::Submit(String::new(), pending), args);
+        // It waits for what is still being sent: the queue it places has
+        // to be there first.
+        let previous = self.last_submit.take();
+        let (client, session, sender) = (
+            self.client.clone(),
+            self.session.clone(),
+            self.sender.clone(),
+        );
+        let generation = self.generation;
+        let calling = self.local.calling();
+        self.last_submit = Some(tokio::spawn(async move {
+            let _calling = calling;
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let result = client.chat_call(&session, "submit", args, false).await;
+            let _ = sender.send(Incoming::Answer(
+                Call::Submit(String::new(), pending),
+                result,
+                generation,
+            ));
+        }));
     }
 
     fn call(&mut self, call: Call, args: Value) {

@@ -1135,7 +1135,7 @@ modern_require() {
   fi
 }
 modern_capture
-for marker in "  Todo" "╭" "│ >" "╰" "↑ to edit · runs after next turn" "reason-first" "4 more lines, ctrl+o to expand" "Used Read" "fixture.rs" "… output-last" "7 more lines" "done-recent" "active-task" "+3 more (3 done)" "❯ recall queued fixture"; do modern_require "${marker}"; done
+for marker in "  Todo" "╭" "│ >" "╰" "↑ to edit · ctrl+enter or Enter sends now" "reason-first" "4 more lines, ctrl+o to expand" "Used Read" "fixture.rs" "… output-last" "7 more lines" "done-recent" "active-task" "+3 more (3 done)" "❯ recall queued fixture"; do modern_require "${marker}"; done
 if grep -Eq 'reason-last|output-first|output-seventh|done-oldest' "${work_dir}/modern-pane.txt"; then
   cat "${work_dir}/modern-pane.txt" >&2
   echo "collapsed previews/tasks leaked hidden rows" >&2
