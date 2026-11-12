@@ -212,9 +212,9 @@ require_live_color() {
 }
 
 send_line "/theme light"
-require_live_color "38;2;36;41;50" "theme-light"
+require_live_color "38;2;59;63;65" "theme-light"
 send_line "/theme dark"
-require_live_color "38;2;228;231;236" "theme-dark"
+require_live_color "38;2;222;224;225" "theme-dark"
 send_line "/theme kimi"
 require_live_color "38;2;37;99;235" "theme-kimi"
 send_line "/accent magenta"
