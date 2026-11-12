@@ -368,7 +368,7 @@ impl Runtime {
             store.record_compaction_checkpoint(record.clone(), messages.clone())?;
         }
         self.session.partial = None;
-        self.session.messages = messages;
+        self.session.set_messages(messages);
         self.session.compactions.push(record.clone());
         Ok(record)
     }
@@ -469,7 +469,7 @@ impl Runtime {
             store.record_compaction_checkpoint(record.clone(), messages.clone())?;
         }
         self.session.partial = None;
-        self.session.messages = messages;
+        self.session.set_messages(messages);
         self.session.compactions.push(record.clone());
         Ok(record)
     }

@@ -286,7 +286,7 @@ if ! grep -Fq '"content":"shift enter one\nshift enter two\nshift enter three\ns
 fi
 send_line "/image ${work_dir}/pixel.png describe image"
 # Ctrl+V stages an image in the draft (not sent before Enter), and /undo
-# restores both prompt and attachment without changing workspace files.
+# restores both prompt and attachment.
 clipboard_session="$(ls -t "${session_dir}"/*.jsonl | head -n 1)"
 before_paste="$(wc -l < "${clipboard_session}")"
 tmux send-keys -t "${session_name}" C-v
@@ -320,7 +320,12 @@ send_line "multiple clipboard images"
 send_line "/write ${cwd_dir}/file.txt e2e-ok"
 type_line "/undo"
 wait_for "│ > /write "
-grep -Fxq "e2e-ok" "${cwd_dir}/file.txt"
+# The undo is a rewind: the file the undone write created is gone, and
+# sending the restored draft writes it again.
+if [ -e "${cwd_dir}/file.txt" ]; then
+  echo "/undo left the file its turn created" >&2
+  exit 1
+fi
 send_enter
 send_line "/read ${cwd_dir}/file.txt"
 send_line "/todos"

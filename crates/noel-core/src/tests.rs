@@ -34,8 +34,8 @@ fn test_message(role: MessageRole, content: &str) -> ConversationMessage {
     }
 }
 
-#[test]
-fn undo_persists_context_and_keeps_files_audit_queue_usage_and_identity() {
+#[tokio::test]
+async fn undo_persists_context_and_keeps_other_files_audit_queue_usage_and_identity() {
     let base = std::env::temp_dir().join(format!("noel-undo-test-{}", new_session_id()));
     fs::create_dir_all(&base).unwrap();
     fs::write(base.join("user.txt"), "unrelated edits").unwrap();
@@ -63,7 +63,9 @@ fn undo_persists_context_and_keeps_files_audit_queue_usage_and_identity() {
     }
     runtime.record_usage(12, 5).unwrap();
     let before = runtime.session().clone();
-    assert_eq!(runtime.undo_last_turn().unwrap().unwrap().content, "second");
+    let undone = runtime.undo_last_turn().await.unwrap().unwrap();
+    assert_eq!(undone.prompt.content, "second");
+    assert!(undone.restored.is_empty() && undone.refused.is_empty());
     let mut expected = before;
     expected.messages.truncate(2);
     assert_eq!(runtime.session(), &expected);
@@ -74,8 +76,8 @@ fn undo_persists_context_and_keeps_files_audit_queue_usage_and_identity() {
     let loaded = store.load().unwrap();
     assert_eq!(loaded.messages, expected.messages);
     assert_eq!(loaded.usage, expected.usage);
-    assert!(runtime.undo_last_turn().unwrap().is_some());
-    assert!(runtime.undo_last_turn().unwrap().is_none());
+    assert!(runtime.undo_last_turn().await.unwrap().is_some());
+    assert!(runtime.undo_last_turn().await.unwrap().is_none());
     fs::remove_dir_all(base).unwrap();
 }
 
@@ -4328,8 +4330,8 @@ fn the_saved_queue_keeps_steering_ahead_of_follow_ups() {
     let _ = fs::remove_dir_all(base);
 }
 
-#[test]
-fn runs_are_saved_with_their_prompts_and_outlive_compaction_undo_and_restarts() {
+#[tokio::test]
+async fn runs_are_saved_with_their_prompts_and_outlive_compaction_undo_and_restarts() {
     let base = durable_test_dir("runs");
     let (store, state) = SessionStore::create(&base, base.clone()).unwrap();
     let path = store.path().to_path_buf();
@@ -4347,13 +4349,6 @@ fn runs_are_saved_with_their_prompts_and_outlive_compaction_undo_and_restarts() 
         failure: None,
         restarts: 0,
         closed: false,
-        // The load path derives this; the first prompt of this test's
-        // journal starts at index 0, the second at 1.
-        start_message_index: match id {
-            "run-1" => 0,
-            // After the undo, later prompts start at index 1.
-            _ => 1,
-        },
     };
     let runs = || SessionStore::read(&path).unwrap().runs;
 
@@ -4393,7 +4388,7 @@ fn runs_are_saved_with_their_prompts_and_outlive_compaction_undo_and_restarts() 
             ],
         )
         .unwrap();
-    runtime.undo_last_turn().unwrap();
+    runtime.undo_last_turn().await.unwrap();
     assert_eq!(
         runs(),
         [
