@@ -1286,6 +1286,13 @@ impl Remote {
                 _ => {}
             }
         }
+        // Enter submits, and so does ctrl+enter: while a run is active,
+        // that is what queues the draft the footer counts.
+        if bound("submit")
+            || (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            return self.enter(app, config, false).await;
+        }
         match key.code {
             KeyCode::Esc if app.turn_running => self.abort(),
             KeyCode::Esc => {
@@ -1312,7 +1319,6 @@ impl Remote {
             }
             KeyCode::Up => app.history_previous(),
             KeyCode::Down => app.history_next(),
-            KeyCode::Enter => return self.enter(app, config, false).await,
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.push_input_char(ch)
             }
@@ -1330,6 +1336,18 @@ impl Remote {
             return Action::None;
         }
         let line = app.input.trim().to_owned();
+        if line.is_empty() && app.input_media.is_empty() {
+            app.clear_input();
+            // The steer key with an empty draft still means something
+            // while a run is active: every queued follow-up is promoted
+            // into steering (as the in-process TUI drained its queue), so
+            // a pile the user queued lands at the next boundary, not
+            // after the run answers.
+            if steer && app.turn_running {
+                self.promote_queue(app);
+            }
+            return Action::None;
+        }
         let media = std::mem::take(&mut app.input_media);
         app.clear_input();
         app.input_media = media;
@@ -1339,9 +1357,6 @@ impl Remote {
         } else {
             line
         };
-        if line.is_empty() {
-            return Action::None;
-        }
         if let Some(lines) = app.multiline_mut() {
             if line == "." {
                 let prompt = lines.join("\n");
@@ -1358,6 +1373,80 @@ impl Remote {
         }
         self.prompt(app, line, steer);
         Action::None
+    }
+
+    /// Re-submits every queued follow-up as a steer, in order, so the run
+    /// takes them at its next boundary instead of after it answers: the
+    /// steer key's promotion of the queue (docs/commands.md). One that was
+    /// placed into the run meanwhile is left as it is, not duplicated.
+    fn promote_queue(&mut self, app: &mut TuiApp) {
+        let pending = inbox(&self.view)
+            .into_iter()
+            .filter(|(id, _, _)| !self.withdrawing.contains(id))
+            .filter(|(_, mode, _)| mode != "steer")
+            .map(|(id, _, text)| (id, text))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+        for (id, text) in &pending {
+            self.withdrawing.push(id.clone());
+            app.push(TuiEntryKind::System, format!("steering> {text}"));
+        }
+        let pending_id = self.pend();
+        let (client, session, sender) = (
+            self.client.clone(),
+            self.session.clone(),
+            self.sender.clone(),
+        );
+        let generation = self.generation;
+        let previous = self.last_submit.take();
+        let calling = self.local.calling();
+        self.last_submit = Some(tokio::spawn(async move {
+            let _calling = calling;
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            for (id, text) in pending {
+                // Withdraw it, then queue the same text as a steer. Only a
+                // withdrawal that took it re-sends it: one the run placed
+                // already has its text, and one that settled is gone.
+                let withdrawn = client
+                    .chat_call(
+                        &session,
+                        "withdraw",
+                        to_args(&WithdrawArgs { submission_id: id }),
+                        false,
+                    )
+                    .await;
+                let taken = withdrawn
+                    .as_ref()
+                    .is_ok_and(|value| value["outcome"] == "withdrawn");
+                if !taken {
+                    continue;
+                }
+                let _ = client
+                    .chat_call(
+                        &session,
+                        "submit",
+                        to_args(&SubmitArgs::input(
+                            new_request_id(),
+                            text,
+                            WhenBusy::Steer,
+                            Vec::new(),
+                        )),
+                        true,
+                    )
+                    .await;
+            }
+            // Ends the "Working..." the promotion showed, and nothing
+            // else: the queue's own rows say what became of each item.
+            let _ = sender.send(Incoming::Answer(
+                Call::Submit(String::new(), pending_id),
+                Ok(json!({})),
+                generation,
+            ));
+        }));
     }
 
     fn prompt(&mut self, app: &mut TuiApp, text: String, steer: bool) {
@@ -1462,6 +1551,9 @@ impl Remote {
             "/todos" if app.turn_running => app.todos_expanded = !app.todos_expanded,
             "/queue-clear" if app.turn_running => self.clear_pending(app),
             "/interrupt" if app.turn_running => self.abort(),
+            // The server's directory, not the session's worker: it answers
+            // while a run is active too, as `noel client ls` does.
+            "/sessions" => self.list_sessions(app).await,
             "!!" if app.last_shell_command.is_none() => {
                 app.push(TuiEntryKind::System, "no previous shell command")
             }
@@ -1513,6 +1605,35 @@ impl Remote {
         if let Some(selector) = crate::TuiSelectorState::from_json(&selector) {
             app.push(TuiEntryKind::System, format!("{} selector", selector.title));
             app.overlay = crate::Overlay::Selector(selector);
+        }
+    }
+
+    /// `/sessions`: the server's session directory, as `noel client ls`
+    /// prints it. Read here, not on the worker, so it answers while a run
+    /// is active.
+    async fn list_sessions(&mut self, app: &mut TuiApp) {
+        let client = self.client.clone();
+        match client.directory().await {
+            Ok(directory) => {
+                let list = directory["sessions"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                if list.is_empty() {
+                    app.push(TuiEntryKind::System, "no sessions");
+                } else {
+                    let text = list
+                        .iter()
+                        .map(crate::server::client::describe_session)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    app.push(TuiEntryKind::System, text);
+                }
+            }
+            Err(error) => app.push(
+                TuiEntryKind::Error,
+                format!("could not list sessions: {error:#}"),
+            ),
         }
     }
 
@@ -2813,5 +2934,27 @@ mod tests {
             let name = line.split_whitespace().next().unwrap();
             assert_eq!(is_prompt_command(line, name), prompt, "{line}");
         }
+    }
+
+    #[test]
+    fn the_queue_promotes_only_pending_follow_ups() {
+        // What the steer key's promotion takes: every follow-up not
+        // already being withdrawn, never the steers it would duplicate.
+        let view = json!({"docs": {"pi.inbox": {"items": [
+            {"id": "f1", "mode": "followUp", "content": "first"},
+            {"id": "s1", "mode": "steer", "content": "already steering"},
+            {"id": "f2", "mode": "followUp", "content": "second"},
+        ]}}});
+        let mut withdrawing = vec!["f2".to_owned()];
+        let promoted = inbox(&view)
+            .into_iter()
+            .filter(|(id, _, _)| !withdrawing.contains(id))
+            .filter(|(_, mode, _)| mode != "steer")
+            .map(|(id, _, text)| (id, text))
+            .collect::<Vec<_>>();
+        assert_eq!(promoted, [("f1".to_owned(), "first".to_owned())]);
+        withdrawing.clear();
+        let inbox = inbox(&view);
+        assert_eq!(inbox.len(), 3);
     }
 }
