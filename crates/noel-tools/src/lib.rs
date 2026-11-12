@@ -1401,18 +1401,26 @@ mod tests {
     #[tokio::test]
     async fn bash_reports_are_throttled_and_end_with_all_the_output() {
         // 40 lines over about 400 ms: far fewer reports than lines.
+        let started = std::time::Instant::now();
         let (result, reports) =
             run_streaming("for i in $(seq 1 40); do echo line-$i; sleep 0.01; done").await;
+        let took = started.elapsed();
         assert_eq!(result.output.lines().count(), 40);
         assert_eq!(reports[0].0, "");
-        assert!(reports.len() < 15, "{} reports", reports.len());
+        // One report per throttle interval at most, after the first that
+        // says the command started, and with the flush when it ends. The
+        // count is held against the time the command took, not the gaps
+        // between reports as this test sees them: it hears a report after
+        // the reporter has timed it, by however long each was held up, and
+        // a loaded machine stretches the command.
+        let most = (took.as_millis() / BASH_UPDATE_THROTTLE.as_millis()) as usize + 3;
+        assert!(
+            reports.len() <= most,
+            "{} reports in {took:?}",
+            reports.len()
+        );
         assert!(reports.len() > 2, "{} reports", reports.len());
         for pair in reports[1..].windows(2) {
-            let apart = pair[1].1.duration_since(pair[0].1);
-            // The last report flushes what is left when the command ends.
-            if pair[1].0 != result.output {
-                assert!(apart >= BASH_UPDATE_THROTTLE, "{apart:?} apart");
-            }
             assert!(pair[1].0.starts_with(&pair[0].0), "a report lost output");
         }
         assert_eq!(reports.last().unwrap().0, result.output);

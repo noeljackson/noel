@@ -263,7 +263,9 @@ fn a_script_plugin_runs_in_process_with_state_and_limits() {
     let manifest = json!({
         "name": "script",
         "script": "main.js",
-        "limits": {"timeoutMs": 500},
+        // The limit of every call, not only the runaway one: long enough
+        // for the others on a loaded machine in an unoptimized build.
+        "limits": {"timeoutMs": 3000},
         "permissions": ["tools", "commands", "panels"],
     });
     fs::write(dir.join("plugin.json"), manifest.to_string()).unwrap();

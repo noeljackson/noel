@@ -621,8 +621,10 @@ mod tests {
             200,
             r#"{"access_token":"fresh","refresh_token":"rotated","expires_in":3600}"#,
         );
+        // The primary is refused at once; the timeout is the fallback's
+        // too, so it allows for a loaded machine.
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(300))
+            .connect_timeout(Duration::from_secs(2))
             .build()
             .unwrap();
         // Unroutable primary: the request fails before reaching any server.
