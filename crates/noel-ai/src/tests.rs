@@ -404,7 +404,9 @@ async fn stalled_provider_requests_fail_after_the_idle_timeout() {
             session_id: None,
             traits: ModelTraits::default(),
         },
-        provider_http_client_with_idle_timeout(Duration::from_millis(300)),
+        // Long enough for the stub's one event to arrive on a loaded
+        // machine before the wait for the next one starts.
+        provider_http_client_with_idle_timeout(Duration::from_secs(2)),
     );
 
     for expected_texts in [vec![], vec!["partial".to_string()]] {

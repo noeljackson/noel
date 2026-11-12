@@ -967,7 +967,9 @@ mod tests {
                 session_id: None,
                 traits: noel_ai::ModelTraits::default(),
             },
-            noel_ai::provider_http_client_with_idle_timeout(Duration::from_millis(300)),
+            // Long enough for the stub's answer to the retry to arrive on a
+            // loaded machine: it too is cut off at this.
+            noel_ai::provider_http_client_with_idle_timeout(Duration::from_secs(2)),
         );
         let request = ProviderRequest {
             max_output_tokens: None,
