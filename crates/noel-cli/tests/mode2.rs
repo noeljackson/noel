@@ -809,6 +809,69 @@ fn slash_commands_run_on_the_worker_as_the_tui_types_them() {
     assert!(unknown.status.success());
 }
 
+/// `/undo` and `/rewind` (spec §9.2) on the worker: the checkpoints with
+/// the files changed since, the choice of what to restore, and the files
+/// put back or left.
+#[test]
+fn an_undo_and_a_rewind_restore_the_files_the_dropped_turns_changed() {
+    let script = json!([
+        [{"text": "first reply"}],
+        [{"tool_call": {"name": "write", "arguments": {"path": "made.txt", "content": "new\n"}}}],
+        [{"text": "wrote it"}],
+    ]);
+    let mode2 = Mode2::new("rewind", script, json!({}));
+    let session = mode2.new_session("rewind");
+    let file = |name: &str| mode2.root.join("cwd").join(name);
+    fs::write(file("kept.txt"), "original").unwrap();
+    let runs = || mode2.journal(&session).matches("\"run_finished\"").count();
+    let command = |line: &str| mode2.client(&["command", &session, line]);
+
+    mode2.client(&["send", &session, "one"]);
+    wait_until("the first run", || runs() == 1);
+    mode2.client(&["send", &session, "two"]);
+    wait_until("the second run", || runs() == 2);
+    command("/write kept.txt typed");
+    wait_until("the typed write", || runs() == 3);
+    assert!(file("made.txt").exists());
+
+    // The checkpoints name the files the turns from each on changed.
+    let checkpoints = command("/rewind");
+    assert!(
+        checkpoints.contains("two · 2 files: made.txt, kept.txt"),
+        "{checkpoints}"
+    );
+    // A checkpoint with file changes after it asks what to restore.
+    let choice = command("/select rewind m2");
+    assert!(
+        choice.contains("m2:all") && choice.contains("m2:chat"),
+        "{choice}"
+    );
+    assert_eq!(
+        command("/select rewind m2:chat"),
+        "rewound; the files stay as they are\n"
+    );
+    assert!(file("made.txt").exists());
+    assert_eq!(fs::read_to_string(file("kept.txt")).unwrap(), "typed");
+
+    // An undo is the rewind to the last prompt, files included.
+    command("/write kept.txt again");
+    wait_until("the second typed write", || runs() == 4);
+    assert_eq!(fs::read_to_string(file("kept.txt")).unwrap(), "again");
+    assert_eq!(command("/undo"), "undid the last turn; 1 file restored\n");
+    assert_eq!(fs::read_to_string(file("kept.txt")).unwrap(), "typed");
+
+    // The changes the conversation-only rewind kept still belong to the
+    // first prompt, and go back with it.
+    assert_eq!(
+        command("/select rewind m0:all"),
+        "rewound; 2 files restored\n"
+    );
+    assert!(!file("made.txt").exists());
+    assert_eq!(fs::read_to_string(file("kept.txt")).unwrap(), "original");
+    assert_eq!(command("/rewind"), "nothing to rewind to\n");
+    assert_eq!(command("/undo"), "nothing to undo\n");
+}
+
 /// A goal (spec §9.3) starts the work when it is set, and after each turn
 /// that settles the evaluator, the session's own model without tools,
 /// says whether it is met: not met sends the work on, met clears the goal.
