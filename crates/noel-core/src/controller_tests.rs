@@ -1083,6 +1083,31 @@ async fn a_continue_answers_the_context_as_it_is_or_ends_nothing_to_answer() {
             "settled Completed",
         ]
     );
+    // A queued steer is placed into the continue's run as well: a queue of
+    // only steers still has something to answer (spec §3: a run a prompt
+    // starts takes the queued steering in its first round).
+    queued(
+        fixture
+            .controller
+            .enqueue(QueueMode::Steer, steer("mid-course", "s-1")),
+    );
+    fixture.take_events();
+    fixture.script([says("adjusted")]);
+    let Ok(Submitted::Started(start)) = fixture.controller.continue_run(None).await else {
+        panic!("a continue starts a run while idle");
+    };
+    let (_sender, mut inbox) = mpsc::unbounded_channel::<Action>();
+    assert!(fixture.controller.run(start, &mut inbox, |a, b| a(b)).await);
+    assert_eq!(
+        fixture.take_events(),
+        [
+            "run started",
+            "placed s-1",
+            "user mid-course",
+            "assistant adjusted",
+            "settled Completed",
+        ]
+    );
 }
 
 #[tokio::test]
