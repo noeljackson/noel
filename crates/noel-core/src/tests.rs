@@ -4992,3 +4992,226 @@ fn a_journal_replays_every_change_its_session_made() {
     assert_eq!(reopened, expected);
     let _ = fs::remove_dir_all(base);
 }
+
+#[test]
+fn a_claude_code_transcript_imports_as_its_active_conversation() {
+    let base = std::env::temp_dir().join(format!("noel-claude-code-import-{}", new_session_id()));
+    let project = base.join("projects/-repo-x");
+    fs::create_dir_all(&project).expect("create project dir");
+    let record = |kind: &str, uuid: &str, parent: Value, rest: Value| {
+        let mut record = json!({
+            "type": kind, "uuid": uuid, "parentUuid": parent, "isSidechain": false,
+            "sessionId": "cc-session", "cwd": "/repo.x",
+        });
+        record
+            .as_object_mut()
+            .unwrap()
+            .extend(rest.as_object().unwrap().clone());
+        record
+    };
+    let said = |id: &str, block: Value| json!({"message": {"id": id, "role": "assistant", "model": "claude", "content": [block]}});
+    let prompt = |text: &str| json!({"message": {"role": "user", "content": text}});
+    let result = |block: Value| json!({"message": {"role": "user", "content": [block]}});
+    let lines = [
+        json!({"type": "custom-title", "customTitle": "My title", "sessionId": "cc-session"}),
+        record("user", "u0", Value::Null, prompt("old prompt")),
+        record(
+            "assistant",
+            "a0",
+            json!("u0"),
+            said("msg_0", json!({"type": "text", "text": "old answer"})),
+        ),
+        // A compaction: what follows starts again from its summary.
+        record(
+            "system",
+            "b1",
+            Value::Null,
+            json!({"subtype": "compact_boundary", "logicalParentUuid": "a0"}),
+        ),
+        record(
+            "user",
+            "s1",
+            json!("b1"),
+            json!({
+                "isCompactSummary": true, "isVisibleInTranscriptOnly": true,
+                "message": {"role": "user", "content": "Summary: earlier work."},
+            }),
+        ),
+        record("attachment", "att1", json!("s1"), json!({"attachment": {}})),
+        record("user", "u1", json!("att1"), prompt("list files")),
+        record(
+            "user",
+            "m1",
+            json!("u1"),
+            json!({"isMeta": true, "message": {"role": "user", "content": "injected"}}),
+        ),
+        // One reply, a record per block; its two calls fork the tree.
+        record(
+            "assistant",
+            "a1",
+            json!("m1"),
+            said(
+                "msg_1",
+                json!({"type": "thinking", "thinking": "hm", "signature": "sig"}),
+            ),
+        ),
+        record(
+            "assistant",
+            "a2",
+            json!("a1"),
+            said("msg_1", json!({"type": "text", "text": "Looking."})),
+        ),
+        record(
+            "assistant",
+            "a3",
+            json!("a2"),
+            said(
+                "msg_1",
+                json!({"type": "tool_use", "id": "tA", "name": "Read", "input": {"file_path": "a.rs"}}),
+            ),
+        ),
+        record(
+            "assistant",
+            "a4",
+            json!("a3"),
+            said(
+                "msg_1",
+                json!({"type": "tool_use", "id": "tB", "name": "Bash", "input": {"command": "ls"}}),
+            ),
+        ),
+        record(
+            "user",
+            "rB",
+            json!("a4"),
+            result(json!({"type": "tool_result", "tool_use_id": "tB", "content": "a.rs\n"})),
+        ),
+        record(
+            "user",
+            "rA",
+            json!("a3"),
+            result(json!({
+                "type": "tool_result", "tool_use_id": "tA", "is_error": true,
+                "content": [{"type": "text", "text": "fn a"}],
+            })),
+        ),
+        // A branch that was rewound, a subagent's record, and a record
+        // that is no part of the conversation.
+        record(
+            "assistant",
+            "x1",
+            json!("rB"),
+            said("msg_x", json!({"type": "text", "text": "abandoned"})),
+        ),
+        record(
+            "assistant",
+            "a5",
+            json!("rA"),
+            said("msg_2", json!({"type": "text", "text": "Done."})),
+        ),
+        json!({"type": "assistant", "uuid": "sc", "parentUuid": "a5", "isSidechain": true, "sessionId": "cc-session",
+            "message": {"id": "msg_s", "role": "assistant", "content": [{"type": "text", "text": "subagent"}]}}),
+        json!({"type": "api-request-blob", "sessionId": "cc-session", "message": {"role": "user", "content": "blob"}}),
+    ];
+    let path = project.join("abc123.jsonl");
+    let mut content = lines
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    content.push_str("\n{\"type\":\"assistant\",\"uuid\":\"torn");
+    fs::write(&path, content).expect("write transcript");
+
+    let (_store, imported) =
+        SessionStore::import_path(&base.join("sessions"), &path).expect("import transcript");
+    assert_ne!(imported.session_id, "cc-session");
+    assert_eq!(imported.cwd, PathBuf::from("/repo.x"));
+    assert_eq!(imported.name.as_deref(), Some("My title"));
+    assert!(imported.labels.contains("claude-code"));
+    let shown = imported
+        .messages
+        .iter()
+        .map(|message| {
+            let calls = message
+                .tool_calls
+                .iter()
+                .map(|call| format!(" {}:{}{}", call.id, call.name, call.arguments))
+                .collect::<String>();
+            let of = message.tool_call_id.as_deref().unwrap_or_default();
+            format!("{:?} {of}[{}]{calls}", message.role, message.content)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shown,
+        [
+            "User [Summary: earlier work.]",
+            "User [list files]",
+            "Assistant [Looking.] tA:Read{\"file_path\":\"a.rs\"} tB:Bash{\"command\":\"ls\"}",
+            "Tool tA[fn a]",
+            "Tool tB[a.rs\n]",
+            "Assistant [Done.]",
+        ]
+    );
+    assert_eq!(imported.messages[2].thinking, "hm");
+    assert_eq!(imported.messages[3].tool_name.as_deref(), Some("Read"));
+    assert_eq!(
+        imported
+            .tool_history
+            .iter()
+            .map(|event| (event.id.as_str(), event.is_error))
+            .collect::<Vec<_>>(),
+        [("tA", true), ("tB", false)]
+    );
+    // It is a session like any other from here on.
+    let reopened =
+        SessionStore::read(&base.join(format!("sessions/{}.jsonl", imported.session_id)))
+            .expect("read the imported session");
+    assert_eq!(reopened.messages, imported.messages);
+
+    // A transcript that stops mid-turn imports as a settled conversation.
+    let stopped = project.join("def456.jsonl");
+    let lines = [
+        record("user", "u1", Value::Null, prompt("run it")),
+        record(
+            "assistant",
+            "a1",
+            json!("u1"),
+            said(
+                "msg_1",
+                json!({"type": "tool_use", "id": "tC", "name": "Bash", "input": {}}),
+            ),
+        ),
+    ];
+    fs::write(&stopped, lines.map(|line| line.to_string()).join("\n")).expect("write transcript");
+    let (_store, unfinished) =
+        SessionStore::import_path(&base.join("sessions"), &stopped).expect("import transcript");
+    assert!(!unfinished.has_unfinished_turn());
+    assert_eq!(
+        unfinished.messages[2..]
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        ["(no result recorded)", claude_code::UNFINISHED_NOTE]
+    );
+    fs::remove_file(&stopped).expect("remove transcript");
+
+    // The transcripts of a directory, by its Claude Code folder name.
+    let sessions = claude_code::claude_code_sessions(&base.join("projects"), Path::new("/repo.x"));
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        (sessions[0].id.as_str(), sessions[0].title.as_str()),
+        ("abc123", "My title")
+    );
+    let find = |reference: &str| {
+        claude_code::find_claude_code_session(&sessions, reference)
+            .map(|session| session.path.clone())
+    };
+    assert_eq!(find("1"), Ok(path.clone()));
+    assert_eq!(find("abc"), Ok(path.clone()));
+    assert!(find("2").is_err());
+    assert!(
+        claude_code::claude_code_sessions(&base.join("projects"), Path::new("/elsewhere"))
+            .is_empty()
+    );
+
+    let _ = fs::remove_dir_all(base);
+}

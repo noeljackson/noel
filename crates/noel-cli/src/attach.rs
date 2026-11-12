@@ -1394,6 +1394,9 @@ impl Remote {
             "/changelog" => app.push(TuiEntryKind::System, crate::format_changelog()),
             "/themes" => app.push(TuiEntryKind::System, crate::format_themes(config)),
             "/theme" => self.theme_selector(app, config),
+            "/import" if !app.turn_running && line.split_whitespace().nth(1) == Some("claude") => {
+                self.import_claude_code(app, line.trim_start_matches("/import"));
+            }
             "/copy" if app.transcript_view.borrow().has_selection() => {
                 app.transcript_view.get_mut().request_copy();
             }
@@ -1476,6 +1479,37 @@ impl Remote {
         if let Some(selector) = crate::TuiSelectorState::from_json(&selector) {
             app.push(TuiEntryKind::System, format!("{} selector", selector.title));
             app.overlay = crate::Overlay::Selector(selector);
+        }
+    }
+
+    /// `/import claude [session]`: a Claude Code transcript of the session's
+    /// directory, named by its number or id, or picked from a selector.
+    fn import_claude_code(&mut self, app: &mut TuiApp, words: &str) {
+        let cwd = self.view["conversation"]["cwd"]
+            .as_str()
+            .unwrap_or("/")
+            .to_owned();
+        match crate::import_source(std::path::Path::new(&cwd), words) {
+            Ok(crate::ImportSource::File(path)) => {
+                self.sessions_command(format!("/import {}", path.display()));
+            }
+            Ok(crate::ImportSource::ClaudeCode(sessions)) => {
+                let items = sessions.iter().map(|session| {
+                    json!({
+                        "label": crate::claude_code_session_label(session),
+                        "value": session.path,
+                    })
+                });
+                let selector = json!({
+                    "kind": "claude-import",
+                    "title": "import a Claude Code session",
+                    "items": items.collect::<Vec<_>>(),
+                });
+                if let Some(selector) = crate::TuiSelectorState::from_json(&selector) {
+                    app.overlay = crate::Overlay::Selector(selector);
+                }
+            }
+            Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
         }
     }
 
@@ -1688,6 +1722,8 @@ impl Remote {
                             format!("no models for {}", item.value),
                         ),
                     }
+                } else if selector.kind == "claude-import" {
+                    self.sessions_command(format!("/import {}", item.value));
                 } else if matches!(selector.kind.as_str(), "theme" | "themes") {
                     match crate::persist_theme(config, &item.value) {
                         Ok(name) => app.push(TuiEntryKind::System, format!("theme: {name}")),

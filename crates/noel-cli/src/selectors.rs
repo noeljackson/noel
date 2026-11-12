@@ -42,6 +42,65 @@ pub(crate) fn format_session_picker_label(session: &noel_core::SessionSummary) -
 }
 
 /// Compact relative age like Claude's picker: "2m", "3h", "5d".
+/// What `/import <words>` names.
+pub(crate) enum ImportSource {
+    /// A session export or a journal, as typed.
+    File(PathBuf),
+    /// `claude` alone: the Claude Code sessions of the directory, newest
+    /// first, to choose from.
+    ClaudeCode(Vec<noel_core::claude_code::ClaudeCodeSession>),
+}
+
+/// Reads `/import`'s words: a file, or `claude [session]`, a Claude Code
+/// transcript of `cwd` named by its number in the list or by its id. A file
+/// called `claude` is `./claude`.
+pub(crate) fn import_source(cwd: &Path, words: &str) -> Result<ImportSource> {
+    let (first, reference) = split_once_text(words.trim());
+    if first != "claude" {
+        return Ok(ImportSource::File(PathBuf::from(words.trim())));
+    }
+    let sessions = noel_core::claude_code::claude_code_projects_dir()
+        .map(|projects| noel_core::claude_code::claude_code_sessions(&projects, cwd))
+        .unwrap_or_default();
+    if sessions.is_empty() {
+        return Err(anyhow!("no Claude Code sessions for {}", cwd.display()));
+    }
+    if reference.is_empty() {
+        return Ok(ImportSource::ClaudeCode(sessions));
+    }
+    noel_core::claude_code::find_claude_code_session(&sessions, reference)
+        .map(|session| ImportSource::File(session.path.clone()))
+        .map_err(|error| anyhow!(error))
+}
+
+/// A Claude Code session as a picker row: its title, its age, its id.
+pub(crate) fn claude_code_session_label(
+    session: &noel_core::claude_code::ClaudeCodeSession,
+) -> String {
+    let age = session
+        .modified
+        .map(relative_time_label)
+        .unwrap_or_else(|| "-".to_string());
+    let id = session.id.chars().take(8).collect::<String>();
+    format!("{} · {age} · {id}", session.title)
+}
+
+/// The Claude Code sessions of `cwd` as `/import claude` lists them where
+/// there is no picker.
+pub(crate) fn format_claude_code_sessions(
+    cwd: &Path,
+    sessions: &[noel_core::claude_code::ClaudeCodeSession],
+) -> String {
+    let mut lines = vec![format!(
+        "Claude Code sessions for {} (import one by its number or id: import claude <session>):",
+        cwd.display()
+    )];
+    lines.extend(sessions.iter().enumerate().map(|(place, session)| {
+        format!("{:>3}. {}", place + 1, claude_code_session_label(session))
+    }));
+    lines.join("\n")
+}
+
 pub(crate) fn relative_time_label(modified: std::time::SystemTime) -> String {
     let Ok(elapsed) = modified.elapsed() else {
         return "now".to_string();

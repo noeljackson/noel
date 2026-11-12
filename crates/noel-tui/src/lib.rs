@@ -267,6 +267,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "import a session export",
     },
     CommandHelp {
+        command: "/import claude [session]",
+        description: "import a Claude Code session of this directory",
+    },
+    CommandHelp {
         command: "/copy",
         description: "copy selected text or last assistant message",
     },

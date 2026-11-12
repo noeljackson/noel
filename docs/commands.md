@@ -48,7 +48,8 @@
 - `/name [name]` (bare `/name` shows the current name)
 - `/labels <labels...>`
 - `/export [file]` (default `noel-session-<session id>.html` in the session cwd)
-- `/import <file>`
+- `/import <file>` (a noel export or journal, a pi JSONL export, or a Claude Code transcript)
+- `/import claude [session]` (a Claude Code session of this directory: alone it lists them to pick from, newest first; `session` is a number in that list, an id or an id prefix)
 - `/copy`
 - `/share [file]`
 - `/compact [focus]` (model-generated checkpoint, retaining complete recent turns)

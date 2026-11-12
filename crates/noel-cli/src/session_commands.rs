@@ -850,10 +850,22 @@ pub(crate) async fn run(
             export_session(runtime, &path)?;
             ui.push(TuiEntryKind::System, format!("exported {}", path.display()));
         }
-        "/import" => ui.push(TuiEntryKind::System, "usage: /import <path.jsonl>"),
+        "/import" => ui.push(
+            TuiEntryKind::System,
+            "usage: /import <path.jsonl> | /import claude [session]",
+        ),
         _ if line.starts_with("/import ") => {
-            let path = PathBuf::from(line.trim_start_matches("/import ").trim());
-            return ui.switch_session(runtime, config, SessionSwitch::Import(path));
+            let cwd = runtime.session().cwd.clone();
+            match import_source(&cwd, line.trim_start_matches("/import ")) {
+                Ok(ImportSource::File(path)) => {
+                    return ui.switch_session(runtime, config, SessionSwitch::Import(path));
+                }
+                Ok(ImportSource::ClaudeCode(sessions)) => ui.push(
+                    TuiEntryKind::System,
+                    format_claude_code_sessions(&cwd, &sessions),
+                ),
+                Err(error) => ui.push(TuiEntryKind::Error, format!("{error}")),
+            }
         }
         _ if line.starts_with("/account ") => {
             let account = line.trim_start_matches("/account ").trim();
