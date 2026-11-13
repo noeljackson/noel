@@ -1,3 +1,4 @@
+mod oklab;
 mod theme;
 pub use theme::{parse_theme_color, TerminalTheme, ThemePalette, BUILTIN_THEMES};
 
