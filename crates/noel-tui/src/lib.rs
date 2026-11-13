@@ -1,5 +1,10 @@
 mod oklab;
+mod terminal_colors;
 mod theme;
+pub use terminal_colors::{
+    detect_colorfgbg_appearance, parse_color_scheme_report, parse_terminal_reply,
+    terminal_appearance, OscColorTarget, TerminalAppearance, TerminalColors, TerminalReply,
+};
 pub use theme::{parse_theme_color, TerminalTheme, ThemePalette, BUILTIN_THEMES};
 
 use serde::{Deserialize, Serialize};

@@ -305,7 +305,7 @@ pub fn rgb_to_okhsl(color: Rgb) -> Okhsl {
 }
 
 /// OKLCH chroma of an sRGB color.
-pub fn rgb_chroma(color: Rgb) -> f64 {
+pub(crate) fn rgb_chroma(color: Rgb) -> f64 {
     let [_, a, b] = rgb_to_oklab(color);
     (a * a + b * b).sqrt()
 }
