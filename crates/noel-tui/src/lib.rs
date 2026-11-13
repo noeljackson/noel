@@ -1,6 +1,8 @@
 mod oklab;
+mod system_theme;
 mod terminal_colors;
 mod theme;
+pub use system_theme::system_theme_palette;
 pub use terminal_colors::{
     detect_colorfgbg_appearance, parse_color_scheme_report, parse_terminal_reply,
     terminal_appearance, OscColorTarget, TerminalAppearance, TerminalColors, TerminalReply,

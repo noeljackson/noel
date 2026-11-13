@@ -66,11 +66,8 @@ fn hex_channel(channel: &str) -> Option<u8> {
 fn parse_osc_color_value(raw: &str) -> Option<Rgb> {
     let value = raw.trim();
     if let Some(hex) = value.strip_prefix('#') {
-        if hex.len() == 6
-            && hex.chars().all(|c| c.is_ascii_hexdigit())
-        {
-            let channel =
-                |range: std::ops::Range<usize>| u8::from_str_radix(&hex[range], 16).ok();
+        if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            let channel = |range: std::ops::Range<usize>| u8::from_str_radix(&hex[range], 16).ok();
             return Some(Rgb::new(channel(0..2)?, channel(2..4)?, channel(4..6)?));
         }
         if hex.len() == 12 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -167,7 +164,7 @@ pub fn parse_color_scheme_report(data: &str) -> Option<TerminalAppearance> {
 /// 0-6 and 8 (bright black, e.g. Solarized Dark's background) are dark,
 /// 7 and 9-15 are light.
 pub fn detect_colorfgbg_appearance(value: &str) -> Option<TerminalAppearance> {
-    let bg = value.split(';').last()?.trim();
+    let bg = value.split(';').next_back()?.trim();
     if bg.is_empty() || !bg.chars().all(|c| c.is_ascii_digit()) || bg.len() > 2 {
         return None;
     }
@@ -251,10 +248,19 @@ mod tests {
             ),
             ("\x1b]11;bogus\x07", OscColorTarget::Background, None),
         ] {
-            assert_eq!(parse_terminal_reply(data), TerminalReply::Color(target, color));
+            assert_eq!(
+                parse_terminal_reply(data),
+                TerminalReply::Color(target, color)
+            );
         }
-        assert_eq!(parse_terminal_reply("\x1b[?1;2c"), TerminalReply::DeviceAttributes);
-        assert_eq!(parse_terminal_reply("\x1b[?62;22c"), TerminalReply::DeviceAttributes);
+        assert_eq!(
+            parse_terminal_reply("\x1b[?1;2c"),
+            TerminalReply::DeviceAttributes
+        );
+        assert_eq!(
+            parse_terminal_reply("\x1b[?62;22c"),
+            TerminalReply::DeviceAttributes
+        );
         assert_eq!(parse_terminal_reply("\x1b[A"), TerminalReply::Other);
         assert_eq!(parse_terminal_reply("\x1b]12;x\x07"), TerminalReply::Other);
     }
@@ -308,10 +314,7 @@ mod tests {
             TerminalAppearance::Light
         );
         // Without a foreground: whichever of white/black text contrasts more.
-        assert_eq!(
-            terminal_appearance(dark_bg, None),
-            TerminalAppearance::Dark
-        );
+        assert_eq!(terminal_appearance(dark_bg, None), TerminalAppearance::Dark);
         assert_eq!(
             terminal_appearance(light_bg, None),
             TerminalAppearance::Light
