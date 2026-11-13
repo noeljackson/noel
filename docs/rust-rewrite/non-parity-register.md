@@ -967,19 +967,22 @@ port's bugs belong in its own tracker. A local file that the user reviews and
 attaches keeps upstream's consent model without network calls or a zip
 dependency.
 
-### `--use-theme` Takes One Theme Name
+### `--use-theme` Pairs Pick From `COLORFGBG` Only
 
 `--use-theme <name>` selects the initial theme for one run without saving it,
-as Rust's `--theme` does. Upstream also accepts a `light/dark` pair and picks
-a half from the terminal's reported background. Rust has no terminal
-appearance detection, so it rejects pairs with an error, and a `light/dark`
-`theme` setting still falls back to the system theme with a diagnostic.
-`--use-theme` also conflicts with `--theme` and `--no-themes`: upstream
-combines them because its `--theme` loads theme files and `--no-themes` only
-skips discovery, while Rust's `--theme` selects the run's theme and
-`--no-themes` clears it, so one flag would silently override the other.
+as Rust's `--theme` does. Both accept upstream's `light/dark` pair and pick a
+half from the terminal's appearance. Print and JSON modes cannot query the
+terminal, so the half comes from `COLORFGBG` when a terminal set a usable
+background index, dark otherwise; the TUI's OSC 10/11 query reports the real
+colors once it opens. `--use-theme` still conflicts with `--theme` and
+`--no-themes`: upstream combines them because its `--theme` loads theme files
+and `--no-themes` only skips discovery, while Rust's `--theme` selects the
+run's theme and `--no-themes` clears it, so one flag would silently override
+the other.
 
-Reason: choosing a half without asking the terminal would silently guess.
+Reason: a reply cannot arrive before a terminal is open, so non-TTY modes
+classify from the environment, the way upstream classifies before its query
+replies.
 
 ### `noel auth` Named Accounts
 

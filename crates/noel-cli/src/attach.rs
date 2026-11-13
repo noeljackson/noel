@@ -703,6 +703,9 @@ struct Remote {
     generation: u64,
     /// The diff panel's files' diffs, by path, as the worker read them.
     diff_lines: std::collections::HashMap<String, Vec<String>>,
+    /// The terminal color query started when the TUI opened, whose
+    /// reply regenerates the system theme once.
+    color_query: Option<crate::color_query::ColorQuery>,
 }
 
 impl Remote {
@@ -726,6 +729,7 @@ impl Remote {
             waiting: None,
             switch_to: None,
             diff_lines: std::collections::HashMap::new(),
+            color_query: None,
             shell_row: None,
             generation: GENERATIONS.fetch_add(1, Ordering::Relaxed),
             pending: std::collections::BTreeSet::new(),
@@ -921,6 +925,31 @@ impl Remote {
 
     /// The footer and the panels: the queue from `pi.inbox`, the run and
     /// what it does from `pi.live`, the model from `pi.agent`.
+    /// Record the terminal's reported colors: when the active theme is
+    /// the system theme, regenerate its palette from them (upstream's
+    /// first frame renders grayscale, then colors land). Returns whether
+    /// the query is finished, colored or not.
+    fn apply_terminal_colors(
+        &mut self,
+        app: &mut TuiApp,
+        config: &LoadedConfig,
+        colors: Option<noel_tui::TerminalColors>,
+    ) -> bool {
+        let Some(colors) = colors else {
+            return true;
+        };
+        // The system theme's colors are this terminal's, not the
+        // worker's. The palette lives on the app and only the draw that
+        // resolves the theme to `system` uses it, so an explicit theme
+        // switch is never stomped by a late reply.
+        if config.settings.theme.as_deref().unwrap_or("system") == "system"
+            && let Some((palette, _)) = noel_tui::system_theme_palette(&colors, 1.0)
+        {
+            app.system_palette = Some(palette);
+        }
+        true
+    }
+
     fn refresh_chrome(&mut self, app: &mut TuiApp, config: &LoadedConfig) {
         app.show_hardware_cursor = config.settings.show_hardware_cursor.unwrap_or(true);
         let docs = &self.view["docs"];
@@ -1038,6 +1067,10 @@ impl Remote {
     ) -> Result<Option<String>> {
         let mut tick = tokio::time::interval(Duration::from_millis(STREAM_RENDER_INTERVAL_MS * 2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The system theme's colors come from the terminal's own theme:
+        // query at open, then regenerate the palette when the reply
+        // lands (or keep the defaults when nothing reports).
+        self.color_query = crate::color_query::ColorQuery::start();
         self.refresh_chrome(app, config);
         crate::redraw_tui(terminal, app, config)?;
         loop {
@@ -1053,6 +1086,11 @@ impl Remote {
                     changed = true;
                 }
                 _ = tick.tick() => {
+                    if let Some(colors) = self.color_query.as_mut().and_then(|query| query.poll())
+                        && self.apply_terminal_colors(app, config, colors)
+                    {
+                        self.color_query = None;
+                    }
                     while event::poll(Duration::ZERO)? {
                         changed = true;
                         match event::read()? {

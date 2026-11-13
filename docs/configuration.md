@@ -540,9 +540,18 @@ Manual commands: `/web-search <query>` and `/web-fetch <url>`.
 
 ## Terminal themes
 
-The default `system` theme inherits your terminal's foreground, background, and
-ANSI palette, including on light terminals. Secondary text uses terminal dim
-intensity rather than a fixed gray. OS accent colors are not detected.
+The default `system` theme is generated from your terminal's own theme, as
+upstream pi generates it: the TUI queries the default foreground and
+background (OSC 10/11) and the ANSI palette (OSC 4) when it opens, and
+derives every color from them - hues from the palette's slots, lightness
+from contrast rules fitted to upstream's reference design - so a pastel
+terminal gets pastel colors and a light terminal light ones. Until the
+reply lands (or in a terminal that reports nothing) the theme keeps the
+terminal's native colors. A `light/dark` pair (the `theme` setting,
+`--use-theme`, or `/theme light/dark`) is upstream's auto setting: the half
+comes from the terminal's appearance, `COLORFGBG` before the query replies.
+Secondary text uses terminal dim intensity rather than a fixed gray. OS
+accent colors are not detected.
 
 Use `/themes` to list presets and resources, `/theme` to open the selector, or
 `/theme system`, `/theme light`, `/theme dark`, or `/theme kimi` to switch
@@ -567,8 +576,9 @@ preserving unrelated keys:
 
 Set `accentColor` to `null` or omit it to use the theme accent. Project settings
 still take precedence on startup and `/reload`. `--theme <name|path>` selects a
-preset, loaded resource, or JSON file for this invocation; `--no-themes` starts
-with native colors and no accent override.
+preset, loaded resource, or JSON file for this invocation; `--use-theme`
+additionally accepts a `light/dark` pair; `--no-themes` starts with native
+colors and no accent override.
 
 Custom resources in `themes/` or trusted `.noel/themes/` use their filename stem
 as the theme name. They can extend a built-in preset and override any of

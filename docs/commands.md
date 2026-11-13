@@ -143,7 +143,8 @@ Run `noel --no-alt-screen` (or upstream's `--tui-mode regular`) for native inlin
 compatibility: overflow is written once to terminal scrollback, mouse
 selection/wheel remain terminal-owned, and the composer scrolls with the
 terminal. `--tui-mode fullscreen` selects the owned screen explicitly.
-`--use-theme <name>` applies a theme for one run without saving it; it cannot
+`--use-theme <name|light/dark>` applies a theme for one run without saving
+it, a pair's half picked from the terminal's appearance; it cannot
 be combined with `--theme` or `--no-themes`.
 Print/JSON/RPC modes are unchanged.
 Owned mode restores the previous screen, mouse reporting, paste, and raw mode

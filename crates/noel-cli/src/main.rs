@@ -22,6 +22,7 @@ mod background;
 mod bug_report;
 mod bun_install;
 mod clipboard;
+mod color_query;
 mod diagnostics;
 mod image_command;
 mod markdown;
@@ -272,7 +273,9 @@ struct Cli {
     #[arg(long)]
     theme: Option<String>,
 
-    /// Select the initial interactive theme for this run without saving it.
+    /// Select the initial interactive theme for this run without saving
+    /// it: one name, or upstream's `light/dark` pair, whose half the
+    /// terminal's appearance picks.
     #[arg(long, value_name = "NAME", conflicts_with_all = ["theme", "no_themes"])]
     use_theme: Option<String>,
 
@@ -930,15 +933,11 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
         config.settings.accent_color = None;
         config.themes.clear();
     } else if let Some(theme) = cli.theme.as_ref().or(cli.use_theme.as_ref()) {
-        // Either flag selects the theme for this run only (clap rejects both
-        // together); --use-theme takes one name, not upstream's light/dark pair.
-        if cli.use_theme.is_some() && theme.contains('/') {
-            return Err(anyhow!(
-                "--use-theme {theme}: light/dark theme pairs are not supported; pass one theme name"
-            ));
-        }
-        let resolved = resolve_terminal_theme(config, theme)?;
-        config.settings.theme = Some(resolved.name.clone());
+        // Either flag selects the theme for this run only (clap rejects
+        // both together). A `light/dark` pair resolves its half from the
+        // terminal's appearance, as upstream's --use-theme does.
+        let resolved = terminal_theme_for_appearance(config, theme, terminal_appearance_hint())?;
+        config.settings.theme = Some(theme.clone());
         resolved
             .with_accent(config.settings.accent_color.as_deref())
             .map_err(|error| anyhow!(error))?;
@@ -2074,9 +2073,54 @@ fn terminal_renderer(config: &LoadedConfig) -> TerminalRenderer {
 }
 
 fn terminal_theme(config: &LoadedConfig) -> Result<TerminalTheme> {
-    resolve_terminal_theme(config, config.settings.theme.as_deref().unwrap_or("system"))?
-        .with_accent(config.settings.accent_color.as_deref())
-        .map_err(|error| anyhow!(error))
+    terminal_theme_for_appearance(
+        config,
+        config.settings.theme.as_deref().unwrap_or("system"),
+        terminal_appearance_hint(),
+    )?
+    .with_accent(config.settings.accent_color.as_deref())
+    .map_err(|error| anyhow!(error))
+}
+
+/// Resolve a theme setting for `appearance`: a plain name, or a
+/// `light/dark` pair whose half the appearance picks (upstream's auto
+/// theme setting).
+fn terminal_theme_for_appearance(
+    config: &LoadedConfig,
+    setting: &str,
+    appearance: noel_tui::TerminalAppearance,
+) -> Result<TerminalTheme> {
+    match parse_theme_pair(setting) {
+        Some((light, dark)) => {
+            let half = if appearance == noel_tui::TerminalAppearance::Light {
+                light
+            } else {
+                dark
+            };
+            resolve_terminal_theme(config, half)
+        }
+        None => resolve_terminal_theme(config, setting),
+    }
+}
+
+/// A `light/dark` theme pair, as upstream's `parseAutoThemeSetting`: one
+/// slash, both halves nonempty. None for anything else.
+fn parse_theme_pair(setting: &str) -> Option<(&str, &str)> {
+    let (light, dark) = setting.split_once('/')?;
+    if setting.matches('/').count() != 1 || light.is_empty() || dark.is_empty() {
+        return None;
+    }
+    Some((light, dark))
+}
+
+/// The terminal's appearance before any query: `COLORFGBG` when some
+/// terminal set a usable background index, dark otherwise, as upstream
+/// falls back to dark.
+fn terminal_appearance_hint() -> noel_tui::TerminalAppearance {
+    std::env::var("COLORFGBG")
+        .ok()
+        .and_then(|value| noel_tui::detect_colorfgbg_appearance(&value))
+        .unwrap_or(noel_tui::TerminalAppearance::Dark)
 }
 
 fn resolve_terminal_theme(config: &LoadedConfig, name: &str) -> Result<TerminalTheme> {
@@ -2108,19 +2152,24 @@ fn resolve_terminal_theme(config: &LoadedConfig, name: &str) -> Result<TerminalT
 }
 
 fn persist_theme(config: &mut LoadedConfig, name: &str) -> Result<String> {
-    let theme = resolve_terminal_theme(config, name)?;
-    // Validate before persisting, so malformed themes never replace a working selection.
-    theme
-        .clone()
-        .with_accent(config.settings.accent_color.as_deref())
-        .map_err(|error| anyhow!(error))?;
+    let appearance = terminal_appearance_hint();
+    let theme = terminal_theme_for_appearance(config, name, appearance)?;
+    // Validate before persisting, so malformed themes never replace a
+    // working selection. A pair validates both halves: the appearance
+    // only picks between known themes.
+    let halves = parse_theme_pair(name).map(|(light, dark)| [light, dark]);
+    for half in halves.unwrap_or([theme.name.as_str(), theme.name.as_str()]) {
+        resolve_terminal_theme(config, half)?
+            .with_accent(config.settings.accent_color.as_deref())
+            .map_err(|error| anyhow!(error))?;
+    }
     write_user_setting(
         &config.paths.settings_path,
         &["theme"],
-        theme.name.clone().into(),
+        name.to_owned().into(),
     )?;
-    config.settings.theme = Some(theme.name.clone());
-    Ok(theme.name)
+    config.settings.theme = Some(name.to_owned());
+    Ok(name.to_owned())
 }
 
 fn persist_accent(config: &mut LoadedConfig, color: &str) -> Result<()> {
