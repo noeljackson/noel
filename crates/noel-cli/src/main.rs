@@ -1365,7 +1365,7 @@ pub(crate) fn resume_hint(mid_turn: bool, queued: usize) -> Option<String> {
             Some("resumed mid-turn; continuing automatically from saved context".to_string())
         }
         (false, n) => Some(format!(
-            "{n} queued message(s) pending; they run after your next prompt (/queue to list, /queue-clear to clear)"
+            "{n} queued message(s) pending; ctrl+enter sends them now (/queue to list, /queue-clear to clear)"
         )),
         (true, n) => Some(format!(
             "resumed mid-turn; continuing automatically from saved context with {n} queued message(s) first"

@@ -4302,7 +4302,7 @@ fn queue_overflow_shows_newest_editable_message_and_cell_width_truncation() {
     assert!(text.contains("❯ queued 5"));
     assert!(text.contains("❯ queued 6"));
     assert!(!text.contains("queued 4"));
-    assert!(text.contains("+5 more · ↑ to edit · runs after next turn"));
+    assert!(text.contains("+5 more · ↑ to edit · ctrl+enter or Enter sends now"));
     app.queued_messages = vec!["界界界界界界界界界界".into()];
     let mut terminal = Terminal::new(TestBackend::new(16, 3)).unwrap();
     terminal

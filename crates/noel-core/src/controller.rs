@@ -872,13 +872,18 @@ impl<H: Host> SessionController<H> {
                 break Outcome::Completed;
             };
             if let Call::Continue = call {
+                // An idle continue begins with the queued steering, as a run
+                // a prompt starts takes it (spec §3): without it, a queue
+                // of only steers would have nothing to answer.
+                let steers = lock(live).take_steering();
                 let follow_ups = lock(live).take_follow_ups();
-                call = match follow_ups {
-                    Some(call) => call,
-                    None if runtime.session().has_unfinished_turn() => {
+                call = match (steers, follow_ups) {
+                    (_, Some(call)) => call,
+                    (Some(call), None) => call,
+                    (None, None) if runtime.session().has_unfinished_turn() => {
                         Call::Resume { charged: None }
                     }
-                    None => Call::Settle(Outcome::Unanswered {
+                    (None, None) => Call::Settle(Outcome::Unanswered {
                         reason: FailureReason::NothingToAnswer,
                         detail: NOTHING_TO_ANSWER.into(),
                     }),
@@ -1378,6 +1383,27 @@ impl<H: Host> Live<H> {
         }
         self.place_steering();
         self.save_delivered();
+    }
+
+    /// The queued steering as the run's opening engine call, placed into
+    /// it: a continue with nothing else to answer begins with what was
+    /// queued to steer, as a run a prompt starts does (spec §3).
+    fn take_steering(&mut self) -> Option<Call> {
+        if self.queue.steering.pending() == 0 {
+            return None;
+        }
+        let items = self.queue.steering.items();
+        let texts = items.iter().map(|item| item.content.as_str());
+        let text = texts.collect::<Vec<_>>().join(STEERING_JOIN);
+        let placed = items.into_iter().map(|item| item.id).collect::<Vec<_>>();
+        // The mailbox the active run reads is drained: its message is this
+        // call's, not one the first round would place again.
+        self.queue.steering.drain();
+        self.place(&placed);
+        Some(Call::FollowUps {
+            message: user_message(text, Vec::new()),
+            placed,
+        })
     }
 
     /// The queued follow-ups as the next engine call, placed into the run.

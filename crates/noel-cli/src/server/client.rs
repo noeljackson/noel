@@ -1142,7 +1142,7 @@ impl AsyncWrite for SshStream {
     }
 }
 
-fn describe_session(session: &Value) -> String {
+pub(crate) fn describe_session(session: &Value) -> String {
     let live = &session["live"];
     let state = if live["busy"] == true {
         "running"
