@@ -2366,9 +2366,15 @@ fn upstream_v1_1_flags_are_accepted_in_print_mode() {
     );
     assert!(!agent.join("settings.json").exists());
 
+    // A light/dark pair is upstream's auto setting: accepted, its half
+    // resolved from the terminal's appearance (dark without reports).
     let pair = run(&["--use-theme", "light/dark"]);
-    assert!(!pair.status.success());
-    assert!(String::from_utf8_lossy(&pair.stderr).contains("theme pairs are not supported"));
+    assert!(
+        pair.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pair.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&pair.stdout), "[faux/echo] hello\n");
     for args in [
         &["--no-themes", "--use-theme", "light"][..],
         &["--theme", "dark", "--use-theme", "light"],

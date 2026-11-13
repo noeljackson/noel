@@ -1,4 +1,5 @@
 mod oklab;
+pub use oklab::Rgb;
 mod system_theme;
 mod terminal_colors;
 mod theme;

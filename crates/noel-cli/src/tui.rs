@@ -511,6 +511,10 @@ pub(crate) struct TuiApp {
     /// The selected row of the slash-command list, when one is visible.
     /// Reset with the input; upstream's SelectList starts at the first row.
     pub(crate) slash_selection: Option<usize>,
+    /// The system theme's palette as generated from this terminal's
+    /// reported colors, once its color query replies. Only a draw that
+    /// resolves the theme to `system` uses it.
+    pub(crate) system_palette: Option<noel_tui::ThemePalette>,
 }
 
 /// What covers the input: a multiline prompt being typed, a selector, or
@@ -1640,7 +1644,12 @@ pub(crate) fn transcript_area(area: Rect, app: &TuiApp) -> Rect {
 }
 
 pub(crate) fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig) {
-    let palette = terminal_theme(config).unwrap_or_default().palette;
+    let theme = terminal_theme(config).unwrap_or_default();
+    let palette = if theme.name == "system" {
+        app.system_palette.unwrap_or(theme.palette)
+    } else {
+        theme.palette
+    };
     frame.render_widget(Block::default().style(palette.base()), frame.area());
     let root = tui_layout(frame.area(), app, config);
     let transcript_area = transcript_area(root[0], app);

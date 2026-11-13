@@ -4514,12 +4514,16 @@ fn use_theme_conflicts_with_other_theme_flags_and_applies_for_one_run() {
     let use_theme = parse(&["--use-theme", "light"]).expect("parse cli");
     apply_cli_overrides(&use_theme, Path::new("."), &mut config).expect("use theme");
     assert_eq!(config.settings.theme.as_deref(), Some("light"));
+    // A light/dark pair is upstream's auto setting: it saves the pair
+    // and resolves its half from the terminal's appearance.
     let pair = parse(&["--use-theme", "light/dark"]).expect("parse cli");
-    let error = apply_cli_overrides(&pair, Path::new("."), &mut config).expect_err("pair");
-    assert!(
-        error.to_string().contains("theme pairs are not supported"),
-        "{error}"
-    );
+    apply_cli_overrides(&pair, Path::new("."), &mut config).expect("pair");
+    assert_eq!(config.settings.theme.as_deref(), Some("light/dark"));
+    let resolved = terminal_theme(&config).expect("pair resolves");
+    // This test terminal reports nothing: the hint is dark.
+    assert_eq!(resolved.name, "dark");
+    let bad_pair = parse(&["--use-theme", "light/missing"]).expect("parse cli");
+    assert!(apply_cli_overrides(&bad_pair, Path::new("."), &mut config).is_err());
 }
 
 fn rust_cli_option_contract() -> BTreeSet<String> {
