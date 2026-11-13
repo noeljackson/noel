@@ -2573,45 +2573,10 @@ fn format_image_models(config: &LoadedConfig, search: &str) -> String {
 }
 
 fn command_completions(config: &LoadedConfig, prefix: &str) -> Vec<String> {
-    let mut completions = EditorState::command_completions(prefix)
+    tui::slash_completion_entries(config, prefix)
         .into_iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    completions.extend(resource_command_completions(
-        prefix,
-        "/extension:",
-        &config.extensions,
-    ));
-    completions.extend(resource_commands::completions(config, prefix));
-    let templates = config.prompt_templates.iter();
-    completions.extend(
-        templates
-            .map(|template| format!("/prompt {}", template.name))
-            .filter(|command| command.starts_with(prefix)),
-    );
-    completions.extend(
-        theme_names(config)
-            .into_iter()
-            .map(|name| format!("/theme {name}"))
-            .filter(|command| command.starts_with(prefix)),
-    );
-    completions.extend(
-        ["refresh", "reset"]
-            .into_iter()
-            .map(|sub| format!("/models {sub}"))
-            .filter(|command| command.starts_with(prefix)),
-    );
-    completions.extend(
-        [
-            "auto", "cyan", "blue", "magenta", "green", "yellow", "red", "default",
-        ]
-        .into_iter()
-        .map(|color| format!("/accent {color}"))
-        .filter(|command| command.starts_with(prefix)),
-    );
-    completions.sort();
-    completions.dedup();
-    completions
+        .map(|entry| entry.command)
+        .collect()
 }
 
 fn resource_command_completions(

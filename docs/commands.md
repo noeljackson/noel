@@ -94,7 +94,15 @@ and the box grows upward with newlines or wrapping, up to ten visible input
 rows; longer drafts scroll vertically to keep the cursor visible. Shift+Enter
 inserts a newline without submitting (also while streaming); Enter submits or
 queues the complete draft. Ctrl+J is an alternative when the terminal does not
-report Shift+Enter distinctly. Multiline pastes (or single-line pastes over
+report Shift+Enter distinctly. A draft that starts with `/` shows the
+slash-command list under the input, as upstream's autocomplete: one row per
+match with its description in a muted second column, an accent-colored arrow
+on the selected row, Up/Down to move the selection (wrapping, and taking
+precedence over history recall while the list is visible), Tab to accept it,
+and Enter to accept it unless the draft is already the exact command, in which
+case Enter runs it. Accepting fills the command head and a space, ready for
+arguments; typing more narrows the list and a filter with no matches says so.
+Multiline pastes (or single-line pastes over
 1,000 characters) collapse to numbered markers such as
 `[paste #1 +500 lines]`. Left/Right skip a marker and
 Backspace/Delete remove the whole paste. Submission, queueing, history, and

@@ -546,9 +546,11 @@ intensity rather than a fixed gray. OS accent colors are not detected.
 
 Use `/themes` to list presets and resources, `/theme` to open the selector, or
 `/theme system`, `/theme light`, `/theme dark`, or `/theme kimi` to switch
-immediately. `kimi` is a Kimi-inspired light preset with neutral conversation
-text and restrained blue accents, not an exact reproduction. `default` is an
-alias for `system`.
+immediately. The `dark` and `light` presets carry upstream pi's built-in theme
+colors (converted from its okhsl values): violet accents, blue borders, and
+slightly-hued grays, painted on the terminal's own background. `kimi` is a
+Kimi-inspired light preset with neutral conversation text and a restrained
+blue accent, not an exact reproduction. `default` is an alias for `system`.
 
 `/accent magenta` or `/accent #2563EB` overrides the accent; `/accent auto`
 restores the preset's accent. Colors accept ANSI names (such as `cyan` or

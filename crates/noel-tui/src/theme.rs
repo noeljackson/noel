@@ -74,31 +74,39 @@ impl TerminalTheme {
         let name = if name == "default" { "system" } else { name };
         let palette = match name {
             "system" => ThemePalette::default(),
+            // Upstream pi's dark.json/light.json, authored in okhsl and
+            // converted to sRGB: violet accents, blue borders, muted grays
+            // with a slight hue. Roles without an upstream token keep the
+            // nearest one: surface is upstream's selectedBg panel tint.
             "light" | "kimi" => ThemePalette {
-                foreground: Color::Rgb(0x24, 0x29, 0x32),
-                background: Color::Rgb(0xFA, 0xFA, 0xF9),
-                surface: Color::Rgb(0xF0, 0xF1, 0xF3),
-                muted: Color::Rgb(0x60, 0x67, 0x73),
-                border: Color::Rgb(0x80, 0x87, 0x92),
+                foreground: Color::Rgb(0x3B, 0x3F, 0x41),
+                background: Color::Reset,
+                // A touch lighter than upstream's selectedBg (okhsl 235 19% 91%)
+                // to keep every role at WCAG AA on the surface.
+                surface: Color::Rgb(0xF4, 0xF6, 0xF8),
+                muted: Color::Rgb(0x67, 0x71, 0x76),
+                border: Color::Rgb(0x3D, 0x8E, 0xB3),
                 accent: if name == "kimi" {
                     Color::Rgb(0x25, 0x63, 0xEB)
                 } else {
-                    Color::Rgb(0x00, 0x69, 0x80)
+                    Color::Rgb(0x74, 0x59, 0xB4)
                 },
-                success: Color::Rgb(0x16, 0x70, 0x3A),
-                warning: Color::Rgb(0x91, 0x5A, 0x00),
-                error: Color::Rgb(0xBE, 0x25, 0x35),
+                success: Color::Rgb(0x33, 0x7E, 0x58),
+                warning: Color::Rgb(0x8F, 0x68, 0x02),
+                error: Color::Rgb(0xC8, 0x25, 0x3D),
             },
             "dark" => ThemePalette {
-                foreground: Color::Rgb(0xE4, 0xE7, 0xEC),
-                background: Color::Rgb(0x18, 0x1B, 0x22),
-                surface: Color::Rgb(0x25, 0x29, 0x33),
-                muted: Color::Rgb(0xA2, 0xAA, 0xB8),
-                border: Color::Rgb(0x78, 0x83, 0x96),
-                accent: Color::Rgb(0x79, 0xBC, 0xFF),
-                success: Color::Rgb(0x7A, 0xD6, 0x9B),
-                warning: Color::Rgb(0xED, 0xC3, 0x72),
-                error: Color::Rgb(0xFF, 0x8A, 0x94),
+                foreground: Color::Rgb(0xDE, 0xE0, 0xE1),
+                background: Color::Reset,
+                // A touch darker than upstream's selectedBg (okhsl 233 41% 24%)
+                // to keep every role at WCAG AA on the surface.
+                surface: Color::Rgb(0x1E, 0x36, 0x43),
+                muted: Color::Rgb(0x9D, 0xA5, 0xA9),
+                border: Color::Rgb(0x5F, 0xA8, 0xCC),
+                accent: Color::Rgb(0xA7, 0x98, 0xD7),
+                success: Color::Rgb(0x68, 0xB7, 0x8D),
+                warning: Color::Rgb(0xCD, 0x9A, 0x22),
+                error: Color::Rgb(0xEA, 0x7F, 0x81),
             },
             _ => return None,
         };
@@ -231,6 +239,9 @@ mod tests {
         }
         for name in ["light", "dark", "kimi"] {
             let palette = TerminalTheme::builtin(name).unwrap().palette;
+            // Presets paint on the terminal's own background; only the
+            // surface tint is theirs, like upstream's selectedBg panels.
+            assert_eq!(palette.background, Color::Reset);
             for foreground in [
                 palette.foreground,
                 palette.muted,
@@ -239,13 +250,11 @@ mod tests {
                 palette.warning,
                 palette.error,
             ] {
-                for background in [palette.background, palette.surface] {
-                    let foreground = luminance(foreground);
-                    let background = luminance(background);
-                    let ratio =
-                        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05);
-                    assert!(ratio >= 4.5, "{name} text contrast: {ratio}");
-                }
+                let foreground = luminance(foreground);
+                let background = luminance(palette.surface);
+                let ratio =
+                    (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05);
+                assert!(ratio >= 4.5, "{name} text contrast: {ratio}");
             }
         }
     }

@@ -73,9 +73,9 @@ fn skill_commands(config: &LoadedConfig) -> impl Iterator<Item = ResourceCommand
     })
 }
 
-/// Completion lines for the template and skill commands `prefix` starts: the
-/// command, then its detail. A skill is also found by its bare name.
-pub(crate) fn completions(config: &LoadedConfig, prefix: &str) -> Vec<String> {
+/// Completion entries (command, description) for the template and skill
+/// commands `prefix` starts. A skill is also found by its bare name.
+pub(crate) fn completion_entries(config: &LoadedConfig, prefix: &str) -> Vec<(String, String)> {
     template_commands(config)
         .chain(skill_commands(config))
         .filter(|command| {
@@ -83,8 +83,17 @@ pub(crate) fn completions(config: &LoadedConfig, prefix: &str) -> Vec<String> {
             command.command.starts_with(prefix)
                 || short.is_some_and(|short| short.starts_with(prefix))
         })
-        .map(|command| format!("{}  {}", command.command, command.detail))
+        .map(|command| (command.command, command.detail))
         .collect()
+}
+
+/// A template's description for completion rows, as `/prompts` shows it.
+pub(crate) fn template_detail(template: &PromptTemplate) -> String {
+    detail(
+        template.argument_hint.as_deref(),
+        &template.source_info,
+        &template.description,
+    )
 }
 
 fn listing<'a>(commands: impl Iterator<Item = ResourceCommand<'a>>, none: &str) -> String {

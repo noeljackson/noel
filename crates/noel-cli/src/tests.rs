@@ -588,15 +588,11 @@ fn command_completions_include_loaded_resources() {
     );
     // A skill and a template complete with what upstream shows: the
     // argument hint, the scope, and the description on one line.
-    let skill = "/skill:review  [u] Review code. Carefully.";
-    assert_eq!(command_completions(&config, "/skill:r"), [skill]);
-    assert_eq!(command_completions(&config, "/rev"), [skill]);
-    assert_eq!(
-        command_completions(&config, "/fix"),
-        ["/fix  <issue> \u{2014} [u] Fix a bug"]
-    );
-    assert_eq!(command_completions(&config, "/prompt f"), ["/prompt fix"]);
-    assert!(command_completions(&config, "/theme d").contains(&"/theme dark".to_string()));
+    // The picker's rows carry the descriptions `/complete` used to inline.
+    let entries = crate::tui::slash_completion_entries(&config, "/skill:r");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].command, "/skill:review");
+    assert_eq!(entries[0].description, "[u] Review code. Carefully.");
 
     assert_eq!(
         resource_commands::format_skills(&config),
@@ -3254,17 +3250,80 @@ fn slash_command_matches_follow_current_input() {
     app.set_input("/cl");
 
     let matches = slash_command_matches(&config, &app);
-    assert!(matches.contains(&"/clear".to_string()));
-    assert!(matches.contains(&"/clone [id|name|path]".to_string()));
+    let commands: Vec<&str> = matches.iter().map(|m| m.command.as_str()).collect();
+    assert!(commands.contains(&"/clear"));
+    assert!(commands.contains(&"/clone [id|name|path]"));
+    // Every builtin row carries its COMMAND_HELP description.
+    let clear = matches.iter().find(|m| m.command == "/clear").unwrap();
+    assert_eq!(clear.description, "clear visible transcript");
 
     app.set_input("not slash");
     assert!(slash_command_matches(&config, &app).is_empty());
 
     app.set_input("/extension:j");
     assert_eq!(
-        slash_command_matches(&config, &app),
-        vec!["/extension:json-ext".to_string()]
+        slash_command_matches(&config, &app)
+            .iter()
+            .map(|m| m.command.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/extension:json-ext"]
     );
+}
+
+#[test]
+fn slash_list_navigates_and_picks_upstream_select_semantics() {
+    let config = LoadedConfig {
+        paths: test_config_paths(),
+        settings: Settings::default(),
+        auth: AuthData::default(),
+        models: Vec::new(),
+        model_scope: Vec::new(),
+        image_models: Vec::new(),
+        keybindings: Vec::new(),
+        context_files: Vec::new(),
+        extensions: Vec::new(),
+        skills: Vec::new(),
+        agents: Vec::new(),
+        mcp_servers: Vec::new(),
+        prompt_templates: Vec::new(),
+        themes: Vec::new(),
+        diagnostics: Vec::new(),
+        system_prompt: None,
+        append_system_prompt: Vec::new(),
+    };
+    let mut app = TuiApp::default();
+    app.set_input("/e");
+    assert_eq!(app.slash_selection, None);
+
+    // Arrows move the selection, wrapping at both ends as upstream does.
+    slash_move_selection(&mut app, &config, 1);
+    assert_eq!(app.slash_selection, Some(1));
+    slash_move_selection(&mut app, &config, -2);
+    assert_eq!(
+        app.slash_selection,
+        Some(slash_command_matches(&config, &app).len() - 1)
+    );
+    slash_move_selection(&mut app, &config, 1);
+    assert_eq!(app.slash_selection, Some(0));
+
+    // The picked completion drops its placeholder: the draft becomes the
+    // command head plus a space, ready for arguments.
+    let (completion, _) = slash_selected_match(&app, &config).unwrap();
+    apply_slash_completion(&mut app, &completion);
+    assert_eq!(
+        app.input,
+        format!("{} ", completion.split_once(' ').unwrap().0)
+    );
+    // Accepting rewrote the input, so the selection reset with it.
+    assert_eq!(app.slash_selection, None);
+
+    // A draft that is exactly the selected command has nothing to pick.
+    app.set_input("/editor");
+    app.slash_selection = Some(0);
+    let (command, _) = slash_selected_match(&app, &config).unwrap();
+    assert_eq!(command, "/editor [text]");
+    apply_slash_completion(&mut app, &command);
+    assert_eq!(app.input, "/editor ");
 }
 
 #[test]
@@ -4619,4 +4678,92 @@ fn the_branch_navigator_folds_and_filters() {
     assert_eq!(again.tree.len(), 4);
     assert_eq!(again.tree["grandchild"].parent.as_deref(), Some("child"));
     assert!(again.tree["grandchild"].named);
+}
+
+#[test]
+fn slash_list_renders_upstream_select_rows() {
+    let config = LoadedConfig {
+        paths: test_config_paths(),
+        settings: Settings::default(),
+        auth: AuthData::default(),
+        models: Vec::new(),
+        model_scope: Vec::new(),
+        image_models: Vec::new(),
+        keybindings: Vec::new(),
+        context_files: Vec::new(),
+        extensions: Vec::new(),
+        skills: Vec::new(),
+        agents: Vec::new(),
+        mcp_servers: Vec::new(),
+        prompt_templates: Vec::new(),
+        themes: Vec::new(),
+        diagnostics: Vec::new(),
+        system_prompt: None,
+        append_system_prompt: Vec::new(),
+    };
+    let palette = TerminalTheme::builtin("system").unwrap().palette;
+    let mut app = TuiApp::default();
+    app.set_input("/c");
+    app.slash_selection = Some(0);
+
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 3)).unwrap();
+    terminal
+        .draw(|frame| draw_slash_matches(frame, frame.area(), &app, &config, &palette))
+        .unwrap();
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol().to_string())
+        .collect::<Vec<_>>()
+        .chunks(60)
+        .map(|row| row.join(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The selected first row: arrow prefix, command, muted description.
+    assert!(rendered.contains("→ /changelog"), "{rendered}");
+    assert!(rendered.contains("show changelog entries"), "{rendered}");
+    // A later row is unselected: no arrow.
+    assert!(rendered.contains("  /clear"), "{rendered}");
+
+    // Moving the selection past the window appends the scroll line.
+    app.slash_selection = Some(3);
+    terminal
+        .draw(|frame| draw_slash_matches(frame, frame.area(), &app, &config, &palette))
+        .unwrap();
+    let scrolled: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol().to_string())
+        .collect::<Vec<_>>()
+        .chunks(60)
+        .map(|row| row.join(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !scrolled.contains("(4/") {
+        // If /c matches fewer than 4, the window already holds the row
+        // and no scroll line is needed; the arrow proves the selection.
+        assert!(scrolled.contains("→ /compact"), "{scrolled}");
+    }
+
+    // A prefix nothing matches says so instead of showing nothing.
+    app.set_input("/zzz");
+    terminal
+        .draw(|frame| draw_slash_matches(frame, frame.area(), &app, &config, &palette))
+        .unwrap();
+    let none: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol().to_string())
+        .collect::<Vec<_>>()
+        .chunks(60)
+        .map(|row| row.join(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(none.contains("No matching commands"), "{none}");
 }

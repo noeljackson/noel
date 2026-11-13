@@ -508,6 +508,9 @@ pub(crate) struct TuiApp {
     /// has no interior round boundary, so ctrl+s steering only lands after
     /// the response finishes and the hint must not promise a boundary.
     pub(crate) turn_saw_tools: bool,
+    /// The selected row of the slash-command list, when one is visible.
+    /// Reset with the input; upstream's SelectList starts at the first row.
+    pub(crate) slash_selection: Option<usize>,
 }
 
 /// What covers the input: a multiline prompt being typed, a selector, or
@@ -700,6 +703,7 @@ impl TuiApp {
     pub(crate) fn reset_history_navigation(&mut self) {
         self.history_cursor = None;
         self.history_draft = None;
+        self.slash_selection = None;
     }
 
     pub(crate) fn paste_text(&mut self, text: &str) {
@@ -1596,8 +1600,7 @@ pub(crate) fn push_transcript_segment(
 }
 
 pub(crate) fn tui_layout(frame_area: Rect, app: &TuiApp, config: &LoadedConfig) -> [Rect; 7] {
-    let slash_matches = slash_command_matches(config, app);
-    let slash_match_height = (slash_matches.len().min(SLASH_MATCH_LIMIT) as u16)
+    let slash_match_height = slash_match_height(slash_command_matches(config, app).len())
         .min(frame_area.height.saturating_sub(4));
     let spacer_height = u16::from(app.queued_messages.is_empty());
     let input_height = input_area_height(app, frame_area, slash_match_height);
@@ -1640,7 +1643,6 @@ pub(crate) fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfi
     let palette = terminal_theme(config).unwrap_or_default().palette;
     frame.render_widget(Block::default().style(palette.base()), frame.area());
     let root = tui_layout(frame.area(), app, config);
-    let slash_matches = slash_command_matches(config, app);
     let transcript_area = transcript_area(root[0], app);
     if app.diff_panel().is_some() {
         let diff_area = Rect::new(
@@ -1656,7 +1658,7 @@ pub(crate) fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfi
     draw_queue_panel(frame, root[2], app, &palette);
     // Queue hints sit directly against the editor; otherwise leave a blank row.
     draw_input(frame, root[4], app, &palette);
-    draw_slash_matches(frame, root[5], &slash_matches, &palette);
+    draw_slash_matches(frame, root[5], app, config, &palette);
     draw_footer(frame, root[6], app, &palette);
     draw_selector_overlay(frame, app, &palette);
     set_tui_cursor(frame, root[4], app);
@@ -2746,7 +2748,26 @@ pub(crate) fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, palet
 pub(crate) const SLASH_MATCH_LIMIT: usize = 6;
 pub(crate) const SELECTOR_PAGE_STEP: usize = 10;
 
-pub(crate) fn slash_command_matches(config: &LoadedConfig, app: &TuiApp) -> Vec<String> {
+/// One row of the slash-command list: the command and its description, as
+/// upstream's SelectList carries label and description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SlashMatch {
+    pub(crate) command: String,
+    pub(crate) description: String,
+}
+
+impl SlashMatch {
+    fn new(command: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            description: description.into(),
+        }
+    }
+}
+
+/// The slash-command list under the input: upstream's autocomplete, whose
+/// rows are commands with descriptions and one selected row.
+pub(crate) fn slash_command_matches(config: &LoadedConfig, app: &TuiApp) -> Vec<SlashMatch> {
     if app.selector().is_some() || app.multiline().is_some() || app.input.contains('\n') {
         return Vec::new();
     }
@@ -2754,33 +2775,173 @@ pub(crate) fn slash_command_matches(config: &LoadedConfig, app: &TuiApp) -> Vec<
     if !input.starts_with('/') {
         return Vec::new();
     }
-    command_completions(config, input)
+    slash_completion_entries(config, input)
         .into_iter()
         .take(SLASH_MATCH_LIMIT)
         .collect()
 }
 
+/// Command and description pairs for `prefix`, in the order the list shows.
+pub(crate) fn slash_completion_entries(config: &LoadedConfig, prefix: &str) -> Vec<SlashMatch> {
+    let builtin = EditorState::command_completions(prefix)
+        .into_iter()
+        .map(|command| {
+            let description = noel_tui::COMMAND_HELP
+                .iter()
+                .find(|help| help.command == command)
+                .map(|help| help.description)
+                .unwrap_or("");
+            SlashMatch::new(command, description)
+        });
+    let extensions = resource_command_completions(prefix, "/extension:", &config.extensions)
+        .into_iter()
+        .map(|command| SlashMatch::new(command, "[u] extension"));
+    let resources = resource_commands::completion_entries(config, prefix)
+        .into_iter()
+        .map(|(command, description)| SlashMatch::new(command, description));
+    let templates = config.prompt_templates.iter().map(|template| {
+        SlashMatch::new(
+            format!("/prompt {}", template.name),
+            resource_commands::template_detail(template),
+        )
+    });
+    let themes = theme_names(config).into_iter().map(|name| {
+        SlashMatch::new(
+            format!("/theme {name}"),
+            if TerminalTheme::builtin(&name).is_some() {
+                "built-in theme".to_string()
+            } else {
+                "[u] theme resource".to_string()
+            },
+        )
+    });
+    let models = ["refresh", "reset"]
+        .into_iter()
+        .map(|sub| SlashMatch::new(format!("/models {sub}"), "model catalog"));
+    let accents = [
+        "auto", "cyan", "blue", "magenta", "green", "yellow", "red", "default",
+    ]
+    .into_iter()
+    .map(|color| SlashMatch::new(format!("/accent {color}"), "accent color"));
+    let mut matches: Vec<SlashMatch> = builtin
+        .chain(extensions)
+        .chain(resources)
+        .chain(templates)
+        .chain(themes)
+        .chain(models)
+        .chain(accents)
+        .filter(|entry| entry.command.starts_with(prefix))
+        .collect();
+    matches.sort_by(|a, b| a.command.cmp(&b.command));
+    matches.dedup_by(|a, b| a.command == b.command);
+    matches
+}
+
+/// Moves the slash list's selection by `delta`, wrapping as upstream's
+/// SelectList does. A no-op without matches.
+pub(crate) fn slash_move_selection(app: &mut TuiApp, config: &LoadedConfig, delta: isize) {
+    let count = slash_command_matches(config, app).len();
+    if count == 0 {
+        app.slash_selection = None;
+        return;
+    }
+    let current = app.slash_selection.unwrap_or(0).min(count - 1);
+    let next = (current as isize + delta).rem_euclid(count as isize) as usize;
+    app.slash_selection = Some(next);
+}
+
+/// The selected match, if the list shows one.
+pub(crate) fn slash_selected_match(app: &TuiApp, config: &LoadedConfig) -> Option<(String, usize)> {
+    let matches = slash_command_matches(config, app);
+    let selected = app.slash_selection?.min(matches.len().saturating_sub(1));
+    let command = matches.get(selected)?.command.clone();
+    Some((command, selected))
+}
+
+/// Applies a picked completion: the input becomes the command up to its
+/// first placeholder, ready for its arguments.
+pub(crate) fn apply_slash_completion(app: &mut TuiApp, completion: &str) {
+    let base = completion
+        .split_once(' ')
+        .map(|(head, _)| head)
+        .unwrap_or(completion);
+    app.set_input(format!("{base} "));
+}
+
+/// The list's height in rows: the matches, and the scroll line when the
+/// window can scroll or the filter removed matches.
+pub(crate) fn slash_match_height(match_count: usize) -> u16 {
+    let shown = match_count.min(SLASH_MATCH_LIMIT) as u16;
+    if shown == 0 {
+        return 0;
+    }
+    // A visible scroll line also covers the no-match message's row.
+    shown + u16::from(match_count > SLASH_MATCH_LIMIT)
+}
+
 pub(crate) fn draw_slash_matches(
     frame: &mut Frame<'_>,
     area: Rect,
-    matches: &[String],
+    app: &TuiApp,
+    config: &LoadedConfig,
     palette: &ThemePalette,
 ) {
-    if area.height == 0 || matches.is_empty() {
+    if area.height == 0 {
         return;
     }
-    let lines = matches
+    let input = app.input.trim();
+    let matches = slash_command_matches(config, app);
+    if matches.is_empty() {
+        if input.starts_with('/') && input.chars().all(|ch| !ch.is_whitespace()) {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  No matching commands",
+                    palette.secondary(),
+                ))),
+                area,
+            );
+        }
+        return;
+    }
+    let selected = app.slash_selection.unwrap_or(0).min(matches.len() - 1);
+    let visible = (area.height as usize).clamp(1, SLASH_MATCH_LIMIT);
+    let start = selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(matches.len().saturating_sub(visible));
+    let command_width = matches
         .iter()
-        .take(area.height as usize)
-        .map(|command| {
-            Line::from(vec![
-                Span::styled("  ", Style::default()),
-                Span::styled(command.clone(), palette.secondary()),
-            ])
-        })
-        .collect::<Vec<_>>();
-    let paragraph = Paragraph::new(lines).style(palette.secondary());
-    frame.render_widget(paragraph, area);
+        .map(|entry| entry.command.chars().count())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(2)
+        .min(area.width.saturating_sub(6) as usize)
+        .max(6);
+    let mut lines = Vec::with_capacity(visible + 1);
+    for (position, entry) in matches.iter().enumerate().skip(start).take(visible) {
+        let prefix = if position == selected { "→ " } else { "  " };
+        let command = truncate_chars(&entry.command, command_width.saturating_sub(1));
+        let row = if entry.description.is_empty() || area.width <= 40 {
+            format!("{prefix}{command}")
+        } else {
+            let pad = command_width.saturating_sub(entry.command.chars().count());
+            let remaining = area.width as usize - prefix.chars().count() - command_width - 2;
+            let description = truncate_chars(&entry.description, remaining);
+            format!("{prefix}{command}{}{description}", " ".repeat(pad))
+        };
+        let style = if position == selected {
+            Style::default().fg(palette.accent)
+        } else {
+            palette.secondary()
+        };
+        lines.push(Line::from(Span::styled(row, style)));
+    }
+    if matches.len() > visible {
+        lines.push(Line::from(Span::styled(
+            format!("  ({}/{})", selected + 1, matches.len()),
+            palette.secondary(),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 pub(crate) fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp, palette: &ThemePalette) {

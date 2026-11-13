@@ -1252,6 +1252,40 @@ impl Remote {
         if bound("steer") {
             return self.enter(app, config, true).await;
         }
+        // The slash-command list navigates like upstream's autocomplete:
+        // arrows move its selection, Tab and Enter pick it, and Enter on the
+        // exact command submits instead. Typing resets the selection.
+        let slash_matches = crate::slash_command_matches(config, app);
+        if !slash_matches.is_empty() {
+            let selected = crate::slash_selected_match(app, config);
+            match key.code {
+                KeyCode::Up => {
+                    crate::slash_move_selection(app, config, -1);
+                    return Action::None;
+                }
+                KeyCode::Down => {
+                    crate::slash_move_selection(app, config, 1);
+                    return Action::None;
+                }
+                KeyCode::Tab => {
+                    if let Some((completion, _)) = selected {
+                        crate::apply_slash_completion(app, &completion);
+                    }
+                    return Action::None;
+                }
+                KeyCode::Enter => {
+                    let draft = app.input.trim().to_owned();
+                    let picked = selected
+                        .filter(|(completion, _)| draft != *completion)
+                        .map(|(completion, _)| completion);
+                    if let Some(completion) = picked {
+                        crate::apply_slash_completion(app, &completion);
+                        return Action::None;
+                    }
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc if app.turn_running => self.abort(),
             KeyCode::Esc => {
