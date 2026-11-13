@@ -881,6 +881,40 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "off": "none",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": null,
+        "max": "max"
+      },
+      "examples": [
+        "cloudflare-workers-ai/@cf/thinkingmachines/inkling-2-small",
+        "opencode/inkling-2-small-free"
+      ],
+      "supported": [
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
         "minimal": null,
         "low": "low",
         "medium": null,
@@ -1417,40 +1451,6 @@
         "low": "low",
         "medium": "medium",
         "high": "high",
-        "xhigh": null,
-        "max": "max"
-      },
-      "examples": [
-        "opencode/inkling-2-small-free",
-        "openrouter/thinkingmachines/inkling"
-      ],
-      "supported": [
-        "off",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "max"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "max",
-        "max": "max",
-        "invalid": "off"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": "none",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
         "xhigh": "xhigh",
         "max": null
       },
@@ -1808,6 +1808,7 @@
         "max": "max"
       },
       "examples": [
+        "openrouter/thinkingmachines/inkling-2-small",
         "openrouter/thinkingmachines/inkling-2-small:free"
       ],
       "supported": [
