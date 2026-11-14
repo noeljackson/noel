@@ -162,6 +162,14 @@ from `main`; Chord v2 has its own pin, `CHORD2_REFERENCE_REF`
 - Open: guests, and the security review before it is on by default
   (the owner's).
 
+### 12. Durable task model and Rust SDK (Planned, #210)
+- `crates/noel-durable`: a Harness a program embeds to build a harness
+  that is not the TUI, with Durable's task model (tasks, sleep and wake,
+  signals, tools that park, child tasks, documents, the task graph).
+  Reverses the audit's "wait" for the task model. Each slice is gated by
+  goldens from upstream's Durable examples and tests. Plan:
+  `docs/durable-sdk-2026-11.md`.
+
 ## Decisions pending
 
 - Plain `noel` through the server by default (`server.default`), once the
