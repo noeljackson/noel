@@ -891,7 +891,7 @@
       },
       "examples": [
         "cloudflare-workers-ai/@cf/thinkingmachines/inkling-2-small",
-        "opencode/inkling-2-small-free"
+        "huggingface/thinkingmachines/Inkling-2-Small"
       ],
       "supported": [
         "off",
