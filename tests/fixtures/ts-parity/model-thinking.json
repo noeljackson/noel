@@ -1768,6 +1768,37 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "off": "none",
+        "minimal": null,
+        "low": "low",
+        "medium": null,
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": null
+      },
+      "examples": [
+        "openrouter/qwen/qwen4-max"
+      ],
+      "supported": [
+        "off",
+        "low",
+        "high",
+        "xhigh"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "low",
+        "low": "low",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "xhigh",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
         "off": null,
         "minimal": null,
         "low": null,
