@@ -952,6 +952,12 @@ impl Remote {
 
     fn refresh_chrome(&mut self, app: &mut TuiApp, config: &LoadedConfig) {
         app.show_hardware_cursor = config.settings.show_hardware_cursor.unwrap_or(true);
+        // The session's thinking level colors the thinking entries'
+        // marker (upstream's thinkingOff..Max gradient).
+        app.thinking_level = self.view["docs"]["pi.agent"]["thinkingLevel"]
+            .as_str()
+            .unwrap_or("-")
+            .to_owned();
         let docs = &self.view["docs"];
         app.todos = serde_json::from_value(docs["noel.todos"]["items"].clone()).unwrap_or_default();
         let live = &docs["pi.live"];
