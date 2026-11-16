@@ -4786,3 +4786,66 @@ fn slash_list_renders_upstream_select_rows() {
         .join("\n");
     assert!(none.contains("No matching commands"), "{none}");
 }
+
+#[test]
+fn slash_list_fuzzy_matches_and_completes_arguments() {
+    let config = LoadedConfig {
+        paths: test_config_paths(),
+        settings: Settings::default(),
+        auth: AuthData::default(),
+        models: vec![ModelDefinition {
+            provider: "faux".to_owned(),
+            id: "script".to_owned(),
+            name: None,
+            api: ConfigProviderApi::Faux,
+            base_url: None,
+            context_window: None,
+            ..ModelDefinition::default()
+        }],
+        model_scope: Vec::new(),
+        image_models: Vec::new(),
+        keybindings: Vec::new(),
+        context_files: Vec::new(),
+        extensions: Vec::new(),
+        skills: Vec::new(),
+        agents: Vec::new(),
+        mcp_servers: Vec::new(),
+        prompt_templates: Vec::new(),
+        themes: Vec::new(),
+        diagnostics: Vec::new(),
+        system_prompt: None,
+        append_system_prompt: Vec::new(),
+    };
+    // Fuzzy: /mo finds /model by subsequence once no prefix matches.
+    let entries = slash_completion_entries(&config, "/mo");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.command.starts_with("/model")),
+        "{entries:?}"
+    );
+    // A scattered query still ranks: /thm finds /theme.
+    assert!(slash_completion_entries(&config, "/thm")
+        .iter()
+        .any(|entry| entry.command.starts_with("/theme")));
+
+    // Argument completion: /model lists selectable models.
+    let models = slash_completion_entries(&config, "/model ");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].command, "/model faux/script");
+    assert!(slash_completion_entries(&config, "/model fa").len() == 1);
+    assert!(slash_completion_entries(&config, "/model zz").is_empty());
+
+    // /thinking lists the level names.
+    let levels = slash_completion_entries(&config, "/thinking ");
+    assert!(levels.len() > 1, "{levels:?}");
+    assert!(levels
+        .iter()
+        .all(|entry| entry.command.starts_with("/thinking ")));
+
+    // Other commands with an argument keep their own completions
+    // (/theme kimi is a prefix match, not intercepted).
+    assert!(slash_completion_entries(&config, "/theme k")
+        .iter()
+        .any(|entry| entry.command == "/theme kimi"));
+}

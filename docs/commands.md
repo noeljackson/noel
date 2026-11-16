@@ -101,7 +101,11 @@ on the selected row, Up/Down to move the selection (wrapping, and taking
 precedence over history recall while the list is visible), Tab to accept it,
 and Enter to accept it unless the draft is already the exact command, in which
 case Enter runs it. Accepting fills the command head and a space, ready for
-arguments; typing more narrows the list and a filter with no matches says so.
+arguments. A filter with no prefix matches fuzzy-matches instead (every query
+character in order, as upstream's autocomplete), and `/model` and `/thinking`
+list their arguments - the selectable models and the thinking levels - as soon
+as the space after the command is typed. A filter with no matches at all says
+so.
 Multiline pastes (or single-line pastes over
 1,000 characters) collapse to numbered markers such as
 `[paste #1 +500 lines]`. Left/Right skip a marker and

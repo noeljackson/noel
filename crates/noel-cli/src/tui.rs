@@ -2891,49 +2891,146 @@ pub(crate) fn slash_completion_entries(config: &LoadedConfig, prefix: &str) -> V
                 .map(|help| help.description)
                 .unwrap_or("");
             SlashMatch::new(command, description)
-        });
+        })
+        .collect::<Vec<_>>();
     let extensions = resource_command_completions(prefix, "/extension:", &config.extensions)
         .into_iter()
-        .map(|command| SlashMatch::new(command, "[u] extension"));
+        .map(|command| SlashMatch::new(command, "[u] extension"))
+        .collect::<Vec<_>>();
     let resources = resource_commands::completion_entries(config, prefix)
         .into_iter()
-        .map(|(command, description)| SlashMatch::new(command, description));
-    let templates = config.prompt_templates.iter().map(|template| {
-        SlashMatch::new(
-            format!("/prompt {}", template.name),
-            resource_commands::template_detail(template),
-        )
-    });
-    let themes = theme_names(config).into_iter().map(|name| {
-        SlashMatch::new(
-            format!("/theme {name}"),
-            if TerminalTheme::builtin(&name).is_some() {
-                "built-in theme".to_string()
-            } else {
-                "[u] theme resource".to_string()
-            },
-        )
-    });
+        .map(|(command, description)| SlashMatch::new(command, description))
+        .collect::<Vec<_>>();
+    let templates = config
+        .prompt_templates
+        .iter()
+        .map(|template| {
+            SlashMatch::new(
+                format!("/prompt {}", template.name),
+                resource_commands::template_detail(template),
+            )
+        })
+        .collect::<Vec<_>>();
+    let themes = theme_names(config)
+        .into_iter()
+        .map(|name| {
+            SlashMatch::new(
+                format!("/theme {name}"),
+                if TerminalTheme::builtin(&name).is_some() {
+                    "built-in theme".to_string()
+                } else {
+                    "[u] theme resource".to_string()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     let models = ["refresh", "reset"]
         .into_iter()
-        .map(|sub| SlashMatch::new(format!("/models {sub}"), "model catalog"));
+        .map(|sub| SlashMatch::new(format!("/models {sub}"), "model catalog"))
+        .collect::<Vec<_>>();
     let accents = [
         "auto", "cyan", "blue", "magenta", "green", "yellow", "red", "default",
     ]
     .into_iter()
-    .map(|color| SlashMatch::new(format!("/accent {color}"), "accent color"));
+    .map(|color| SlashMatch::new(format!("/accent {color}"), "accent color"))
+    .collect::<Vec<_>>();
     let mut matches: Vec<SlashMatch> = builtin
-        .chain(extensions)
-        .chain(resources)
-        .chain(templates)
-        .chain(themes)
-        .chain(models)
-        .chain(accents)
+        .iter()
+        .chain(&extensions)
+        .chain(&resources)
+        .chain(&templates)
+        .chain(&themes)
+        .chain(&models)
+        .chain(&accents)
         .filter(|entry| entry.command.starts_with(prefix))
+        .cloned()
         .collect();
     matches.sort_by(|a, b| a.command.cmp(&b.command));
     matches.dedup_by(|a, b| a.command == b.command);
+
+    // Argument completion (upstream's getArgumentCompletions): a draft
+    // past the command head lists the arguments that command takes -
+    // /model the selectable models, /thinking the level names - kept
+    // when they prefix-match the argument text.
+    // A command with argument completion takes over as soon as the
+    // draft names it, an empty argument included (upstream completes
+    // /model with the list of models the moment the space is typed).
+    if let Some((command, argument)) = split_slash_input(prefix)
+        && matches!(command.as_str(), "model" | "thinking")
+    {
+        let argument_matches: Vec<SlashMatch> = match command.as_str() {
+            "model" => model_select::selectable_models(config, true)
+                .into_iter()
+                .map(|model| {
+                    SlashMatch::new(
+                        format!("/model {}/{}", model.provider, model.id),
+                        "selectable model",
+                    )
+                })
+                .collect(),
+            "thinking" => noel_config::THINKING_LEVELS
+                .iter()
+                .map(|level| SlashMatch::new(format!("/thinking {level}"), "thinking level"))
+                .collect(),
+            _ => Vec::new(),
+        };
+        return argument_matches
+            .into_iter()
+            .filter(|entry| argument.is_empty() || entry.command.starts_with(prefix))
+            .collect();
+    }
+
+    // Upstream's autocomplete fuzzy-matches when nothing prefix-matches:
+    // every query character in order (its fuzzy.ts), the command head
+    // scored on its bare name (a skill also matches without skill:).
+    // Exact matches keep their alphabetical order first.
+    if matches.is_empty()
+        && let Some((command, argument)) = split_slash_input(prefix)
+    {
+        let all: Vec<SlashMatch> = builtin
+            .iter()
+            .chain(&extensions)
+            .chain(&resources)
+            .chain(&templates)
+            .chain(&themes)
+            .chain(&models)
+            .chain(&accents)
+            .cloned()
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut unique: Vec<SlashMatch> = all
+            .into_iter()
+            .filter(|entry| seen.insert(entry.command.clone()))
+            .collect();
+        let query = if argument.is_empty() {
+            command.clone()
+        } else {
+            format!("{command} {argument}")
+        };
+        unique = noel_tui::fuzzy_filter(unique, &query, |entry| {
+            let head_end = entry.command.find(' ').unwrap_or(entry.command.len());
+            let entry_head = &entry.command[..head_end];
+            let bare = entry_head
+                .strip_prefix("/skill:")
+                .unwrap_or(entry_head.trim_start_matches('/'));
+            bare.to_owned()
+        });
+        return unique
+            .into_iter()
+            .take(SLASH_MATCH_LIMIT)
+            .collect::<Vec<_>>();
+    }
     matches
+}
+
+/// A `/command argument` draft split into its head (without the slash)
+/// and the argument text after the first space.
+pub(crate) fn split_slash_input(input: &str) -> Option<(String, String)> {
+    let text = input.strip_prefix('/')?;
+    match text.split_once(' ') {
+        Some((command, argument)) => Some((command.to_owned(), argument.to_owned())),
+        None => Some((text.to_owned(), String::new())),
+    }
 }
 
 /// Moves the slash list's selection by `delta`, wrapping as upstream's

@@ -1,4 +1,6 @@
+mod fuzzy;
 mod oklab;
+pub use fuzzy::{fuzzy_filter, fuzzy_match};
 pub use oklab::Rgb;
 mod system_theme;
 mod terminal_colors;
