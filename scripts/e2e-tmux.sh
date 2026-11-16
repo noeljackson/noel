@@ -467,22 +467,37 @@ quit_noel
 pane_output="$(tmux capture-pane -t "${session_name}" -p -S -2000 2>/dev/null || true)"
 printf '%s\n' "${pane_output}" > "${work_dir}/pane.txt"
 
+# The session is gone (quit_noel above); the pane's scrollback keeps its
+# output. A late render can still be flushing under load, so the pane is
+# recaptured briefly before an assertion fails (like wait_for, not the
+# one-shot grep that flaked under load >100).
+pane_poll() {
+  pane_output="$(tmux capture-pane -t "${session_name}" -p -S -2000 2>/dev/null || true)"
+  printf '%s\n' "${pane_output}" > "${work_dir}/pane.txt"
+}
+
 require_output() {
   local expected="$1"
-  if ! grep -Fq "${expected}" "${work_dir}/pane.txt"; then
-    cat "${work_dir}/pane.txt" >&2
-    echo "missing expected pane output: ${expected}" >&2
-    exit 1
-  fi
+  for _ in $(seq 1 100); do
+    grep -Fq "${expected}" "${work_dir}/pane.txt" && return
+    pane_poll
+    sleep 0.05
+  done
+  cat "${work_dir}/pane.txt" >&2
+  echo "missing expected pane output: ${expected}" >&2
+  exit 1
 }
 
 require_output_regex() {
   local pattern="$1"
-  if ! grep -Eq "${pattern}" "${work_dir}/pane.txt"; then
-    cat "${work_dir}/pane.txt" >&2
-    echo "missing expected pane output matching: ${pattern}" >&2
-    exit 1
-  fi
+  for _ in $(seq 1 100); do
+    grep -Eq "${pattern}" "${work_dir}/pane.txt" && return
+    pane_poll
+    sleep 0.05
+  done
+  cat "${work_dir}/pane.txt" >&2
+  echo "missing expected pane output matching: ${pattern}" >&2
+  exit 1
 }
 
 require_output "noel rust cli"
