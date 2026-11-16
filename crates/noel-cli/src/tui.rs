@@ -515,6 +515,9 @@ pub(crate) struct TuiApp {
     /// reported colors, once its color query replies. Only a draw that
     /// resolves the theme to `system` uses it.
     pub(crate) system_palette: Option<noel_tui::ThemePalette>,
+    /// The session's thinking level, as the footer shows it; colors the
+    /// thinking entries' marker through the theme's gradient.
+    pub(crate) thinking_level: String,
 }
 
 /// What covers the input: a multiline prompt being typed, a selector, or
@@ -1150,11 +1153,12 @@ pub(crate) fn pending_entry_rows(
     palette: &ThemePalette,
     state: &PreviewState,
     progress: EntryScrollback,
+    thinking_level: &str,
 ) -> Vec<TranscriptRow> {
     if progress.complete {
         return Vec::new();
     }
-    let mut logical = render_entry_lines(std::slice::from_ref(entry), palette);
+    let mut logical = render_entry_lines(std::slice::from_ref(entry), palette, thinking_level);
     if logical.is_empty() {
         return Vec::new();
     }
@@ -1193,7 +1197,11 @@ pub(crate) fn pending_entry_rows(
             entry,
             |line| logical_lines.get(line).cloned(),
             base,
-            palette.accent,
+            MarkdownColors {
+                accent: palette.md_code(),
+                heading: palette.md_heading(),
+                link: palette.md_link(),
+            },
         );
     }
     let limit = if entry.kind == TuiEntryKind::Thinking {
@@ -1314,7 +1322,15 @@ pub(crate) fn transcript_overflow(
             continue;
         }
         let progress = app.transcript_scrollback.entries[index];
-        let rows = pending_entry_rows(entry, index, area.width as usize, palette, &state, progress);
+        let rows = pending_entry_rows(
+            entry,
+            index,
+            area.width as usize,
+            palette,
+            &state,
+            progress,
+            app.thinking_level.as_str(),
+        );
         height += rows.len();
         if !rows.is_empty() {
             chunks.push((index, rows));
@@ -1471,6 +1487,20 @@ pub(crate) fn visible_transcript_with_thinking(
     hide_thinking: bool,
     palette: &ThemePalette,
 ) -> VisibleTranscript {
+    visible_transcript_with_thinking_level(entries, width, height, hide_thinking, palette, "")
+}
+
+/// [`visible_transcript_with_thinking`] with the session's thinking
+/// level, which colors the thinking markers.
+#[cfg(test)]
+pub(crate) fn visible_transcript_with_thinking_level(
+    entries: &[TuiEntry],
+    width: usize,
+    height: u16,
+    hide_thinking: bool,
+    palette: &ThemePalette,
+    thinking_level: &str,
+) -> VisibleTranscript {
     visible_transcript_with_previews(
         entries,
         width,
@@ -1478,6 +1508,7 @@ pub(crate) fn visible_transcript_with_thinking(
         hide_thinking,
         palette,
         PreviewState::default(),
+        thinking_level,
     )
 }
 
@@ -1513,6 +1544,7 @@ pub(crate) fn preview_entry(
         palette,
         state,
         EntryScrollback::default(),
+        "",
     )
     .into_iter()
     .map(|row| row.line)
@@ -1527,10 +1559,21 @@ pub(crate) fn visible_transcript_with_previews(
     hide_thinking: bool,
     palette: &ThemePalette,
     state: PreviewState,
+    thinking_level: &str,
 ) -> VisibleTranscript {
-    visible_pending_transcript(entries, width, height, hide_thinking, palette, state, &[])
+    visible_pending_transcript(
+        entries,
+        width,
+        height,
+        hide_thinking,
+        palette,
+        state,
+        &[],
+        thinking_level,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn visible_pending_transcript(
     entries: &[TuiEntry],
     width: usize,
@@ -1539,6 +1582,7 @@ pub(crate) fn visible_pending_transcript(
     palette: &ThemePalette,
     state: PreviewState,
     archived: &[EntryScrollback],
+    thinking_level: &str,
 ) -> VisibleTranscript {
     let width = width.max(1);
     let target_height = height.saturating_add(TRANSCRIPT_RENDER_OVERSCAN_ROWS) as usize;
@@ -1555,10 +1599,18 @@ pub(crate) fn visible_pending_transcript(
         if progress.complete {
             continue;
         }
-        let mut chunk = pending_entry_rows(entry, index, width, palette, &state, progress)
-            .into_iter()
-            .map(|row| row.line)
-            .collect::<Vec<_>>();
+        let mut chunk = pending_entry_rows(
+            entry,
+            index,
+            width,
+            palette,
+            &state,
+            progress,
+            thinking_level,
+        )
+        .into_iter()
+        .map(|row| row.line)
+        .collect::<Vec<_>>();
         if chunks.is_empty() {
             while chunk.last().map(Line::width) == Some(0) {
                 chunk.pop();
@@ -1973,13 +2025,13 @@ pub(crate) fn colorized_diff_line(line: &str, palette: &ThemePalette) -> Line<'s
     let style = if line.starts_with("+++") || line.starts_with("---") {
         palette.secondary()
     } else if line.starts_with('+') {
-        Style::default().fg(palette.success)
+        Style::default().fg(palette.diff_added())
     } else if line.starts_with('-') {
-        Style::default().fg(palette.error)
+        Style::default().fg(palette.diff_removed())
     } else if line.starts_with("@@") {
         Style::default().fg(palette.accent)
     } else {
-        Style::default()
+        Style::default().fg(palette.diff_context())
     };
     Line::from(line.to_string()).style(style)
 }
@@ -2052,6 +2104,7 @@ pub(crate) fn draw_transcript(
         palette,
         transcript_preview_state(app),
         &app.transcript_scrollback.entries,
+        app.thinking_level.as_str(),
     );
     if visible.lines.is_empty() {
         return;
@@ -2066,8 +2119,10 @@ pub(crate) fn draw_transcript(
 pub(crate) fn render_entry_lines(
     entries: &[TuiEntry],
     palette: &ThemePalette,
+    thinking_level: &str,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let thinking_marker = Style::default().fg(palette.thinking(thinking_level));
     for entry in entries {
         match entry.kind {
             TuiEntryKind::Thinking if entry.text.is_empty() => continue,
@@ -2075,7 +2130,7 @@ pub(crate) fn render_entry_lines(
                 &mut lines,
                 "thinking",
                 &entry.text,
-                palette.secondary(),
+                thinking_marker,
                 palette.secondary().add_modifier(Modifier::ITALIC),
             ),
             TuiEntryKind::Tool => push_tool_lines(&mut lines, &entry.text, palette),
@@ -2139,13 +2194,23 @@ pub(crate) fn push_marked_lines(
 /// styles change. Links are the exception — their display text is the link
 /// label only — so a link row's display differs from its source slice and
 /// selection copies the raw markdown, like folded tool previews.
+/// The markdown restyler's colors: the accent for code and bars, with
+/// heading and link overrides from the theme's md roles.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MarkdownColors {
+    pub(crate) accent: ratatui::style::Color,
+    pub(crate) heading: ratatui::style::Color,
+    pub(crate) link: ratatui::style::Color,
+}
+
 pub(crate) fn restyle_rows_with_markdown(
     rows: &mut [TranscriptRow],
     entry: &TuiEntry,
     logical_source_line: impl Fn(usize) -> Option<String>,
     base: Style,
-    accent: ratatui::style::Color,
+    md: MarkdownColors,
 ) {
+    let accent = md.accent;
     if entry.kind != TuiEntryKind::Assistant {
         return;
     }
@@ -2211,7 +2276,7 @@ pub(crate) fn restyle_rows_with_markdown(
             }
             let lines = rendered.render();
             if *next < lines.len() {
-                row.line = table_line(&lines[*next], base, accent);
+                row.line = table_line(&lines[*next], base, accent, md.link);
                 *next += 1;
                 continue;
             }
@@ -2227,7 +2292,7 @@ pub(crate) fn restyle_rows_with_markdown(
             row.line = if visible.trim().is_empty() {
                 Line::from(Span::styled(String::new(), base))
             } else {
-                Line::from(styled_spans(&visible, base, accent))
+                Line::from(styled_spans_with_link(&visible, base, accent, md.link))
             };
             continue;
         }
@@ -2276,7 +2341,7 @@ pub(crate) fn restyle_rows_with_markdown(
             let rendered = parsed.render();
             table = Some((parsed, 1));
             if let Some(segments) = rendered.first() {
-                row.line = table_line(segments, base, accent);
+                row.line = table_line(segments, base, accent, md.link);
             }
             continue;
         }
@@ -2337,7 +2402,7 @@ pub(crate) fn restyle_rows_with_markdown(
             }
             markdown::BlockKind::Heading(level) => {
                 let content = heading_content(&kind, classify_target);
-                let style = base.add_modifier(Modifier::BOLD).fg(accent);
+                let style = base.add_modifier(Modifier::BOLD).fg(md.heading);
                 row.line = Line::from(vec![Span::styled(
                     format!("{}{content}", " ".repeat(*level as usize)),
                     style,
@@ -2354,11 +2419,16 @@ pub(crate) fn restyle_rows_with_markdown(
                     base
                 };
                 let mut spans = vec![Span::styled(render.prefix.clone(), marker_style)];
-                spans.extend(styled_spans(content.trim_start(), marker_style, accent));
+                spans.extend(styled_spans_with_link(
+                    content.trim_start(),
+                    marker_style,
+                    accent,
+                    md.link,
+                ));
                 row.line = Line::from(spans);
             }
             markdown::BlockKind::Plain => {
-                let spans = styled_spans(row_text, base, accent);
+                let spans = styled_spans_with_link(row_text, base, accent, md.link);
                 row.line = Line::from(spans);
             }
         }
@@ -2397,6 +2467,7 @@ fn table_line(
     segments: &[markdown::TableSegment],
     base: Style,
     accent: ratatui::style::Color,
+    link: ratatui::style::Color,
 ) -> Line<'static> {
     let mut spans = Vec::new();
     for segment in segments {
@@ -2411,17 +2482,18 @@ fn table_line(
                 base.add_modifier(Modifier::BOLD),
             ));
         } else {
-            spans.extend(styled_spans(&segment.text, base, accent));
+            spans.extend(styled_spans_with_link(&segment.text, base, accent, link));
         }
     }
     Line::from(spans)
 }
 
 /// Convert one markdown line to styled spans over its plain base style.
-pub(crate) fn styled_spans(
+pub(crate) fn styled_spans_with_link(
     line: &str,
     base: Style,
     accent: ratatui::style::Color,
+    md_link: ratatui::style::Color,
 ) -> Vec<Span<'static>> {
     markdown::parse_inline_line(line)
         .into_iter()
@@ -2431,7 +2503,7 @@ pub(crate) fn styled_spans(
                 // base first: the markdown style's fg/modifiers must win over
                 // the plain base (base.fg is Some(Reset) and would otherwise
                 // mask the accent color via patch).
-                other => base.patch(markdown::ratatui_style(other, accent)),
+                other => base.patch(markdown::ratatui_style_with_link(other, accent, md_link)),
             };
             Span::styled(span.display, style)
         })
@@ -2463,16 +2535,24 @@ pub(crate) fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str, palett
     let highlight = Style::default()
         .fg(palette.accent)
         .add_modifier(Modifier::BOLD);
-    let mut spans = vec![Span::styled(
-        if failed { "✗ " } else { "● " },
-        if failed {
-            Style::default().fg(palette.error)
-        } else if running {
-            palette.secondary()
-        } else {
-            Style::default().fg(palette.success)
-        },
-    )];
+    // The status tint (upstream's toolPending/Success/ErrorBg) washes
+    // the marker and the header line; Reset keeps today's plain rows.
+    let phase = if failed {
+        noel_tui::ToolPhase::Error
+    } else if running {
+        noel_tui::ToolPhase::Pending
+    } else {
+        noel_tui::ToolPhase::Success
+    };
+    let tint = palette.tool_bg(phase);
+    let marker = if failed {
+        Style::default().fg(palette.error)
+    } else if running {
+        palette.secondary()
+    } else {
+        Style::default().fg(palette.success)
+    };
+    let mut spans = vec![Span::styled(if failed { "✗ " } else { "● " }, marker)];
     if name == "bash" {
         spans.push(Span::styled(
             if failed {
@@ -2521,6 +2601,14 @@ pub(crate) fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str, palett
             palette.secondary(),
         ));
     }
+    let spans = if tint != ratatui::style::Color::Reset {
+        spans
+            .into_iter()
+            .map(|span| Span::styled(span.content, span.style.bg(tint)))
+            .collect::<Vec<_>>()
+    } else {
+        spans
+    };
     lines.push(Line::from(spans));
     for line in output.lines() {
         lines.push(Line::from(Span::styled(
@@ -2803,49 +2891,146 @@ pub(crate) fn slash_completion_entries(config: &LoadedConfig, prefix: &str) -> V
                 .map(|help| help.description)
                 .unwrap_or("");
             SlashMatch::new(command, description)
-        });
+        })
+        .collect::<Vec<_>>();
     let extensions = resource_command_completions(prefix, "/extension:", &config.extensions)
         .into_iter()
-        .map(|command| SlashMatch::new(command, "[u] extension"));
+        .map(|command| SlashMatch::new(command, "[u] extension"))
+        .collect::<Vec<_>>();
     let resources = resource_commands::completion_entries(config, prefix)
         .into_iter()
-        .map(|(command, description)| SlashMatch::new(command, description));
-    let templates = config.prompt_templates.iter().map(|template| {
-        SlashMatch::new(
-            format!("/prompt {}", template.name),
-            resource_commands::template_detail(template),
-        )
-    });
-    let themes = theme_names(config).into_iter().map(|name| {
-        SlashMatch::new(
-            format!("/theme {name}"),
-            if TerminalTheme::builtin(&name).is_some() {
-                "built-in theme".to_string()
-            } else {
-                "[u] theme resource".to_string()
-            },
-        )
-    });
+        .map(|(command, description)| SlashMatch::new(command, description))
+        .collect::<Vec<_>>();
+    let templates = config
+        .prompt_templates
+        .iter()
+        .map(|template| {
+            SlashMatch::new(
+                format!("/prompt {}", template.name),
+                resource_commands::template_detail(template),
+            )
+        })
+        .collect::<Vec<_>>();
+    let themes = theme_names(config)
+        .into_iter()
+        .map(|name| {
+            SlashMatch::new(
+                format!("/theme {name}"),
+                if TerminalTheme::builtin(&name).is_some() {
+                    "built-in theme".to_string()
+                } else {
+                    "[u] theme resource".to_string()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     let models = ["refresh", "reset"]
         .into_iter()
-        .map(|sub| SlashMatch::new(format!("/models {sub}"), "model catalog"));
+        .map(|sub| SlashMatch::new(format!("/models {sub}"), "model catalog"))
+        .collect::<Vec<_>>();
     let accents = [
         "auto", "cyan", "blue", "magenta", "green", "yellow", "red", "default",
     ]
     .into_iter()
-    .map(|color| SlashMatch::new(format!("/accent {color}"), "accent color"));
+    .map(|color| SlashMatch::new(format!("/accent {color}"), "accent color"))
+    .collect::<Vec<_>>();
     let mut matches: Vec<SlashMatch> = builtin
-        .chain(extensions)
-        .chain(resources)
-        .chain(templates)
-        .chain(themes)
-        .chain(models)
-        .chain(accents)
+        .iter()
+        .chain(&extensions)
+        .chain(&resources)
+        .chain(&templates)
+        .chain(&themes)
+        .chain(&models)
+        .chain(&accents)
         .filter(|entry| entry.command.starts_with(prefix))
+        .cloned()
         .collect();
     matches.sort_by(|a, b| a.command.cmp(&b.command));
     matches.dedup_by(|a, b| a.command == b.command);
+
+    // Argument completion (upstream's getArgumentCompletions): a draft
+    // past the command head lists the arguments that command takes -
+    // /model the selectable models, /thinking the level names - kept
+    // when they prefix-match the argument text.
+    // A command with argument completion takes over as soon as the
+    // draft names it, an empty argument included (upstream completes
+    // /model with the list of models the moment the space is typed).
+    if let Some((command, argument)) = split_slash_input(prefix)
+        && matches!(command.as_str(), "model" | "thinking")
+    {
+        let argument_matches: Vec<SlashMatch> = match command.as_str() {
+            "model" => model_select::selectable_models(config, true)
+                .into_iter()
+                .map(|model| {
+                    SlashMatch::new(
+                        format!("/model {}/{}", model.provider, model.id),
+                        "selectable model",
+                    )
+                })
+                .collect(),
+            "thinking" => noel_config::THINKING_LEVELS
+                .iter()
+                .map(|level| SlashMatch::new(format!("/thinking {level}"), "thinking level"))
+                .collect(),
+            _ => Vec::new(),
+        };
+        return argument_matches
+            .into_iter()
+            .filter(|entry| argument.is_empty() || entry.command.starts_with(prefix))
+            .collect();
+    }
+
+    // Upstream's autocomplete fuzzy-matches when nothing prefix-matches:
+    // every query character in order (its fuzzy.ts), the command head
+    // scored on its bare name (a skill also matches without skill:).
+    // Exact matches keep their alphabetical order first.
+    if matches.is_empty()
+        && let Some((command, argument)) = split_slash_input(prefix)
+    {
+        let all: Vec<SlashMatch> = builtin
+            .iter()
+            .chain(&extensions)
+            .chain(&resources)
+            .chain(&templates)
+            .chain(&themes)
+            .chain(&models)
+            .chain(&accents)
+            .cloned()
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut unique: Vec<SlashMatch> = all
+            .into_iter()
+            .filter(|entry| seen.insert(entry.command.clone()))
+            .collect();
+        let query = if argument.is_empty() {
+            command.clone()
+        } else {
+            format!("{command} {argument}")
+        };
+        unique = noel_tui::fuzzy_filter(unique, &query, |entry| {
+            let head_end = entry.command.find(' ').unwrap_or(entry.command.len());
+            let entry_head = &entry.command[..head_end];
+            let bare = entry_head
+                .strip_prefix("/skill:")
+                .unwrap_or(entry_head.trim_start_matches('/'));
+            bare.to_owned()
+        });
+        return unique
+            .into_iter()
+            .take(SLASH_MATCH_LIMIT)
+            .collect::<Vec<_>>();
+    }
     matches
+}
+
+/// A `/command argument` draft split into its head (without the slash)
+/// and the argument text after the first space.
+pub(crate) fn split_slash_input(input: &str) -> Option<(String, String)> {
+    let text = input.strip_prefix('/')?;
+    match text.split_once(' ') {
+        Some((command, argument)) => Some((command.to_owned(), argument.to_owned())),
+        None => Some((text.to_owned(), String::new())),
+    }
 }
 
 /// Moves the slash list's selection by `delta`, wrapping as upstream's

@@ -581,9 +581,14 @@ additionally accepts a `light/dark` pair; `--no-themes` starts with native
 colors and no accent override.
 
 Custom resources in `themes/` or trusted `.noel/themes/` use their filename stem
-as the theme name. They can extend a built-in preset and override any of
-`foreground`, `background`, `surface`, `muted`, `border`, `accent`, `success`,
-`warning`, and `error`:
+as the theme name. They can extend a built-in preset and override any base role
+(`foreground`, `background`, `surface`, `muted`, `border`, `accent`, `success`,
+`warning`, `error`) or any extended role: the thinking gradient
+(`thinkingOff`..`thinkingMax`), tool status tints (`toolPendingBg`,
+`toolSuccessBg`, `toolErrorBg`), diffs (`diffAdded`, `diffRemoved`,
+`diffContext`), and markdown (`mdHeading`, `mdLink`, `mdCode`, `mdQuote`).
+An unset role falls back to its base role, so a theme that overrides only
+`accent` renders as before:
 
 ```json
 {

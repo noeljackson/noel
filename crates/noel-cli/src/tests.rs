@@ -152,7 +152,7 @@ fn assistant_markdown_renders_styled_spans_but_plain_logical_lines() {
     let palette = ThemePalette::default();
     // Logical lines (selection/copy source) stay plain and complete,
     // including the markdown syntax and link URL.
-    let logical = render_entry_lines(std::slice::from_ref(&entry), &palette);
+    let logical = render_entry_lines(std::slice::from_ref(&entry), &palette, "");
     let logical_text: Vec<String> = logical
         .iter()
         .map(|line| {
@@ -178,6 +178,7 @@ fn assistant_markdown_renders_styled_spans_but_plain_logical_lines() {
         &palette,
         &PreviewState::default(),
         EntryScrollback::default(),
+        "",
     );
     let anchor_starts: Vec<TranscriptPosition> = rows.iter().map(|row| row.start).collect();
     restyle_rows_with_markdown(
@@ -185,7 +186,11 @@ fn assistant_markdown_renders_styled_spans_but_plain_logical_lines() {
         &entry,
         |line| logical_text.get(line).cloned(),
         Style::default().fg(palette.foreground),
-        palette.accent,
+        MarkdownColors {
+            accent: palette.accent,
+            heading: palette.accent,
+            link: palette.accent,
+        },
     );
     // Anchors identical after restyling.
     assert_eq!(
@@ -236,7 +241,7 @@ fn ordered_lists_display_sequential_numbers() {
             .to_string(),
     };
     let palette = ThemePalette::default();
-    let logical = render_entry_lines(std::slice::from_ref(&entry), &palette);
+    let logical = render_entry_lines(std::slice::from_ref(&entry), &palette, "");
     let logical_text: Vec<String> = logical
         .iter()
         .map(|line| {
@@ -253,13 +258,18 @@ fn ordered_lists_display_sequential_numbers() {
         &palette,
         &PreviewState::default(),
         EntryScrollback::default(),
+        "",
     );
     restyle_rows_with_markdown(
         &mut rows,
         &entry,
         |line| logical_text.get(line).cloned(),
         Style::default().fg(palette.foreground),
-        palette.accent,
+        MarkdownColors {
+            accent: palette.accent,
+            heading: palette.accent,
+            link: palette.accent,
+        },
     );
     let display: Vec<String> = rows
         .iter()
@@ -2488,6 +2498,7 @@ fn thinking_is_dimmed_and_separate_from_answer() {
             },
         ],
         &ThemePalette::default(),
+        "",
     );
     let summary = lines
         .iter()
@@ -2501,7 +2512,8 @@ fn thinking_is_dimmed_and_separate_from_answer() {
             kind: TuiEntryKind::Thinking,
             text: String::new()
         }],
-        &ThemePalette::default()
+        &ThemePalette::default(),
+        ""
     )
     .is_empty());
 }
@@ -2520,6 +2532,7 @@ fn transcript_lines_drop_trailing_entry_spacer_for_viewport() {
             text: "done".to_string(),
         }],
         &ThemePalette::default(),
+        "",
     );
     while lines.last().map(Line::width) == Some(0) {
         lines.pop();
@@ -2610,7 +2623,7 @@ fn scrollback_watermarks_survive_rewrap_and_appending_to_a_partial_line() {
         // logical painted text using the watermark rather than row counts.
         let watermark = app.transcript_scrollback.entries[entry].position;
         assert!(watermark >= before);
-        let all = render_entry_lines(&app.entries, &ThemePalette::default());
+        let all = render_entry_lines(&app.entries, &ThemePalette::default(), "");
         let pending = pending_entry_rows(
             &app.entries[entry],
             entry,
@@ -2618,6 +2631,7 @@ fn scrollback_watermarks_survive_rewrap_and_appending_to_a_partial_line() {
             &ThemePalette::default(),
             &PreviewState::default(),
             app.transcript_scrollback.entries[entry],
+            "",
         );
         assert_eq!(
             pending
@@ -4064,6 +4078,7 @@ fn compact_command_header_keeps_line_count_and_full_command_is_expandable() {
             position: TranscriptPosition { line: 2, byte: 1 },
             complete: false,
         },
+        "",
     );
     assert_eq!(line_text(&pending[0].line), "  … final result");
 }
@@ -4114,7 +4129,7 @@ fn tool_label_styles_are_segmented_and_previews_keep_final_output_line() {
         kind: TuiEntryKind::Tool,
         text: "completed read\nsrc/main.rs\nfirst\nsecond\nthird\nfourth\nfifth".into(),
     };
-    let lines = render_entry_lines(std::slice::from_ref(&entry), &palette);
+    let lines = render_entry_lines(std::slice::from_ref(&entry), &palette, "");
     let spans = &lines[0].spans;
     assert_eq!(spans[0].style.fg, Some(palette.success));
     assert_eq!(spans[1].content, "Used ");
@@ -4770,4 +4785,67 @@ fn slash_list_renders_upstream_select_rows() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(none.contains("No matching commands"), "{none}");
+}
+
+#[test]
+fn slash_list_fuzzy_matches_and_completes_arguments() {
+    let config = LoadedConfig {
+        paths: test_config_paths(),
+        settings: Settings::default(),
+        auth: AuthData::default(),
+        models: vec![ModelDefinition {
+            provider: "faux".to_owned(),
+            id: "script".to_owned(),
+            name: None,
+            api: ConfigProviderApi::Faux,
+            base_url: None,
+            context_window: None,
+            ..ModelDefinition::default()
+        }],
+        model_scope: Vec::new(),
+        image_models: Vec::new(),
+        keybindings: Vec::new(),
+        context_files: Vec::new(),
+        extensions: Vec::new(),
+        skills: Vec::new(),
+        agents: Vec::new(),
+        mcp_servers: Vec::new(),
+        prompt_templates: Vec::new(),
+        themes: Vec::new(),
+        diagnostics: Vec::new(),
+        system_prompt: None,
+        append_system_prompt: Vec::new(),
+    };
+    // Fuzzy: /mo finds /model by subsequence once no prefix matches.
+    let entries = slash_completion_entries(&config, "/mo");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.command.starts_with("/model")),
+        "{entries:?}"
+    );
+    // A scattered query still ranks: /thm finds /theme.
+    assert!(slash_completion_entries(&config, "/thm")
+        .iter()
+        .any(|entry| entry.command.starts_with("/theme")));
+
+    // Argument completion: /model lists selectable models.
+    let models = slash_completion_entries(&config, "/model ");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].command, "/model faux/script");
+    assert!(slash_completion_entries(&config, "/model fa").len() == 1);
+    assert!(slash_completion_entries(&config, "/model zz").is_empty());
+
+    // /thinking lists the level names.
+    let levels = slash_completion_entries(&config, "/thinking ");
+    assert!(levels.len() > 1, "{levels:?}");
+    assert!(levels
+        .iter()
+        .all(|entry| entry.command.starts_with("/thinking ")));
+
+    // Other commands with an argument keep their own completions
+    // (/theme kimi is a prefix match, not intercepted).
+    assert!(slash_completion_entries(&config, "/theme k")
+        .iter()
+        .any(|entry| entry.command == "/theme kimi"));
 }

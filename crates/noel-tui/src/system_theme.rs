@@ -123,10 +123,10 @@ fn family(name: &str) -> &'static Family {
 
 /// The palette slot a role's source token reads (upstream TOKEN_SLOTS).
 fn slot_of(role: Role) -> usize {
-    match role {
+    role.slot_override().unwrap_or(match role {
         Role::Warning => 3,
         _ => family(role.family_name()).slot,
-    }
+    })
 }
 
 /// Target-lightness curves: a polynomial in the surface's OKLab
@@ -166,6 +166,34 @@ const LEVELS: &[(&str, &[(TerminalAppearance, Curve); 2])] = &[
         (TerminalAppearance::Dark, curve([0.7303, 0.07695, -1.31626, 7.1681, -10.14436, 4.92846], (0.0, 0.712))),
         (TerminalAppearance::Light, curve([-4948.31942, 26870.91986, -58334.48399, 63280.17197, -34298.01053, 7430.30146], (0.811, 1.0))),
     ]),
+    ("thinking0", &[
+        (TerminalAppearance::Dark, curve([0.52988, -0.05809, -0.30924, 4.63567, -6.52933, 2.89108], (0.0, 0.873))),
+        (TerminalAppearance::Light, curve([-28.27749, 182.85284, -469.62416, 603.15916, -384.59976, 97.35147], (0.51, 1.0))),
+    ]),
+    ("thinking1", &[
+        (TerminalAppearance::Dark, curve([0.55278, -0.03667, -0.45659, 4.95347, -6.90265, 3.0706], (0.0, 0.858))),
+        (TerminalAppearance::Light, curve([-37.10484, 235.86282, -596.62344, 754.3633, -474.00763, 118.3551], (0.535, 1.0))),
+    ]),
+    ("thinking2", &[
+        (TerminalAppearance::Dark, curve([0.57486, -0.01765, -0.58987, 5.25227, -7.27175, 3.25532], (0.0, 0.842))),
+        (TerminalAppearance::Light, curve([-59.89653, 377.05024, -945.07843, 1182.03145, -734.96375, 181.68658], (0.556, 1.0))),
+    ]),
+    ("thinking3", &[
+        (TerminalAppearance::Dark, curve([0.59621, -0.00062, -0.71148, 5.53588, -7.6392, 3.44606], (0.0, 0.827))),
+        (TerminalAppearance::Light, curve([-72.07122, 445.84082, -1099.57352, 1353.88793, -829.53392, 202.26164], (0.58, 1.0))),
+    ]),
+    ("thinking4", &[
+        (TerminalAppearance::Dark, curve([0.61691, 0.01462, -0.82288, 5.80651, -8.00641, 3.64333], (0.0, 0.811))),
+        (TerminalAppearance::Light, curve([-110.14338, 674.21488, -1645.75941, 2004.32367, -1215.15899, 293.3183], (0.6, 1.0))),
+    ]),
+    ("thinking5", &[
+        (TerminalAppearance::Dark, curve([0.63702, 0.02826, -0.92498, 6.06465, -8.37246, 3.84651], (0.0, 0.795))),
+        (TerminalAppearance::Light, curve([-175.47701, 1063.54495, -2570.70594, 3098.80776, -1860.15527, 444.76392], (0.62, 1.0))),
+    ]),
+    ("thinking6", &[
+        (TerminalAppearance::Dark, curve([0.65658, 0.04044, -1.01835, 6.30989, -8.73529, 4.05439], (0.0, 0.779))),
+        (TerminalAppearance::Light, curve([-183.81712, 1094.70055, -2602.68539, 3088.71276, -1826.91131, 430.75931], (0.643, 1.0))),
+    ]),
 ];
 
 fn level_curve(level: &str, appearance: TerminalAppearance) -> &'static Curve {
@@ -192,6 +220,22 @@ enum Role {
     Success,    // success (green family)
     Warning,    // warning (yellow family)
     Error,      // error (red family)
+    // The extended set (#212), from upstream's tokens.
+    ThinkingOff,     // thinkingOff (neutral family)
+    ThinkingMinimal, // thinkingMinimal (thinkingSlate)
+    ThinkingLow,     // thinkingLow (thinkingBlue)
+    ThinkingMedium,  // thinkingMedium (thinkingPeriwinkle)
+    ThinkingHigh,    // thinkingHigh (thinkingViolet)
+    ThinkingXhigh,   // thinkingXhigh (thinkingMagenta)
+    ThinkingMax,     // thinkingMax (thinkingRed)
+    ToolPendingBg,   // toolPendingBg (neutral)
+    ToolSuccessBg,   // toolSuccessBg (green)
+    ToolErrorBg,     // toolErrorBg (red)
+    DiffAdded,       // toolDiffAdded (green)
+    DiffRemoved,     // toolDiffRemoved (red)
+    MdHeading,       // mdHeading (yellow)
+    MdLink,          // mdLink (blue)
+    MdCode,          // mdCode (violet)
 }
 impl Role {
     fn family_name(self) -> &'static str {
@@ -203,6 +247,36 @@ impl Role {
             Self::Success => "green",
             Self::Warning => "yellow",
             Self::Error => "red",
+            // The thinking gradient rides upstream's thinking families'
+            // hues: slate, blue, periwinkle, violet, magenta, red.
+            Self::ThinkingOff => "neutral",
+            Self::ThinkingMinimal => "calamine",
+            Self::ThinkingLow => "blue",
+            Self::ThinkingMedium => "calamine",
+            Self::ThinkingHigh => "violet",
+            Self::ThinkingXhigh => "violet",
+            Self::ThinkingMax => "red",
+            Self::ToolPendingBg => "neutral",
+            Self::ToolSuccessBg => "green",
+            Self::ToolErrorBg => "red",
+            Self::DiffAdded => "green",
+            Self::DiffRemoved => "red",
+            Self::MdHeading => "yellow",
+            Self::MdLink => "blue",
+            Self::MdCode => "violet",
+        }
+    }
+
+    /// A palette slot override (upstream TOKEN_SLOTS: syntaxString 2,
+    /// syntaxNumber 5, searchMatchBg 3); none of the new roles need one
+    /// beyond their family's slot except where noted.
+    fn slot_override(self) -> Option<usize> {
+        match self {
+            Self::ThinkingMinimal => Some(4),
+            Self::ThinkingLow => Some(4),
+            Self::ThinkingMedium => Some(6),
+            Self::ThinkingXhigh => Some(13),
+            _ => None,
         }
     }
 
@@ -227,6 +301,48 @@ impl Role {
             Role::Border => {
                 static BORDER_RULES: [(&str, Surface); 1] = [("readable", Surface::Background)];
                 &BORDER_RULES
+            }
+            // Upstream's thinking levels: their own curve on the
+            // background.
+            Role::ThinkingOff => {
+                static R: [(&str, Surface); 1] = [("thinking0", Surface::Background)];
+                &R
+            }
+            Role::ThinkingMinimal => {
+                static R: [(&str, Surface); 1] = [("thinking1", Surface::Background)];
+                &R
+            }
+            Role::ThinkingLow => {
+                static R: [(&str, Surface); 1] = [("thinking2", Surface::Background)];
+                &R
+            }
+            Role::ThinkingMedium => {
+                static R: [(&str, Surface); 1] = [("thinking3", Surface::Background)];
+                &R
+            }
+            Role::ThinkingHigh => {
+                static R: [(&str, Surface); 1] = [("thinking4", Surface::Background)];
+                &R
+            }
+            Role::ThinkingXhigh => {
+                static R: [(&str, Surface); 1] = [("thinking5", Surface::Background)];
+                &R
+            }
+            Role::ThinkingMax => {
+                static R: [(&str, Surface); 1] = [("thinking6", Surface::Background)];
+                &R
+            }
+            // Tool status panels (upstream PANELS) and diff/markdown
+            // tokens readable on the background and panels.
+            Role::ToolPendingBg | Role::ToolSuccessBg | Role::ToolErrorBg => {
+                static R: [(&str, Surface); 1] = [("panel", Surface::Background)];
+                &R
+            }
+            Role::DiffAdded | Role::DiffRemoved | Role::MdHeading | Role::MdLink | Role::MdCode => {
+                &[
+                    ("readable", Surface::Background),
+                    ("readable", Surface::Surface),
+                ]
             }
             Role::Accent | Role::Success | Role::Warning | Role::Error => &[
                 ("readable", Surface::Background),
@@ -458,6 +574,21 @@ pub fn system_theme_palette(
             Role::Success,
             Role::Warning,
             Role::Error,
+            Role::ThinkingOff,
+            Role::ThinkingMinimal,
+            Role::ThinkingLow,
+            Role::ThinkingMedium,
+            Role::ThinkingHigh,
+            Role::ThinkingXhigh,
+            Role::ThinkingMax,
+            Role::ToolPendingBg,
+            Role::ToolSuccessBg,
+            Role::ToolErrorBg,
+            Role::DiffAdded,
+            Role::DiffRemoved,
+            Role::MdHeading,
+            Role::MdLink,
+            Role::MdCode,
         ] {
             let mut targets = Vec::new();
             for (level, surface) in role.rules() {
@@ -476,7 +607,13 @@ pub fn system_theme_palette(
             } else {
                 targets.iter().copied().fold(f64::MAX, f64::min)
             };
-            solved.push((role, paint(role, l)));
+            let color = match role {
+                Role::ToolPendingBg | Role::ToolSuccessBg | Role::ToolErrorBg => {
+                    limit_panel(role, l)
+                }
+                _ => paint(role, l),
+            };
+            solved.push((role, color));
         }
         Some(solved)
     };
@@ -538,22 +675,10 @@ pub fn system_theme_palette(
                 };
                 let foreground_l = oklab_lightness(reported);
                 if lighter == (foreground_l >= needed) {
-                    let to_color = |color: Color| match color {
-                        Color::Rgb(r, g, b) => Rgb::new(r, g, b),
-                        _ => Rgb::new(0, 0, 0),
-                    };
                     let palette = ThemePalette {
                         foreground: Color::Reset,
-                        background: Color::Reset,
-                        surface: color_to_color(color_of(Role::Surface)),
-                        muted: color_to_color(color_of(Role::Muted)),
-                        border: color_to_color(color_of(Role::Border)),
-                        accent: color_to_color(color_of(Role::Accent)),
-                        success: color_to_color(color_of(Role::Success)),
-                        warning: color_to_color(color_of(Role::Warning)),
-                        error: color_to_color(color_of(Role::Error)),
+                        ..base_palette(color_of)
                     };
-                    let _ = to_color;
                     return Some((palette, appearance));
                 }
                 foreground = anchored(
@@ -572,16 +697,39 @@ pub fn system_theme_palette(
             &surfaces(Role::Foreground),
             lighter,
         )),
-        background: Color::Reset,
-        surface: color_to_color(color_of(Role::Surface)),
-        muted: color_to_color(color_of(Role::Muted)),
-        border: color_to_color(color_of(Role::Border)),
-        accent: color_to_color(color_of(Role::Accent)),
-        success: color_to_color(color_of(Role::Success)),
-        warning: color_to_color(color_of(Role::Warning)),
-        error: color_to_color(color_of(Role::Error)),
+        ..base_palette(color_of)
     };
     Some((palette, appearance))
+}
+
+/// The palette's non-foreground roles from the solved colors.
+#[allow(clippy::field_reassign_with_default)]
+fn base_palette(color_of: impl Fn(Role) -> Rgb) -> ThemePalette {
+    let mut palette = ThemePalette::default();
+    palette.background = Color::Reset;
+    palette.surface = color_to_color(color_of(Role::Surface));
+    palette.muted = color_to_color(color_of(Role::Muted));
+    palette.border = color_to_color(color_of(Role::Border));
+    palette.accent = color_to_color(color_of(Role::Accent));
+    palette.success = color_to_color(color_of(Role::Success));
+    palette.warning = color_to_color(color_of(Role::Warning));
+    palette.error = color_to_color(color_of(Role::Error));
+    palette.thinking_off = color_to_color(color_of(Role::ThinkingOff));
+    palette.thinking_minimal = color_to_color(color_of(Role::ThinkingMinimal));
+    palette.thinking_low = color_to_color(color_of(Role::ThinkingLow));
+    palette.thinking_medium = color_to_color(color_of(Role::ThinkingMedium));
+    palette.thinking_high = color_to_color(color_of(Role::ThinkingHigh));
+    palette.thinking_xhigh = color_to_color(color_of(Role::ThinkingXhigh));
+    palette.thinking_max = color_to_color(color_of(Role::ThinkingMax));
+    palette.tool_pending_bg = color_to_color(color_of(Role::ToolPendingBg));
+    palette.tool_success_bg = color_to_color(color_of(Role::ToolSuccessBg));
+    palette.tool_error_bg = color_to_color(color_of(Role::ToolErrorBg));
+    palette.diff_added = color_to_color(color_of(Role::DiffAdded));
+    palette.diff_removed = color_to_color(color_of(Role::DiffRemoved));
+    palette.md_heading = color_to_color(color_of(Role::MdHeading));
+    palette.md_link = color_to_color(color_of(Role::MdLink));
+    palette.md_code = color_to_color(color_of(Role::MdCode));
+    palette
 }
 
 fn color_to_color(color: Rgb) -> Color {
@@ -775,6 +923,71 @@ mod upstream_reference_tests {
         expected(palette.success, "#77b272");
         expected(palette.warning, "#b39d6d");
         expected(palette.error, "#e17b98");
+    }
+
+    fn parse_hex(hex: &str) -> (u8, u8, u8) {
+        let value = hex.strip_prefix('#').unwrap();
+        let channel =
+            |range: std::ops::Range<usize>| u8::from_str_radix(&value[range], 16).unwrap();
+        (channel(0..2), channel(2..4), channel(4..6))
+    }
+}
+
+#[cfg(test)]
+mod extended_token_tests {
+    use super::*;
+
+    /// Upstream's own generator on the Catppuccin Mocha reports: the
+    /// extended roles match its tokens (within a channel of float drift).
+    #[test]
+    fn extended_roles_match_upstream_generator() {
+        let colors = TerminalColors {
+            foreground: Some(Rgb::new(0xC7, 0xC7, 0xC7)),
+            background: Some(Rgb::new(0x1E, 0x1E, 0x2E)),
+            palette: Some([
+                Rgb::new(0x45, 0x46, 0x75),
+                Rgb::new(0xF3, 0x8B, 0xA8),
+                Rgb::new(0xA6, 0xE3, 0xA1),
+                Rgb::new(0xF9, 0xE2, 0xAF),
+                Rgb::new(0x89, 0xB4, 0xFA),
+                Rgb::new(0xF5, 0xC2, 0xE7),
+                Rgb::new(0x94, 0xE2, 0xD5),
+                Rgb::new(0xBA, 0xBA, 0xC7),
+                Rgb::new(0x6C, 0x70, 0x86),
+                Rgb::new(0xF3, 0x8B, 0xA8),
+                Rgb::new(0xA6, 0xE3, 0xA1),
+                Rgb::new(0xF9, 0xE2, 0xAF),
+                Rgb::new(0x89, 0xB4, 0xFA),
+                Rgb::new(0xF5, 0xC2, 0xE7),
+                Rgb::new(0x94, 0xE2, 0xD5),
+                Rgb::new(0xA6, 0xAD, 0xE8),
+            ]),
+        };
+        let (palette, _) = system_theme_palette(&colors, 1.0).unwrap();
+        let expected = |color: Color, hex: &str| {
+            let Color::Rgb(r, g, b) = color else {
+                panic!("explicit color expected for {hex}")
+            };
+            let (er, eg, eb) = parse_hex(hex);
+            for (got, want) in [(r, er), (g, eg), (b, eb)] {
+                assert!(got.abs_diff(want) <= 2, "{hex}: ({r}, {g}, {b})");
+            }
+        };
+        expected(palette.thinking_off, "#6a6e84");
+        expected(palette.thinking_minimal, "#4e76b7");
+        expected(palette.thinking_low, "#547dbf");
+        expected(palette.thinking_medium, "#489287");
+        expected(palette.thinking_high, "#a7789b");
+        expected(palette.thinking_xhigh, "#ad7ea1");
+        expected(palette.thinking_max, "#d5708d");
+        expected(palette.tool_pending_bg, "#303139");
+        expected(palette.tool_success_bg, "#20391e");
+        expected(palette.tool_error_bg, "#511f2e");
+        expected(palette.diff_added, "#77b272");
+        expected(palette.diff_removed, "#e17b98");
+        expected(palette.md_heading, "#b39d6d");
+        expected(palette.md_link, "#76a0e5");
+        expected(palette.md_code, "#bf8eb2");
     }
 
     fn parse_hex(hex: &str) -> (u8, u8, u8) {

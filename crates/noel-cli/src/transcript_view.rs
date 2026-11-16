@@ -92,6 +92,9 @@ pub(super) struct TranscriptView {
     selection: Option<Selection>,
     copy_status: Option<String>,
     pending_copy: Option<String>,
+    // The session's thinking level, mirrored from TuiApp for the entry
+    // layouts' marker color.
+    pub(super) thinking_level: String,
 }
 
 impl TranscriptView {
@@ -279,15 +282,19 @@ impl TranscriptView {
                 .map(|(_, entry)| entry)
                 .unwrap_or(entry);
             let layout = self.layouts[index].get_or_insert_with(|| EntryLayout {
-                logical: render_entry_lines(std::slice::from_ref(entry), palette)
-                    .iter()
-                    .map(|line| {
-                        line.spans
-                            .iter()
-                            .map(|span| span.content.as_ref())
-                            .collect()
-                    })
-                    .collect(),
+                logical: render_entry_lines(
+                    std::slice::from_ref(entry),
+                    palette,
+                    self.thinking_level.as_str(),
+                )
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect()
+                })
+                .collect(),
                 rows: if hide_thinking && entry.kind == TuiEntryKind::Thinking {
                     Vec::new()
                 } else {
@@ -298,6 +305,7 @@ impl TranscriptView {
                         palette,
                         &effective_previews,
                         EntryScrollback::default(),
+                        self.thinking_level.as_str(),
                     )
                 },
             });

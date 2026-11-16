@@ -518,16 +518,20 @@ fn parse_delimiter(line: &str, columns: usize) -> Option<Vec<Alignment>> {
 /// Map a parsed span style to a ratatui style for a given accent color.
 /// Kept here so the theme mapping lives next to the parser, but callers
 /// pass their palette so themes stay in control of colors.
-pub fn ratatui_style(style: SpanStyle, accent: ratatui::style::Color) -> Style {
+/// The markdown span styles: code keeps `accent` (upstream's mdCode),
+/// links take their own color (mdLink).
+pub fn ratatui_style_with_link(
+    style: SpanStyle,
+    accent: ratatui::style::Color,
+    link: ratatui::style::Color,
+) -> Style {
     match style {
         SpanStyle::Plain => Style::default(),
         SpanStyle::Bold => Style::default().add_modifier(Modifier::BOLD),
         SpanStyle::Italic => Style::default().add_modifier(Modifier::ITALIC),
         SpanStyle::Code => Style::default().fg(accent),
         SpanStyle::Strike => Style::default().add_modifier(Modifier::CROSSED_OUT),
-        SpanStyle::Link => Style::default()
-            .fg(accent)
-            .add_modifier(Modifier::UNDERLINED),
+        SpanStyle::Link => Style::default().fg(link).add_modifier(Modifier::UNDERLINED),
         // Some terminals (kitty among them) don't visually combine SGR 1+3
         // distinctly on all fonts; tinting with the accent keeps bold-italic
         // recognizable even when the font renders both weights identically.
