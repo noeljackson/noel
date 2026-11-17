@@ -211,6 +211,7 @@ pub(crate) fn record(events: &Events, event: Event<'_>) {
         Event::Placed {
             run_id,
             submissions,
+            ..
         } => OwnedEvent::Placed {
             run_id: run_id.to_owned(),
             submissions: submissions
