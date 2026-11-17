@@ -405,10 +405,16 @@ const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
     "connection.?error",
     "connection.?refused",
     "connection.?lost",
+    // Gateway mid-stream drop relayed as an Anthropic-style api_error
+    // event, e.g. {"type":"error","error":{"message":"Connection closed."}}
+    "connection.?closed",
     "other side closed",
     "fetch failed",
     r"request to \S+ failed, reason:",
     "getaddrinfo",
+    // Node socket error codes, standalone.
+    r"(?<![a-z0-9_])(?:ECONNRESET|ECONNABORTED|ECONNREFUSED|ETIMEDOUT|EPIPE)(?![a-z0-9_])",
+    "connection reset by peer",
     "ENOTFOUND",
     "EAI_AGAIN",
     "upstream.?connect",
@@ -420,6 +426,7 @@ const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
     "terminated",
     "websocket.?closed",
     "websocket.?error",
+    "websocket.?connection.?limit.?reached",
     "ended without",
     "stream ended before message_stop",
     "stream ended before a terminal response event",
@@ -510,6 +517,8 @@ fn any_pattern(patterns: &[&str]) -> Regex {
 /// nothing after the pattern depends on what it consumed.
 fn translate_js_lookaround(pattern: &str) -> String {
     pattern
+        .replace("(?<![a-z0-9_])", "(?:^|[^a-z0-9_])")
+        .replace("(?![a-z0-9_])", "(?:[^a-z0-9_]|$)")
         .replace("(?<![a-z0-9])", "(?:^|[^a-z0-9])")
         .replace("(?![a-z0-9])", "(?:[^a-z0-9]|$)")
 }

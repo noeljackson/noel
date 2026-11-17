@@ -115,7 +115,7 @@ pub(crate) fn model_tool_definition(
                     },
                     "glob": {
                         "type": "string",
-                        "description": "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'"
+                        "description": "Filter files by glob pattern relative to path, e.g. 'src/**/*.ts'. Without '/', e.g. '*.ts', it matches file names at any depth"
                     },
                     "ignoreCase": {
                         "type": "boolean",
@@ -145,7 +145,7 @@ pub(crate) fn model_tool_definition(
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'"
+                        "description": "Glob pattern relative to the search directory, e.g. 'src/**/*.ts'. Without '/', e.g. '*.ts', it matches file names at any depth"
                     },
                     "path": {
                         "type": "string",
