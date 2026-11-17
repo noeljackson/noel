@@ -132,6 +132,7 @@ impl TuiSelectorState {
             label: item["label"].as_str().unwrap_or_default().to_owned(),
             value: item["value"].as_str().unwrap_or_default().to_owned(),
             active: item["active"] == true,
+            description: String::new(),
         });
         let mut state = Self::new(
             value["kind"].as_str()?,
@@ -362,6 +363,15 @@ impl TuiSelectorState {
                 ))
             })
             .collect();
+        // A model row's description names the levels it supports, the
+        // picker's second column.
+        for item in &mut self.items {
+            if let Some(thinking) = self.model_thinking.get(&item.value)
+                && !thinking.levels.is_empty()
+            {
+                item.description = format!("thinking: {}", thinking.levels.join(", "));
+            }
+        }
         self
     }
 
@@ -3187,10 +3197,27 @@ pub(crate) fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp, palette
             .width
             .saturating_sub(4)
             .saturating_sub(prefix.chars().count() as u16) as usize;
-        lines.push(Line::from(Span::styled(
-            format!("{prefix}{}", truncate_chars(&item.label, text_width)),
-            style,
-        )));
+        // A description column, as the slash list shows one: labels align,
+        // the description follows muted (the selected row keeps its own
+        // style, upstream's SelectList behavior).
+        let row = if item.description.is_empty() || area.width <= 48 {
+            truncate_chars(&item.label, text_width)
+        } else {
+            let label_width = selector
+                .filtered_indices
+                .iter()
+                .filter_map(|index| selector.items.get(*index))
+                .map(|row| row.label.chars().count())
+                .max()
+                .unwrap_or(0)
+                .min(text_width.saturating_sub(12));
+            let label = truncate_chars(&item.label, label_width);
+            let pad = label_width.saturating_sub(item.label.chars().count());
+            let description_width = text_width.saturating_sub(label_width + 2);
+            let description = truncate_chars(&item.description, description_width);
+            format!("{label}{}  {description}", " ".repeat(pad))
+        };
+        lines.push(Line::from(Span::styled(format!("{prefix}{row}"), style)));
     }
     if selector.filtered_indices.is_empty() {
         lines.push(Line::from(Span::styled("no matches", palette.secondary())));

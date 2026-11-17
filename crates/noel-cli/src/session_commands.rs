@@ -134,11 +134,13 @@ pub(crate) fn plan_approval_selector() -> TuiSelectorState {
                 label: "approve the plan and implement it".to_string(),
                 value: "approve".to_string(),
                 active: true,
+                description: String::new(),
             },
             SelectorItem {
                 label: "keep planning".to_string(),
                 value: "keep".to_string(),
                 active: false,
+                description: String::new(),
             },
         ],
     );

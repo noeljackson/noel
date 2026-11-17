@@ -2397,6 +2397,7 @@ fn session_tree_row(
         ),
         value: session.session_id.clone(),
         active: here,
+        description: String::new(),
     });
     if let Some(kids) = children.get(&session.session_id) {
         for (index, child) in kids.iter().enumerate() {

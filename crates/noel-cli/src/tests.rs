@@ -4645,6 +4645,7 @@ fn the_branch_navigator_folds_and_filters() {
             label: value.to_owned(),
             value: value.to_owned(),
             active: false,
+            description: String::new(),
         })
         .collect();
     let mut state = TuiSelectorState::new("branches", Selector::new("branches", items), "", None);
