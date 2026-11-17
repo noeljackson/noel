@@ -56,6 +56,15 @@ pub struct Handle {
     events: Arc<Events>,
 }
 
+impl Clone for Handle {
+    fn clone(&self) -> Handle {
+        Handle {
+            requests: self.requests.clone(),
+            events: self.events.clone(),
+        }
+    }
+}
+
 impl Handle {
     pub(super) async fn submit(
         &self,

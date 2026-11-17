@@ -21,6 +21,8 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "cloudflare-ai-gateway-kimi.json",
     "codemode-declarations.json",
     "durable-chat.json",
+    "durable-forks.json",
+    "durable-harnessMany.json",
     "durable-inbox.json",
     "durable-print.json",
     "durable-turnLimit.json",
@@ -205,6 +207,8 @@ fn every_script_output_is_committed() {
             "durable-fixture.ts",
             fixture_set(&[
                 "durable-chat.json",
+                "durable-forks.json",
+                "durable-harnessMany.json",
                 "durable-inbox.json",
                 "durable-print.json",
                 "durable-turnLimit.json",
@@ -371,6 +375,11 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ),
         ("error-classification.json", "crates/noel-ai/src/tests.rs"),
         ("durable-chat.json", "crates/noel-durable/tests/slice1.rs"),
+        ("durable-forks.json", "crates/noel-durable/tests/multi.rs"),
+        (
+            "durable-harnessMany.json",
+            "crates/noel-durable/tests/multi.rs",
+        ),
         ("durable-inbox.json", "crates/noel-durable/tests/slice1.rs"),
         ("durable-print.json", "crates/noel-durable/tests/slice1.rs"),
         (

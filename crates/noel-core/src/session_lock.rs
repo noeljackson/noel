@@ -21,7 +21,7 @@ use crate::SessionError;
 const LOCK_ATTEMPTS: usize = 16;
 
 #[derive(Debug)]
-pub(crate) struct SessionLock {
+pub struct SessionLock {
     journal: PathBuf,
     lock_path: PathBuf,
     /// Holds the OS lock; taken in `drop` while the registry is locked.
@@ -31,7 +31,18 @@ pub(crate) struct SessionLock {
 }
 
 impl SessionLock {
-    pub(crate) fn writer(&self) -> MutexGuard<'_, ()> {
+    /// A lock that guards nothing but in-process serialization (an
+    /// in-memory journal has no file to lock).
+    pub fn memory() -> SessionLock {
+        SessionLock {
+            journal: PathBuf::new(),
+            lock_path: PathBuf::new(),
+            file: None,
+            writer: Mutex::new(()),
+        }
+    }
+
+    pub fn writer(&self) -> MutexGuard<'_, ()> {
         self.writer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -57,7 +68,7 @@ fn registry() -> &'static Registry {
 /// Takes the session lock for `journal`, or shares it when this process
 /// already holds it. Never waits for another process: a held lock fails at
 /// once with [`SessionError::Locked`], leaving the wait policy to callers.
-pub(crate) fn acquire(journal: &Path) -> Result<Arc<SessionLock>, SessionError> {
+pub fn acquire(journal: &Path) -> Result<Arc<SessionLock>, SessionError> {
     let journal = canonical_journal_path(journal);
     let registry = registry();
     let mut held = registry.held.lock().unwrap_or_else(PoisonError::into_inner);

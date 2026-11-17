@@ -15,13 +15,17 @@
 mod driver;
 mod events;
 mod host;
+mod multi;
 mod provider;
+mod sqlite;
 mod submission;
 mod tools;
 
 pub use events::{Outcome, OwnedEvent};
+pub use multi::{Backend, MultiHarness, MultiOptions};
 pub use noel_providers::ModelSpec;
 pub use provider::{ProviderOptions, ProviderResolver, ProviderSource};
+pub use sqlite::SqliteJournal;
 pub use submission::{Settled, Submission, SubmissionState};
 pub use tools::{Tool, ToolContext, ToolRegistry, ToolResult};
 
@@ -140,6 +144,7 @@ pub type EnvHook = noel_core::EnvHook;
 pub use noel_core::EnvTarget;
 
 /// What a harness is opened with.
+#[derive(Clone)]
 pub struct HarnessOptions {
     /// The config its models and settings come from. A program without a
     /// user's noel installation builds one with
@@ -221,13 +226,25 @@ pub struct Harness {
 }
 
 impl Harness {
+    /// A handle's own driver and id (the multi-conversation harness
+    /// shares handles across its conversations).
+    pub(crate) fn from_handle(
+        driver: driver::Handle,
+        session_id: String,
+        _journal: std::path::PathBuf,
+    ) -> Harness {
+        Harness { driver, session_id }
+    }
+
+    pub(crate) fn handle(&self) -> driver::Handle {
+        self.driver.clone()
+    }
+}
+
+impl Harness {
     /// Opens a session on `storage` (a fresh one when it is empty, the
     /// session it holds otherwise), with `options`.
     pub async fn open(storage: Storage, options: HarnessOptions) -> Result<Harness, HarnessError> {
-        use noel_core::{Runtime, SessionStore};
-        // An empty journal starts a session in it (upstream opens fresh
-        // storage); one that holds a session opens it, and a run it says
-        // was interrupted resumes at open.
         let empty = storage.read().is_ok_and(|bytes| bytes.is_empty())
             || storage
                 .read()
@@ -235,21 +252,32 @@ impl Harness {
                 .is_some_and(|error| matches!(error, noel_core::SessionError::Read { source, .. } if source.kind() == std::io::ErrorKind::NotFound));
         let (store, state) = if empty {
             let cwd = options.cwd.clone();
-            SessionStore::create_in_storage(storage, cwd, "s1")?
+            noel_core::SessionStore::create_in_storage(storage, cwd, "s1".to_string())?
         } else {
-            SessionStore::open_storage(storage)?
+            noel_core::SessionStore::open_storage(storage)?
         };
-        let systems = noel_core::ReloadableSystems::from_config(&options.config, 1);
-        let mut runtime = Runtime::with_store(state, systems, store);
-        let model = options.model.clone();
-        if let Some(model) = model {
-            runtime
-                .set_active_model(Some(model))
-                .map_err(|error| HarnessError::Provider(error.to_string()))?;
-        }
-        let session_id = runtime.session().session_id.clone();
-        let driver = driver::spawn(runtime, options).await?;
-        Ok(Harness { driver, session_id })
+        Self::open_on(store, state, options).await
+    }
+
+    /// [`Harness::open`] with the session named `session_id` (the
+    /// multi-conversation harness names each conversation's session).
+    pub async fn open_named(
+        storage: Storage,
+        session_id: String,
+        options: HarnessOptions,
+    ) -> Result<Harness, HarnessError> {
+        let empty = storage.read().is_ok_and(|bytes| bytes.is_empty())
+            || storage
+                .read()
+                .err()
+                .is_some_and(|error| matches!(error, noel_core::SessionError::Read { source, .. } if source.kind() == std::io::ErrorKind::NotFound));
+        let (store, state) = if empty {
+            let cwd = options.cwd.clone();
+            noel_core::SessionStore::create_in_storage(storage, cwd, session_id)?
+        } else {
+            noel_core::SessionStore::open_storage(storage)?
+        };
+        Self::open_on(store, state, options).await
     }
 
     /// Starts a new session named `session_id` in an empty in-memory

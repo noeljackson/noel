@@ -29,6 +29,7 @@ const { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } = await imp
 const {
 	ConversationBusy,
 	createRegistry,
+	createSession,
 	defineExtension,
 	defineTool,
 	Harness,
@@ -210,11 +211,82 @@ async function turnLimit(): Promise<Json> {
 	};
 }
 
+/** 05/07 (harness and conversations): a harness of many conversations,
+ * created, found again, listed; handles are stateless. */
+async function harnessMany(): Promise<Json> {
+	const faux = fauxProvider();
+	faux.setResponses([fauxAssistantMessage([fauxText("one.")]), fauxAssistantMessage([fauxText("two.")])]);
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const registry = createRegistry();
+	const harness = await Harness.open(new MemoryStorage(), { models, registry }, BACKGROUND_CONTEXT);
+	const root = await harness.root(BACKGROUND_CONTEXT, {
+		agent: { model: { provider: "faux", modelId: "faux-1" } },
+	});
+	const helper = await harness.createConversation(
+		{ ownership: { kind: "ownerless" }, agent: { model: { provider: "faux", modelId: "faux-1" } } },
+		BACKGROUND_CONTEXT,
+	);
+	// Each conversation answers its own prompt.
+	const first = await (await root.submit({ type: "input", content: "to the root" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+	const second = await (await helper.submit({ type: "input", content: "to the helper" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+	// Found again by id: the same conversation.
+	const found = await harness.conversation(helper.id, BACKGROUND_CONTEXT);
+	await harness.close(BACKGROUND_CONTEXT);
+	return {
+		rootId: root.id,
+		conversations: [root.id !== helper.id, found?.id === helper.id],
+		settled: [first.status, second.status],
+	};
+}
+
+/** 02 (forks): a fork continues from one entry of another conversation. */
+async function forks(): Promise<Json> {
+	const session = createSession(new MemoryStorage());
+	const chat = await session.commit(
+		(tx) => tx.createConversation({ ownership: { kind: "ownerless" } }),
+		BACKGROUND_CONTEXT,
+	);
+	const first = await session.commit(
+		(tx) => tx.appendEntry(chat.id, { kind: "note", data: "hello" }),
+		BACKGROUND_CONTEXT,
+	);
+	await session.commit(
+		(tx) => tx.appendEntry(chat.id, { kind: "note", data: "goodbye" }),
+		BACKGROUND_CONTEXT,
+	);
+	const branch = await session.commit(
+		(tx) => tx.forkConversation(chat.id, first.id, { ownership: { kind: "ownerless" } }),
+		BACKGROUND_CONTEXT,
+	);
+	const branchEntries = await session.commit(
+		(tx) => tx.scanEntries({ conversationId: branch.id }, 10),
+		BACKGROUND_CONTEXT,
+	);
+	const parentEntries = await session.commit(
+		(tx) => tx.scanEntries({ conversationId: chat.id }, 10),
+		BACKGROUND_CONTEXT,
+	);
+	// The fork's own writes leave the parent unchanged.
+	await session.commit((tx) => tx.appendEntry(branch.id, { kind: "note", data: "branch note" }), BACKGROUND_CONTEXT);
+	const after = await session.commit(
+		(tx) => tx.scanEntries({ conversationId: chat.id }, 10),
+		BACKGROUND_CONTEXT,
+	);
+	return {
+		forkTranscript: branchEntries.items.map((entry) => entry.data),
+		parentTranscript: parentEntries.items.map((entry) => entry.data),
+		independent: after.items.map((entry) => entry.data),
+	};
+}
+
 const scenarios: Record<string, () => Promise<Json>> = {
 	chat,
 	print: printMode,
 	inbox,
 	turnLimit,
+	harnessMany,
+	forks,
 };
 
 const outDir = process.argv[2];
