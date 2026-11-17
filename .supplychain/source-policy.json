@@ -68,6 +68,14 @@
       "reason": "syntect 5.3.0 uses yaml-rust for grammar loading; this is an unmaintained notice with no fixed release available.",
       "owner": "@noeljackson",
       "expires": "2027-02-07"
+    },
+    {
+      "kind": "osv",
+      "advisory_id": "RUSTSEC-2026-0543",
+      "package": "chrono",
+      "reason": "The GPUI 0.3.0 desktop and iOS app stacks still use chrono; no fixed release is available and the crate is an unmaintained notice, not a vulnerability.",
+      "owner": "@noeljackson",
+      "expires": "2027-02-07"
     }
   ]
 }

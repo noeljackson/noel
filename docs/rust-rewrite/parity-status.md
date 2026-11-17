@@ -87,6 +87,17 @@ The committed TypeScript parity fixtures are:
 - `local-tools.json`: built-in local tool inventory (names, labels, prompt
   snippets, parameter names). Rust checks only that every upstream tool is
   present; `tool-behavior.json` covers what the tools do.
+- `durable-chat.json`, `durable-print.json`, `durable-inbox.json`,
+  `durable-turnLimit.json`: the scenarios of upstream Durable's own examples
+  `13-chat`, `17-print` (faux variant), `19-inbox` and
+  `33-turn-limit-and-continue`, run through upstream's Harness on the faux
+  provider and recorded by `scripts/ts-parity/durable-fixture.ts`
+  (`make ts-parity-durable`, from the local pi checkout at
+  `TS_REFERENCE_REF`): the settled record (status, reason), the transcript's
+  entry kinds and turn roles, the queue's order, the refusal of a
+  `whenBusy: "reject"` submit, `runFailure` and its clearing, and a second
+  continue refused `ConversationBusy`. `crates/noel-durable`'s slice-1 tests
+  replay each scenario against the SDK and compare.
 - `mistral-devstral.json`: Mistral chat-completions request shape.
 - `mistral-tool-id.json`: Mistral tool-history request shape and 9-character
   tool-call ID normalization.

@@ -10,6 +10,7 @@ members = [
     "crates/noel-codemode",
     "crates/noel-config",
     "crates/noel-core",
+    "crates/noel-durable",
     "crates/noel-env",
     "crates/noel-mcp",
     "crates/noel-ffi",
