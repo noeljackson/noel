@@ -1,27 +1,36 @@
+//! noel's built-in tools. They work in a workspace, an
+//! [`ExecutionEnv`]: `read`, `write`, `edit`, `ls` and `bash` reach files
+//! and run commands only through it. `grep` and `find` search with
+//! ripgrep's crates, here or, in a workspace on another machine, over what
+//! the workspace lists and reads.
+
+mod mutation;
 mod output;
 mod paths;
-mod process;
 mod read;
 mod search;
 mod truncate;
 mod web;
 
-use std::fs;
-use std::os::fd::OwnedFd;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use noel_env::{
+    Context, ExecOptions, ExecutionEnv, ExecutionErrorCode, FileErrorCode, LocalEnv,
+    LocalEnvOptions, OutputChunk, ShellCommand, SpillOptions,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
-use tokio::process::{ChildStdout, Command};
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
+pub use noel_env::{kill_running_tool_groups, spawn_tool_process, ToolProcessGroup};
 use output::{OutputAccumulator, OutputSnapshot};
-use paths::resolve_to_cwd;
-pub use process::{kill_running_tool_groups, spawn_tool_process, ToolProcessGroup};
+use paths::resolve_tool_path;
 use truncate::{format_size, truncate_head, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+pub use truncate::{slice_head_utf16, slice_tail_utf16};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -98,6 +107,11 @@ pub struct ToolResult {
     /// Images that go to the model with the output (`read` of an image).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ToolImage>,
+    /// What a programmatic caller such as a codemode script gets instead of
+    /// the text (upstream `structuredContent`): `bash`'s output, exit code
+    /// and wall time. Never shown to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<serde_json::Value>,
 }
 
 impl ToolResult {
@@ -106,6 +120,7 @@ impl ToolResult {
             output: output.into(),
             is_error: false,
             images: Vec::new(),
+            structured: None,
         }
     }
 
@@ -145,6 +160,8 @@ pub enum ToolError {
 
 #[derive(Debug, Clone)]
 pub struct ToolRuntimeOptions {
+    /// The shell of the local workspace [`execute_tool`] makes; a workspace
+    /// passed to [`execute_tool_in`] brings its own.
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
     pub offline: bool,
@@ -181,6 +198,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         "find",
         "ls",
         "todo",
+        "task",
         "web_search",
         "web_fetch",
     ]
@@ -195,25 +213,68 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     .collect()
 }
 
+/// The local workspace at `cwd` that [`execute_tool`] runs tools in.
+pub fn local_env(cwd: &Path, options: &ToolRuntimeOptions) -> LocalEnv {
+    LocalEnv::with_options(
+        cwd,
+        LocalEnvOptions {
+            shell_path: options.shell_path.clone(),
+        },
+    )
+}
+
+/// Runs a tool in the local workspace at `cwd`.
 pub async fn execute_tool(
     cwd: &Path,
     request: ToolRequest,
     options: &ToolRuntimeOptions,
 ) -> Result<ToolResult, ToolError> {
-    execute_tool_streaming(cwd, request, options, &mut |_| {}).await
+    execute_tool_in(&local_env(cwd, options), request, options).await
+}
+
+/// Runs a tool in the workspace `env`.
+pub async fn execute_tool_in(
+    env: &dyn ExecutionEnv,
+    request: ToolRequest,
+    options: &ToolRuntimeOptions,
+) -> Result<ToolResult, ToolError> {
+    execute_tool_streaming_in(env, request, options, &mut |_| {}).await
+}
+
+/// What a running tool has printed so far, as [`execute_tool_streaming`]
+/// reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputSoFar<'a> {
+    /// The end of the output, within the limits of the result (the last
+    /// 2000 lines or 50 KB).
+    pub text: &'a str,
+    /// Whether output before `text` was left out to keep within them.
+    pub truncated: bool,
 }
 
 /// [`execute_tool`] that also reports a `bash` command's output while it
 /// runs. `on_output` gets everything printed so far, within the limits of
-/// the result (the last 2000 lines or 50 KB): once, empty, when the command
-/// starts, then as output arrives, at most every [`BASH_UPDATE_THROTTLE`].
-/// Other tools report nothing before their result.
+/// the result (see [`OutputSoFar`]): once, empty, when the command starts,
+/// then as output arrives, at most every [`BASH_UPDATE_THROTTLE`]. Other
+/// tools report nothing before their result.
 pub async fn execute_tool_streaming(
     cwd: &Path,
     request: ToolRequest,
     options: &ToolRuntimeOptions,
-    on_output: &mut (dyn FnMut(&str) + Send),
+    on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
 ) -> Result<ToolResult, ToolError> {
+    execute_tool_streaming_in(&local_env(cwd, options), request, options, on_output).await
+}
+
+/// [`execute_tool_streaming`] in the workspace `env`. Dropping the future
+/// stops the tool, and kills a running command's processes.
+pub async fn execute_tool_streaming_in(
+    env: &dyn ExecutionEnv,
+    request: ToolRequest,
+    options: &ToolRuntimeOptions,
+    on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
+) -> Result<ToolResult, ToolError> {
+    let cx = Context::background();
     if options.offline
         && matches!(
             &request,
@@ -229,13 +290,13 @@ pub async fn execute_tool_streaming(
             path,
             offset,
             limit,
-        } => read::read_tool(cwd, &path, offset, limit, options),
+        } => read::read_tool(env, &path, offset, limit, options, &cx).await,
         ToolRequest::Bash {
             command,
             timeout_ms,
-        } => bash_tool(cwd, &command, timeout_ms, options, on_output).await,
-        ToolRequest::Edit { path, edits } => edit_tool(cwd, &path, &edits),
-        ToolRequest::Write { path, content } => write_tool(cwd, &path, &content),
+        } => bash_tool(env, &command, timeout_ms, options, on_output, &cx).await,
+        ToolRequest::Edit { path, edits } => edit_tool(env, &path, &edits, &cx).await,
+        ToolRequest::Write { path, content } => write_tool(env, &path, &content, &cx).await,
         ToolRequest::Grep {
             path,
             pattern,
@@ -244,24 +305,28 @@ pub async fn execute_tool_streaming(
             ignore_case,
             context,
             limit,
-        } => search::grep_tool(
-            cwd,
-            search::GrepArgs {
-                pattern: &pattern,
-                path: path.as_deref(),
-                glob: glob.as_deref(),
-                ignore_case: ignore_case.unwrap_or(false),
-                literal: literal.unwrap_or(false),
-                context: context.unwrap_or(0),
-                limit,
-            },
-        ),
+        } => {
+            search::grep_tool(
+                env,
+                search::GrepArgs {
+                    pattern: &pattern,
+                    path: path.as_deref(),
+                    glob: glob.as_deref(),
+                    ignore_case: ignore_case.unwrap_or(false),
+                    literal: literal.unwrap_or(false),
+                    context: context.unwrap_or(0),
+                    limit,
+                },
+                &cx,
+            )
+            .await
+        }
         ToolRequest::Find {
             pattern,
             path,
             limit,
-        } => search::find_tool(cwd, &pattern, path.as_deref(), limit),
-        ToolRequest::Ls { path, limit } => search::ls_tool(cwd, path.as_deref(), limit),
+        } => search::find_tool(env, &pattern, path.as_deref(), limit, &cx).await,
+        ToolRequest::Ls { path, limit } => search::ls_tool(env, path.as_deref(), limit, &cx).await,
         ToolRequest::WebSearch { query, limit } => {
             tokio::time::timeout(Duration::from_secs(30), web::search(&query, limit))
                 .await
@@ -292,6 +357,16 @@ pub fn cap_tool_output(output: String) -> String {
             |error| format!("Full output could not be saved: {error}"),
             |path| format!("Full output: {}", path.display()),
         );
+    // #160: a first line past the limit leaves nothing to show; say so, as
+    // `read` does, instead of "lines 1-0".
+    if truncation.first_line_exceeds_limit {
+        let first = output.split('\n').next().unwrap_or_default();
+        return format!(
+            "[Line 1 is {}, exceeds {} limit. {saved}]",
+            format_size(first.len()),
+            format_size(DEFAULT_MAX_BYTES)
+        );
+    }
     let cause = if truncation.by_lines {
         String::new()
     } else {
@@ -303,51 +378,12 @@ pub fn cap_tool_output(output: String) -> String {
     )
 }
 
-/// After the shell exits, output still arriving (a background job holds the
-/// pipes) is read until it pauses for this long.
-const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(100);
-
 /// The shortest time between two reports of a running command's output
 /// (upstream `BASH_UPDATE_THROTTLE_MS`).
 pub const BASH_UPDATE_THROTTLE: Duration = Duration::from_millis(100);
 
-/// The shell commands run in (upstream `getShellConfig`): the `shellPath`
-/// setting, else `/bin/bash`, else `bash` on PATH, else `sh`.
-fn shell_program(shell_path: Option<&str>) -> Result<PathBuf, ToolError> {
-    if let Some(shell_path) = shell_path {
-        return if Path::new(shell_path).exists() {
-            Ok(PathBuf::from(shell_path))
-        } else {
-            Err(ToolError::Failed(format!(
-                "Custom shell path not found: {shell_path}"
-            )))
-        };
-    }
-    let bin_bash = Path::new("/bin/bash");
-    if bin_bash.exists() {
-        return Ok(bin_bash.to_path_buf());
-    }
-    Ok(std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|directory| directory.join("bash"))
-                .find(|candidate| candidate.is_file())
-        })
-        .unwrap_or_else(|| PathBuf::from("sh")))
-}
-
-/// Reads the next chunk of the output pipe; `None` once it is closed. A
-/// closed pipe never completes, so `select!` keeps waiting on its other
-/// branches.
-async fn read_chunk(pipe: &mut Option<ChildStdout>, buffer: &mut [u8]) -> Option<usize> {
-    match pipe {
-        Some(open) => match open.read(buffer).await {
-            Ok(read) if read > 0 => Some(read),
-            _ => None,
-        },
-        None => std::future::pending().await,
-    }
-}
+/// The longest timeout a workspace accepts (a 32-bit millisecond timer).
+const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
 
 async fn sleep_until(deadline: Option<Instant>) {
     match deadline {
@@ -398,185 +434,329 @@ fn with_status(text: String, status: &str) -> String {
     }
 }
 
-/// Runs `command` with `bash -c` (upstream `bash.ts`). stdout and stderr are
-/// one stream in the order written; the model gets its last 2000 lines or
-/// 50 KB, and a longer output is saved whole to a temp file. A timeout or a
-/// non-zero exit is an error result that still carries the output. While
-/// the command runs, `on_output` gets its output so far (see
-/// [`execute_tool_streaming`]).
+/// What a running command printed, and when it was last reported.
+struct BashReporter<'a> {
+    output: OutputAccumulator,
+    on_output: &'a mut (dyn FnMut(OutputSoFar<'_>) + Send),
+    last_report: Option<Instant>,
+    /// When output not reported yet is reported, once the throttle allows;
+    /// `None` with nothing unreported (#175: one field, not a flag beside
+    /// it).
+    report_due: Option<Instant>,
+    /// Why the output could not be kept, which stopped the command.
+    error: Option<io::Error>,
+}
+
+impl BashReporter<'_> {
+    fn report(&mut self) {
+        (self.report_due, self.last_report) = (None, Some(Instant::now()));
+        (self.on_output)(OutputSoFar {
+            text: &self.output.tail(),
+            truncated: self.output.truncated(),
+        });
+    }
+
+    /// Keeps a chunk of output and reports it now, or returns true when the
+    /// throttle moved the report to `report_due`.
+    fn append(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        if let Err(error) = self.output.append(bytes) {
+            let message = error.to_string();
+            self.error = Some(error);
+            return Err(message);
+        }
+        let due = self.last_report.map(|at| at + BASH_UPDATE_THROTTLE);
+        match due.filter(|due| *due > Instant::now()) {
+            Some(due) => {
+                self.report_due = Some(due);
+                Ok(true)
+            }
+            None => {
+                self.report();
+                Ok(false)
+            }
+        }
+    }
+}
+
+fn lock<'a, 'b>(reporter: &'a Mutex<BashReporter<'b>>) -> MutexGuard<'a, BashReporter<'b>> {
+    reporter.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Runs `command` through the workspace's shell (upstream `bash.ts`).
+/// stdout and stderr are one stream in the order written; the model gets
+/// its last 2000 lines or 50 KB, and a longer output is saved whole to a
+/// temp file. A timeout or a non-zero exit is an error result that still
+/// carries the output. While the command runs, `on_output` gets its output
+/// so far (see [`execute_tool_streaming`]).
 async fn bash_tool(
-    cwd: &Path,
+    env: &dyn ExecutionEnv,
     command: &str,
     timeout_ms: Option<u64>,
     options: &ToolRuntimeOptions,
-    on_output: &mut (dyn FnMut(&str) + Send),
+    on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
+    cx: &Context,
 ) -> Result<ToolResult, ToolError> {
     // Like upstream, the first report says the command is starting, even if
     // it then cannot start.
-    on_output("");
+    on_output(OutputSoFar {
+        text: "",
+        truncated: false,
+    });
     let command = match &options.shell_command_prefix {
         Some(prefix) if !prefix.trim().is_empty() => format!("{prefix}\n{command}"),
         _ => command.to_string(),
     };
-    let shell = shell_program(options.shell_path.as_deref())?;
-    if !cwd.exists() {
-        return Err(ToolError::Failed(format!(
-            "Working directory does not exist: {}\nCannot execute bash commands.",
-            cwd.display()
-        )));
-    }
+    let started = std::time::Instant::now();
+    let cwd = PathBuf::from(env.cwd());
     let io_error = |source| ToolError::Io {
-        path: cwd.to_path_buf(),
+        path: cwd.clone(),
         source,
     };
-    // stdout and stderr share one pipe, so the output is in the order it
-    // was written.
-    let (reader, writer) = std::io::pipe().map_err(io_error)?;
-    let mut process = Command::new(shell);
-    process
-        .arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        // Commands are non-interactive: stdin is empty and the shell gets no
-        // controlling terminal, so nothing can read noel's input (the RPC
-        // request stream or the TUI's terminal).
-        .stdin(Stdio::null())
-        .stdout(writer.try_clone().map_err(io_error)?)
-        .stderr(writer);
-    for (name, value) in &options.bash_env {
-        match value {
-            Some(value) => process.env(name, value),
-            None => process.env_remove(name),
-        };
-    }
-    // The shell leads its own process group, so a timeout or an interrupt
-    // (dropping this future) kills the whole tree, not just the shell pid:
-    // killing only the shell orphaned children like a long preflight script.
-    let (mut child, group) = spawn_tool_process(&mut process).map_err(io_error)?;
-    // The builder holds the pipe's write ends; the pipe closes once the
-    // command's processes are its only writers.
-    drop(process);
-    let mut group = Some(group);
-    let mut pipe = Some(
-        ChildStdout::from_std(std::process::ChildStdout::from(OwnedFd::from(reader)))
-            .map_err(io_error)?,
-    );
-    let mut buffer = vec![0; 64 * 1024];
-    let mut output = OutputAccumulator::new("noel-bash");
-    let mut deadline = timeout_ms
-        .and_then(|timeout_ms| Instant::now().checked_add(Duration::from_millis(timeout_ms)));
-    let mut timed_out = false;
-    let mut status = None;
-    // Once the shell has exited, output is read until it pauses.
-    let mut output_grace = None;
-    // Output not reported yet is reported once the throttle allows.
-    let mut unreported = false;
-    let mut last_report: Option<Instant> = None;
-    let mut report_due = None;
-    while status.is_none() || pipe.is_some() {
-        tokio::select! {
-            read = read_chunk(&mut pipe, &mut buffer) => match read {
-                Some(read) => {
-                    output.append(&buffer[..read]).map_err(io_error)?;
-                    unreported = true;
-                    let due = last_report.map(|at| at + BASH_UPDATE_THROTTLE);
-                    match due.filter(|due| *due > Instant::now()) {
-                        Some(due) => report_due = Some(due),
-                        None => {
-                            (unreported, report_due, last_report) =
-                                (false, None, Some(Instant::now()));
-                            on_output(&output.tail());
-                        }
+    let reporter = Mutex::new(BashReporter {
+        output: OutputAccumulator::new("noel-bash"),
+        on_output,
+        last_report: None,
+        report_due: None,
+        error: None,
+    });
+    // Wakes the loop below when a report was put off.
+    let report_put_off = Notify::new();
+    let mut on_chunk = |chunk: OutputChunk<'_>| {
+        if lock(&reporter).append(chunk.raw.unwrap_or(chunk.text.as_bytes()))? {
+            report_put_off.notify_one();
+        }
+        Ok(())
+    };
+    // In a workspace on another machine the complete output is kept there
+    // too, as Durable's bash tool keeps it, so the path the result names is
+    // one the workspace's `read` can open.
+    let remote = !noel_env::is_local(env);
+    let result = {
+        // stdout and stderr share one pipe, so the output is in the order
+        // it was written. The command runs in its own session and process
+        // group: a timeout or an interrupt (dropping this future) kills the
+        // whole tree, not just the shell.
+        let exec = env.exec(
+            ShellCommand::Script(command),
+            ExecOptions {
+                env: options.bash_env.clone(),
+                // A zero timeout still starts the command and kills it at
+                // once; a longer one than the timer holds becomes its
+                // longest.
+                timeout: timeout_ms
+                    .map(|timeout_ms| Duration::from_millis(timeout_ms.clamp(1, MAX_TIMEOUT_MS))),
+                on_output: Some(&mut on_chunk),
+                merge_stderr: true,
+                spill: remote.then_some(SpillOptions {
+                    after_bytes: DEFAULT_MAX_BYTES as u64,
+                    after_lines: DEFAULT_MAX_LINES as u64,
+                }),
+                ..ExecOptions::default()
+            },
+            cx,
+        );
+        tokio::pin!(exec);
+        loop {
+            let due = lock(&reporter).report_due;
+            tokio::select! {
+                biased;
+                result = &mut exec => break result,
+                () = report_put_off.notified() => {}
+                () = sleep_until(due) => {
+                    let mut reporter = lock(&reporter);
+                    // A report made since, or put off again, is not due.
+                    if reporter.report_due.is_some_and(|due| due <= Instant::now()) {
+                        reporter.report();
                     }
                 }
-                None => pipe = None,
-            },
-            () = sleep_until(report_due) => {
-                (unreported, report_due, last_report) = (false, None, Some(Instant::now()));
-                on_output(&output.tail());
             }
-            exit = child.wait(), if status.is_none() => status = Some(exit.map_err(io_error)?),
-            () = sleep_until(deadline) => {
-                // Dropping the group kills the tree; what it wrote is kept.
-                timed_out = true;
-                deadline = None;
-                drop(group.take());
+        }
+    };
+    let mut reporter = reporter
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    let spill_path = match &result {
+        Ok(result) => result.spill_path.clone(),
+        Err(error) => error.spill_path.clone(),
+    };
+    let exit_code = match result {
+        Ok(result) => Some(result.exit_code),
+        Err(error) => match error.code {
+            ExecutionErrorCode::Timeout => None,
+            ExecutionErrorCode::CallbackError => {
+                return Err(io_error(
+                    reporter
+                        .error
+                        .take()
+                        .unwrap_or_else(|| io::Error::other(error.message)),
+                ));
             }
-            () = sleep_until(output_grace) => break,
-        }
-        if status.is_some() {
-            output_grace = Some(Instant::now() + EXIT_OUTPUT_GRACE);
-        }
-    }
-    if let Some(group) = group {
-        group.finish();
-    }
-    if unreported {
-        on_output(&output.tail());
+            ExecutionErrorCode::SpawnError if error.errno.is_some() => {
+                return Err(io_error(io::Error::from_raw_os_error(
+                    error.errno.unwrap_or_default(),
+                )));
+            }
+            _ => return Err(ToolError::Failed(error.message)),
+        },
+    };
+    if reporter.report_due.is_some() {
+        reporter.report();
     }
 
-    let snapshot = output.finish().map_err(io_error)?;
-    if timed_out {
+    let mut snapshot = reporter.output.finish().map_err(io_error)?;
+    if let (Some(spilled), Some(local)) = (spill_path, &snapshot.full_output_path) {
+        // The workspace's copy replaces the one kept here.
+        let _ = std::fs::remove_file(local);
+        snapshot.full_output_path = Some(PathBuf::from(spilled));
+    }
+    let Some(code) = exit_code else {
+        // Killed at the timeout; what it wrote is kept.
         let seconds = timeout_ms.unwrap_or_default() as f64 / 1000.0;
         return Ok(ToolResult::error(with_status(
             bash_output_text(&snapshot, ""),
             &format!("Command timed out after {seconds} seconds"),
         )));
-    }
+    };
     let text = bash_output_text(&snapshot, "(no output)");
-    // A shell killed by a signal has no exit code; report it the shell way.
-    let code = status.and_then(|status| {
-        status.code().or_else(|| {
-            std::os::unix::process::ExitStatusExt::signal(&status).map(|signal| 128 + signal)
-        })
-    });
-    Ok(match code {
-        Some(0) => ToolResult::text(text),
-        Some(code) => ToolResult::error(with_status(
+    let mut result = match code {
+        0 => ToolResult::text(text),
+        code => ToolResult::error(with_status(
             text,
             &format!("Command exited with code {code}"),
         )),
-        None => ToolResult::error(with_status(text, "Command terminated without an exit code")),
-    })
+    };
+    // Upstream's `structuredContent`: scripts get the output unlimited by
+    // the model's limits (up to 1 MiB), and a non-zero exit code as data.
+    let (full, truncated) = read_full_output(&snapshot, STRUCTURED_OUTPUT_MAX_BYTES);
+    let mut structured = serde_json::json!({
+        "output": full,
+        "truncated": truncated,
+        "exit_code": code,
+        "wall_time_seconds": (started.elapsed().as_millis() as f64 / 100.0).round() / 10.0,
+    });
+    if let (true, Some(path)) = (truncated, &snapshot.full_output_path) {
+        structured["full_output_path"] = serde_json::json!(path.display().to_string());
+    }
+    result.structured = Some(structured);
+    Ok(result)
 }
 
-/// The error code Node reports for an I/O failure, where upstream's tools
-/// put it in their results.
-pub(crate) fn node_error_code(error: &std::io::Error) -> Option<&'static str> {
-    match error.kind() {
-        std::io::ErrorKind::NotFound => Some("ENOENT"),
-        std::io::ErrorKind::PermissionDenied => Some("EACCES"),
-        std::io::ErrorKind::IsADirectory => Some("EISDIR"),
+/// Output limit of `bash`'s structured output (upstream
+/// `STRUCTURED_OUTPUT_MAX_BYTES`).
+const STRUCTURED_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+
+/// A command's whole output, or its first and last halves of `max_bytes`
+/// around `[... N bytes omitted ...]` when it is larger (upstream
+/// `readFullOutput`). Output kept only on another machine is its tail.
+fn read_full_output(snapshot: &OutputSnapshot, max_bytes: usize) -> (String, bool) {
+    use std::io::{Read, Seek, SeekFrom};
+    let truncation = &snapshot.truncation;
+    let fallback = || (truncation.content.clone(), truncation.truncated);
+    let Some(path) = snapshot
+        .full_output_path
+        .as_ref()
+        .filter(|_| truncation.truncated)
+    else {
+        return fallback();
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return fallback();
+    };
+    let Ok(size) = file.metadata().map(|metadata| metadata.len() as usize) else {
+        return fallback();
+    };
+    if size <= max_bytes {
+        let mut bytes = Vec::with_capacity(size);
+        return match file.read_to_end(&mut bytes) {
+            Ok(_) => (String::from_utf8_lossy(&bytes).into_owned(), false),
+            Err(_) => fallback(),
+        };
+    }
+    let head_bytes = max_bytes / 2;
+    let tail_bytes = max_bytes - head_bytes;
+    let mut head = vec![0; head_bytes];
+    let mut tail = vec![0; tail_bytes];
+    let read = file
+        .read_exact(&mut head)
+        .and_then(|()| file.seek(SeekFrom::Start((size - tail_bytes) as u64)))
+        .and_then(|_| file.read_exact(&mut tail));
+    if read.is_err() {
+        return fallback();
+    }
+    // Cut at character boundaries: the head drops an incomplete trailing
+    // sequence, the tail skips leading continuation bytes.
+    let head_end = match std::str::from_utf8(&head) {
+        Ok(_) => head.len(),
+        Err(error) => error.valid_up_to(),
+    };
+    let tail_start = tail
+        .iter()
+        .take_while(|byte| (**byte & 0xc0) == 0x80)
+        .count();
+    let omitted = size - head_bytes - tail_bytes;
+    (
+        format!(
+            "{}\n\n[... {omitted} bytes omitted ...]\n\n{}",
+            String::from_utf8_lossy(&head[..head_end]),
+            String::from_utf8_lossy(&tail[tail_start..])
+        ),
+        true,
+    )
+}
+
+/// The error code Node reports for a failure, where upstream's tools put it
+/// in their results.
+pub(crate) fn node_error_code(code: FileErrorCode) -> Option<&'static str> {
+    match code {
+        FileErrorCode::NotFound => Some("ENOENT"),
+        FileErrorCode::PermissionDenied => Some("EACCES"),
+        FileErrorCode::IsDirectory => Some("EISDIR"),
         _ => None,
     }
 }
 
-fn edit_tool(cwd: &Path, input_path: &str, edits: &[TextEdit]) -> Result<ToolResult, ToolError> {
-    let path = resolve_to_cwd(cwd, input_path);
+async fn edit_tool(
+    env: &dyn ExecutionEnv,
+    input_path: &str,
+    edits: &[TextEdit],
+    cx: &Context,
+) -> Result<ToolResult, ToolError> {
+    let path = resolve_tool_path(env, input_path, cx).await?;
     // A file that cannot be read or written is reported as upstream does.
-    let io_error = |source: std::io::Error| match node_error_code(&source) {
+    let file_error = |error: noel_env::FileError| match node_error_code(error.code) {
         Some(code) => ToolError::Failed(format!(
             "Could not edit file: {input_path}. Error code: {code}."
         )),
         None => ToolError::Io {
-            path: path.clone(),
-            source,
+            path: PathBuf::from(&path),
+            source: error.to_io_error(),
         },
     };
-    let content = fs::read_to_string(&path).map_err(io_error)?;
-    let next = apply_text_edits(&content, edits, input_path)?;
-    fs::write(&path, next).map_err(io_error)?;
-    Ok(ToolResult::text(format!(
-        "Successfully replaced {} block(s) in {input_path}.",
-        edits.len()
-    )))
+    mutation::with_file_mutation_queue(env, &path, cx, async {
+        let bytes = env.read_binary_file(&path, cx).await.map_err(file_error)?;
+        // Strictly UTF-8: an edit must not rewrite bytes it could not read.
+        let content = io::read_to_string(bytes.as_slice()).map_err(|source| ToolError::Io {
+            path: PathBuf::from(&path),
+            source,
+        })?;
+        let next = apply_text_edits(&content, edits, input_path)?;
+        env.write_file(&path, next.as_bytes(), cx)
+            .await
+            .map_err(file_error)?;
+        Ok(ToolResult::text(format!(
+            "Successfully replaced {} block(s) in {input_path}.",
+            edits.len()
+        )))
+    })
+    .await
 }
 
 /// Applies every edit to `content`, or none (upstream
 /// `applyEditsToNormalizedContent`, without fuzzy matching). Each `find` must
 /// occur exactly once in the original content and the matched regions must
-/// not overlap. Edits use the file's line endings (CRLF when its first line
-/// ends in CRLF); the rest of the file, including a BOM, is kept byte for
+/// not overlap. `oldText` is matched in the file's first-line ending; the
+/// new text takes the ending of the line where its range starts (upstream
+/// d448c51e2), and the rest of the file, including a BOM, is kept byte for
 /// byte.
 fn apply_text_edits(content: &str, edits: &[TextEdit], path: &str) -> Result<String, ToolError> {
     if edits.is_empty() {
@@ -622,7 +802,12 @@ fn apply_text_edits(content: &str, edits: &[TextEdit], path: &str) -> Result<Str
                 format!("Found {count} occurrences of edits[{index}] in {path}. Each oldText must be unique. Please provide more context to make it unique.")
             }));
         }
-        matches.push((start, find.len(), in_file_endings(&edit.replace), index));
+        let replace = edit.replace.replace("\r\n", "\n");
+        let replace = match line_ending_at(content, start) {
+            "\n" => replace,
+            ending => replace.replace('\n', ending),
+        };
+        matches.push((start, find.len(), replace, index));
     }
     matches.sort_by_key(|(start, ..)| *start);
     for pair in matches.windows(2) {
@@ -644,27 +829,57 @@ fn apply_text_edits(content: &str, edits: &[TextEdit], path: &str) -> Result<Str
     Ok(next)
 }
 
-fn write_tool(cwd: &Path, input_path: &str, content: &str) -> Result<ToolResult, ToolError> {
-    let path = resolve_to_cwd(cwd, input_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| ToolError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+/// The line ending new text at `at` takes (upstream d448c51e2): that of the
+/// line `at` is on, or of the line before when it is the unterminated last
+/// line. A lone CR only in a file without any LF (classic Mac); elsewhere a
+/// lone CR is a character inside a line.
+fn line_ending_at(content: &str, at: usize) -> &'static str {
+    let crlf_before = |newline: usize| newline > 0 && content.as_bytes()[newline - 1] == b'\r';
+    if let Some(offset) = content[at..].find('\n') {
+        return if crlf_before(at + offset) {
+            "\r\n"
+        } else {
+            "\n"
+        };
     }
-    fs::write(&path, content).map_err(|source| ToolError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    Ok(ToolResult::text(format!(
-        "Successfully wrote to {input_path}"
-    )))
+    if let Some(newline) = content[..at].rfind('\n') {
+        return if crlf_before(newline) { "\r\n" } else { "\n" };
+    }
+    if content.contains('\r') {
+        "\r"
+    } else {
+        "\n"
+    }
+}
+
+async fn write_tool(
+    env: &dyn ExecutionEnv,
+    input_path: &str,
+    content: &str,
+    cx: &Context,
+) -> Result<ToolResult, ToolError> {
+    let path = resolve_tool_path(env, input_path, cx).await?;
+    mutation::with_file_mutation_queue(env, &path, cx, async {
+        // Missing parent directories are created; a failure names the path
+        // that failed, the file or a parent.
+        env.write_file(&path, content.as_bytes(), cx)
+            .await
+            .map_err(|error| ToolError::Io {
+                path: PathBuf::from(error.path.as_deref().unwrap_or(&path)),
+                source: error.to_io_error(),
+            })?;
+        Ok(ToolResult::text(format!(
+            "Successfully wrote to {input_path}"
+        )))
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::fs;
 
     #[tokio::test]
     async fn web_tools_are_read_only_and_offline_rejects_network_before_connecting() {
@@ -714,6 +929,67 @@ mod tests {
         .unwrap();
         assert!(result.is_error);
         assert_eq!(result.output, "failed-output\n\nCommand exited with code 7");
+    }
+
+    #[tokio::test]
+    async fn bash_gives_scripts_its_structured_output() {
+        let result = execute_tool(
+            Path::new("."),
+            ToolRequest::Bash {
+                command: "printf failed-output; exit 7".into(),
+                timeout_ms: Some(1000),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let structured = result.structured.expect("structured output");
+        assert_eq!(structured["output"], "failed-output");
+        assert_eq!(structured["exit_code"], 7);
+        assert_eq!(structured["truncated"], false);
+        assert!(structured["wall_time_seconds"].is_number());
+        assert!(structured.get("full_output_path").is_none());
+
+        // Past the model's limits the script still gets all of it, up to
+        // 1 MiB: here, 3000 lines of 10 bytes.
+        let result = execute_tool(
+            Path::new("."),
+            ToolRequest::Bash {
+                command: "seq -w 1 3000 | sed 's/$/-abcd/'".into(),
+                timeout_ms: Some(5000),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let structured = result.structured.expect("structured output");
+        assert_eq!(structured["truncated"], false);
+        assert_eq!(structured["output"].as_str().unwrap().lines().count(), 3000);
+        assert!(result.output.contains("Full output:"));
+    }
+
+    #[tokio::test]
+    async fn bash_structured_output_over_its_limit_keeps_head_and_tail() {
+        let result = execute_tool(
+            Path::new("."),
+            ToolRequest::Bash {
+                command: "head -c 1200000 /dev/zero | tr '\\0' a; printf END".into(),
+                timeout_ms: Some(10000),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let structured = result.structured.expect("structured output");
+        let output = structured["output"].as_str().unwrap();
+        assert_eq!(structured["truncated"], true);
+        assert!(
+            output.contains("\n\n[... 151427 bytes omitted ...]\n\n"),
+            "{}",
+            &output[524280..524330]
+        );
+        assert!(output.ends_with("END"));
+        assert!(structured["full_output_path"].is_string());
     }
 
     #[tokio::test]
@@ -1100,7 +1376,7 @@ mod tests {
             Path::new("."),
             bash(command),
             &ToolRuntimeOptions::default(),
-            &mut |output| reports.push((output.to_string(), std::time::Instant::now())),
+            &mut |output| reports.push((output.text.to_string(), std::time::Instant::now())),
         )
         .await
         .expect("bash");
@@ -1125,18 +1401,26 @@ mod tests {
     #[tokio::test]
     async fn bash_reports_are_throttled_and_end_with_all_the_output() {
         // 40 lines over about 400 ms: far fewer reports than lines.
+        let started = std::time::Instant::now();
         let (result, reports) =
             run_streaming("for i in $(seq 1 40); do echo line-$i; sleep 0.01; done").await;
+        let took = started.elapsed();
         assert_eq!(result.output.lines().count(), 40);
         assert_eq!(reports[0].0, "");
-        assert!(reports.len() < 15, "{} reports", reports.len());
+        // One report per throttle interval at most, after the first that
+        // says the command started, and with the flush when it ends. The
+        // count is held against the time the command took, not the gaps
+        // between reports as this test sees them: it hears a report after
+        // the reporter has timed it, by however long each was held up, and
+        // a loaded machine stretches the command.
+        let most = (took.as_millis() / BASH_UPDATE_THROTTLE.as_millis()) as usize + 3;
+        assert!(
+            reports.len() <= most,
+            "{} reports in {took:?}",
+            reports.len()
+        );
         assert!(reports.len() > 2, "{} reports", reports.len());
         for pair in reports[1..].windows(2) {
-            let apart = pair[1].1.duration_since(pair[0].1);
-            // The last report flushes what is left when the command ends.
-            if pair[1].0 != result.output {
-                assert!(apart >= BASH_UPDATE_THROTTLE, "{apart:?} apart");
-            }
             assert!(pair[1].0.starts_with(&pair[0].0), "a report lost output");
         }
         assert_eq!(reports.last().unwrap().0, result.output);
@@ -1155,6 +1439,18 @@ mod tests {
             assert!(output.lines().count() <= DEFAULT_MAX_LINES);
             assert!(output.len() <= DEFAULT_MAX_BYTES);
         }
+        // A report says when it has left the beginning out.
+        let mut truncated = Vec::new();
+        execute_tool_streaming(
+            Path::new("."),
+            bash("seq 1 3; sleep 0.3; seq 1 20000"),
+            &ToolRuntimeOptions::default(),
+            &mut |output| truncated.push((output.text.starts_with("1\n"), output.truncated)),
+        )
+        .await
+        .expect("bash");
+        assert_eq!(truncated[..2], [(false, false), (true, false)]);
+        assert_eq!(truncated.last(), Some(&(false, true)));
         let _ = fs::remove_file(rest.trim_end_matches(']'));
     }
 
@@ -1165,7 +1461,7 @@ mod tests {
             Path::new("/nonexistent/noel-tools-cwd"),
             bash("echo never"),
             &ToolRuntimeOptions::default(),
-            &mut |output| reports.push(output.to_string()),
+            &mut |output| reports.push(output.text.to_string()),
         )
         .await
         .unwrap_err();
@@ -1182,7 +1478,7 @@ mod tests {
                 limit: None,
             },
             &ToolRuntimeOptions::default(),
-            &mut |output| reports.push(output.to_string()),
+            &mut |output| reports.push(output.text.to_string()),
         )
         .await
         .expect("ls");
@@ -1273,6 +1569,55 @@ mod tests {
         cwd
     }
 
+    /// ripgrep's context, as upstream now formats it (8da141c2): runs
+    /// merge so a shared line shows once, the last allowed match keeps its
+    /// trailing context, the limit notice needs one more match, and only
+    /// the line terminator is stripped.
+    #[tokio::test]
+    async fn grep_context_merges_and_the_limit_notice_needs_one_more_match() {
+        let cwd = temp_dir("grep-context");
+        fs::write(
+            cwd.join("a.txt"),
+            "one\nhit 1\ntwo\nhit 2\nthree\nfour\nfive\nhit 3\nsix\r\nCR\rinside hit 4\n",
+        )
+        .unwrap();
+        let request = |context, limit| ToolRequest::Grep {
+            path: None,
+            pattern: "hit".to_string(),
+            glob: None,
+            literal: None,
+            ignore_case: None,
+            context: Some(context),
+            limit: Some(limit),
+        };
+        // Context 1 around hits 1 and 2 shares "two": once.
+        let merged = run(&cwd, request(1, 2)).await.expect("grep").output;
+        assert!(
+            merged.starts_with(
+                "a.txt-1- one\na.txt:2: hit 1\na.txt-3- two\na.txt:4: hit 2\na.txt-5- three\n"
+            ),
+            "{merged}"
+        );
+        assert!(
+            merged.contains("[2 matches limit reached. Use limit=4"),
+            "{merged}"
+        );
+        // Exactly as many matches as the limit: no notice; a lone CR stays.
+        let all = run(&cwd, request(0, 4)).await.expect("grep").output;
+        assert_eq!(
+            all,
+            "a.txt:2: hit 1\na.txt:4: hit 2\na.txt:8: hit 3\na.txt:10: CR\rinside hit 4"
+        );
+        // A match inside the last allowed match's trailing context is shown
+        // as context.
+        let trailing = run(&cwd, request(2, 1)).await.expect("grep").output;
+        assert!(
+            trailing.starts_with("a.txt-1- one\na.txt:2: hit 1\na.txt-3- two\na.txt-4- hit 2\n"),
+            "{trailing}"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
     #[tokio::test]
     async fn grep_searches_what_ripgrep_would() {
         let cwd = search_tree("grep");
@@ -1322,6 +1667,24 @@ mod tests {
             "No files found matching pattern"
         );
         assert_eq!(run(&cwd, find("src")).await.expect("find").output, "src/");
+        // The limit notice only when there are more than `limit` (upstream
+        // 676af1d7): four matches with limit 4 have none, limit 3 has one.
+        let limited = |limit| ToolRequest::Find {
+            pattern: "*.txt".to_string(),
+            path: None,
+            limit: Some(limit),
+        };
+        assert_eq!(
+            run(&cwd, limited(4)).await.expect("find").output,
+            "bom.txt\nlink.txt\nonly-rg-skips.txt\nsrc/real.txt"
+        );
+        let three = run(&cwd, limited(3)).await.expect("find").output;
+        assert!(
+            three.starts_with("bom.txt\nlink.txt\nonly-rg-skips.txt\n")
+                && three
+                    .contains("[3 results limit reached. Use limit=6 for more, or refine pattern]"),
+            "{three}"
+        );
         assert_eq!(
             run(&cwd, find(".github/*.yml")).await.expect("find").output,
             ".github/ci.yml"
@@ -1372,6 +1735,20 @@ mod tests {
         assert!(shown.starts_with("row 1\n") && shown.ends_with("\nrow 2000"));
         let saved = PathBuf::from(notice.strip_suffix(']').expect("notice end"));
         assert_eq!(fs::read_to_string(&saved).expect("saved output"), long);
+        let _ = fs::remove_file(saved);
+
+        // A first line past the byte limit: a notice, not "lines 1-0".
+        let wide = "x".repeat(DEFAULT_MAX_BYTES + 10);
+        let capped = cap_tool_output(wide.clone());
+        let notice = capped
+            .strip_prefix("[Line 1 is ")
+            .expect("first line notice");
+        let saved = notice
+            .split_once(" limit. Full output: ")
+            .and_then(|(_, path)| path.strip_suffix(']'))
+            .map(PathBuf::from)
+            .expect("saved path");
+        assert_eq!(fs::read_to_string(&saved).expect("saved output"), wide);
         let _ = fs::remove_file(saved);
     }
 
@@ -1577,6 +1954,31 @@ mod tests {
             "x = 1;\nx = 1;\nabcdef\n"
         );
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    /// Upstream d448c51e2: lines the edit does not touch keep their endings,
+    /// and the new text takes the ending of the line its range starts on.
+    #[test]
+    fn edits_take_the_line_ending_where_they_start() {
+        let edit = |content: &str, find: &str, replace: &str| {
+            let edits = [TextEdit {
+                find: find.to_owned(),
+                replace: replace.to_owned(),
+            }];
+            apply_text_edits(content, &edits, "f").expect("edit")
+        };
+        assert_eq!(
+            edit("a\nb\r\nX = 1\r\n", "X = 1", "X = 2"),
+            "a\nb\r\nX = 2\r\n"
+        );
+        assert_eq!(edit("a\r\nb\nc", "c", "C"), "a\r\nb\nC");
+        assert_eq!(edit("a\rb\nX = 1\n", "X = 1", "X = 2"), "a\rb\nX = 2\n");
+        assert_eq!(edit("a\r\nb\nc\n", "b", "B\nB2"), "a\r\nB\nB2\nc\n");
+        assert_eq!(edit("a\nb\r\nc", "b", "x\ny"), "a\nx\r\ny\r\nc");
+        // The unterminated last line takes the ending of the line before.
+        assert_eq!(edit("a\r\nb", "b", "b\nc"), "a\r\nb\r\nc");
+        // A file of lone CRs (classic Mac) keeps them.
+        assert_eq!(edit("a\rb", "b", "b\nc"), "a\rb\rc");
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@
 
 use ratatui::style::{Modifier, Style};
 use std::ops::Range;
+use unicode_width::UnicodeWidthStr as _;
 
 /// Styling intent for a span; mapped to ratatui styles by the caller so the
 /// parser stays free of theme knowledge.
@@ -66,90 +67,88 @@ pub fn parse_inline_line(line: &str) -> Vec<StyledSpan> {
     while index < bytes.len() {
         let rest = &line[index..];
         // Code spans take priority and suppress other emphasis inside.
-        if rest.starts_with('`') {
-            if let Some(close) = find_code_close(line, index) {
-                flush_plain(&mut spans, plain_start, index);
-                spans.push(StyledSpan {
-                    source: index..close + 1,
-                    style: SpanStyle::Code,
-                    display: line[index + 1..close].to_string(),
-                });
-                index = close + 1;
-                plain_start = index;
-                continue;
-            }
+        if rest.starts_with('`')
+            && let Some(close) = find_code_close(line, index)
+        {
+            flush_plain(&mut spans, plain_start, index);
+            spans.push(StyledSpan {
+                source: index..close + 1,
+                style: SpanStyle::Code,
+                display: line[index + 1..close].to_string(),
+            });
+            index = close + 1;
+            plain_start = index;
+            continue;
         }
-        if rest.starts_with("***") {
-            if let Some(content_end) = find_triple_marker(line, index + 3, b'*') {
-                flush_plain(&mut spans, plain_start, index);
-                spans.push(StyledSpan {
-                    source: index..content_end + 3,
-                    style: SpanStyle::BoldItalic,
-                    display: line[index + 3..content_end].to_string(),
-                });
-                index = content_end + 3;
-                plain_start = index;
-                continue;
-            }
+        if rest.starts_with("***")
+            && let Some(content_end) = find_triple_marker(line, index + 3, b'*')
+        {
+            flush_plain(&mut spans, plain_start, index);
+            spans.push(StyledSpan {
+                source: index..content_end + 3,
+                style: SpanStyle::BoldItalic,
+                display: line[index + 3..content_end].to_string(),
+            });
+            index = content_end + 3;
+            plain_start = index;
+            continue;
         }
-        if rest.starts_with("**") {
-            if let Some(content_end) = find_double_marker(line, index + 2, b'*') {
-                flush_plain(&mut spans, plain_start, index);
-                spans.push(StyledSpan {
-                    source: index..content_end + 2,
-                    style: SpanStyle::Bold,
-                    display: line[index + 2..content_end].to_string(),
-                });
-                index = content_end + 2;
-                plain_start = index;
-                continue;
-            }
+        if rest.starts_with("**")
+            && let Some(content_end) = find_double_marker(line, index + 2, b'*')
+        {
+            flush_plain(&mut spans, plain_start, index);
+            spans.push(StyledSpan {
+                source: index..content_end + 2,
+                style: SpanStyle::Bold,
+                display: line[index + 2..content_end].to_string(),
+            });
+            index = content_end + 2;
+            plain_start = index;
+            continue;
         }
-        if rest.starts_with("~~") {
-            if let Some(content_end) = find_double_marker(line, index + 2, b'~') {
-                flush_plain(&mut spans, plain_start, index);
-                spans.push(StyledSpan {
-                    source: index..content_end + 2,
-                    style: SpanStyle::Strike,
-                    display: line[index + 2..content_end].to_string(),
-                });
-                index = content_end + 2;
-                plain_start = index;
-                continue;
-            }
+        if rest.starts_with("~~")
+            && let Some(content_end) = find_double_marker(line, index + 2, b'~')
+        {
+            flush_plain(&mut spans, plain_start, index);
+            spans.push(StyledSpan {
+                source: index..content_end + 2,
+                style: SpanStyle::Strike,
+                display: line[index + 2..content_end].to_string(),
+            });
+            index = content_end + 2;
+            plain_start = index;
+            continue;
         }
-        if rest.starts_with('[') {
-            if let Some((link_end, text_end)) = find_link(line, index) {
-                flush_plain(&mut spans, plain_start, index);
-                // Display only the link text; the URL stays selectable in
-                // the source range.
-                spans.push(StyledSpan {
-                    source: index..link_end,
-                    style: SpanStyle::Link,
-                    display: line[index + 1..text_end].to_string(),
-                });
-                index = link_end;
-                plain_start = index;
-                continue;
-            }
+        if rest.starts_with('[')
+            && let Some((link_end, text_end)) = find_link(line, index)
+        {
+            flush_plain(&mut spans, plain_start, index);
+            // Display only the link text; the URL stays selectable in
+            // the source range.
+            spans.push(StyledSpan {
+                source: index..link_end,
+                style: SpanStyle::Link,
+                display: line[index + 1..text_end].to_string(),
+            });
+            index = link_end;
+            plain_start = index;
+            continue;
         }
         let single = rest
             .chars()
             .next()
             .map(|ch| (ch == '*' || ch == '_') && !rest.starts_with("**"))
             .unwrap_or(false);
-        if single {
-            if let Some(content_end) = find_single_emphasis_close(line, index) {
-                flush_plain(&mut spans, plain_start, index);
-                spans.push(StyledSpan {
-                    source: index..content_end + 1,
-                    style: SpanStyle::Italic,
-                    display: line[index + 1..content_end].to_string(),
-                });
-                index = content_end + 1;
-                plain_start = index;
-                continue;
-            }
+        if single && let Some(content_end) = find_single_emphasis_close(line, index) {
+            flush_plain(&mut spans, plain_start, index);
+            spans.push(StyledSpan {
+                source: index..content_end + 1,
+                style: SpanStyle::Italic,
+                display: line[index + 1..content_end].to_string(),
+            });
+            index = content_end + 1;
+            plain_start = index;
+            continue;
         }
         index += rest.chars().next().map(char::len_utf8).unwrap_or(1);
     }
@@ -284,19 +283,255 @@ fn find_link(line: &str, open: usize) -> Option<(usize, usize)> {
     Some((close + 1, text_end))
 }
 
+/// A parsed GFM pipe table: its rows of cells and per-column alignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Table {
+    /// Header cells, already unescaped (`\|` → `|`).
+    pub header: Vec<String>,
+    /// Data rows, one per source line after the delimiter.
+    pub rows: Vec<Vec<String>>,
+    /// Per-column alignment from the delimiter row (`:---` left, `:--:`
+    /// center, `---:` right, `---` left).
+    pub align: Vec<Alignment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alignment {
+    Left,
+    Center,
+    Right,
+}
+
+impl Table {
+    /// Column display widths (unicode width), header included, capped at
+    /// [`TABLE_MAX_COLUMN_WIDTH`]; longer cells truncate with an ellipsis
+    /// when rendered.
+    pub fn column_widths(&self) -> Vec<usize> {
+        let columns = self.header.len();
+        let mut widths = vec![0usize; columns];
+        for row in std::iter::once(&self.header).chain(self.rows.iter()) {
+            for (index, cell) in row.iter().enumerate().take(columns) {
+                widths[index] = widths[index].max(truncate_cell(cell).width());
+            }
+        }
+        widths
+    }
+
+    /// The rendered lines of the table, one per source line, in source
+    /// order: the header row, the separator (from the delimiter line), one
+    /// row per data line. Cell text is padded to the column width; inline
+    /// emphasis inside cells is applied by the caller over each cell
+    /// segment's text.
+    pub fn render(&self) -> Vec<Vec<TableSegment>> {
+        let widths = self.column_widths();
+        let mut lines = vec![self.data_row(&self.header, &widths, true)];
+        lines.push(self.border(&widths));
+        for row in &self.rows {
+            lines.push(self.data_row(row, &widths, false));
+        }
+        lines
+    }
+
+    fn border(&self, widths: &[usize]) -> Vec<TableSegment> {
+        let inner = widths
+            .iter()
+            .map(|width| "─".repeat(width + 2))
+            .collect::<Vec<_>>()
+            .join("┼");
+        vec![TableSegment::border(format!("  ├{inner}┤"))]
+    }
+
+    fn data_row(&self, cells: &[String], widths: &[usize], header: bool) -> Vec<TableSegment> {
+        let mut segments = vec![TableSegment::border("  │".to_string())];
+        for (index, width) in widths.iter().enumerate() {
+            let cell = cells.get(index).map(String::as_str).unwrap_or("");
+            let cell = truncate_cell(cell);
+            let padding = width.saturating_sub(cell.width());
+            let (left, right) = match self.align.get(index).copied().unwrap_or(Alignment::Left) {
+                Alignment::Left => (1, padding + 1),
+                Alignment::Right => (padding + 1, 1),
+                Alignment::Center => (padding / 2 + 1, padding - padding / 2 + 1),
+            };
+            segments.push(TableSegment::cell(
+                format!("{}{}{}", " ".repeat(left), cell, " ".repeat(right)),
+                header,
+            ));
+            segments.push(TableSegment::border("│".to_string()));
+        }
+        segments
+    }
+}
+/// One styled run of a rendered table line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableSegment {
+    pub text: String,
+    /// The header row is bold.
+    pub header: bool,
+    /// A border/padding run (`│ ├ ┤ ─` and the spaces around cells), drawn
+    /// dim by the caller; a cell's own padding is part of its segment.
+    pub border: bool,
+}
+
+impl TableSegment {
+    fn border(text: String) -> Self {
+        Self {
+            text,
+            header: false,
+            border: true,
+        }
+    }
+    fn cell(text: String, header: bool) -> Self {
+        Self {
+            text,
+            header,
+            border: false,
+        }
+    }
+}
+
+/// Widest cell a column shows before it is capped (a longer cell renders
+/// truncated with an ellipsis; wrapping inside a grid cell needs row
+/// geometry the transcript's line wrapper does not have).
+pub const TABLE_MAX_COLUMN_WIDTH: usize = 28;
+
+/// A cell longer than [`TABLE_MAX_COLUMN_WIDTH`] cuts at a grapheme
+/// boundary before that width, with an ellipsis. (The transcript wrapper
+/// breaks lines at the terminal edge; a grid cell must keep its row to one
+/// line.)
+fn truncate_cell(cell: &str) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if cell.width() <= TABLE_MAX_COLUMN_WIDTH {
+        return cell.to_string();
+    }
+    let mut width = 0usize;
+    let mut end = cell.len();
+    for (index, ch) in cell.char_indices() {
+        let used = ch.width().unwrap_or(0);
+        // Reserve one column for the ellipsis.
+        if width + used > TABLE_MAX_COLUMN_WIDTH - 1 {
+            end = index;
+            break;
+        }
+        width += used;
+    }
+    format!("{}…", &cell[..end])
+}
+
+/// Parses a GFM pipe table starting at `lines[start]`, if it is one: a
+/// header row of `|`-separated cells, a delimiter row of `---` cells, and
+/// at least those two lines. Returns the table and the index of the first
+/// line after it.
+pub fn parse_table(lines: &[impl AsRef<str>], start: usize) -> Option<(Table, usize)> {
+    let header_line = lines.get(start)?.as_ref();
+    let delimiter_line = lines.get(start + 1)?.as_ref();
+    let header = split_row(header_line)?;
+    if header.is_empty() {
+        return None;
+    }
+    let align = parse_delimiter(delimiter_line, header.len())?;
+    let mut rows = Vec::new();
+    let mut end = start + 2;
+    while let Some(line) = lines.get(end) {
+        let line = line.as_ref();
+        if line.trim().is_empty() {
+            break;
+        }
+        match split_row(line) {
+            Some(cells) => {
+                rows.push(cells);
+                end += 1;
+            }
+            None => break,
+        }
+    }
+    if rows.is_empty() {
+        // A delimiter with no data rows is not a table.
+        return None;
+    }
+    Some((
+        Table {
+            header,
+            rows,
+            align,
+        },
+        end,
+    ))
+}
+
+/// Splits one `| a | b |` row into cells. A leading or trailing pipe is
+/// optional; `\|` is a literal pipe. `None` when the line has no pipes
+/// (not a table row).
+fn split_row(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let inner = trimmed
+        .strip_prefix('|')
+        .map(str::to_string)
+        .unwrap_or_else(|| trimmed.to_string());
+    let inner = inner.strip_suffix('|').map(str::to_string).unwrap_or(inner);
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && chars.peek() == Some(&'|') {
+            cell.push('|');
+            chars.next();
+        } else if ch == '|' {
+            cells.push(cell.trim().to_string());
+            cell = String::new();
+        } else {
+            cell.push(ch);
+        }
+    }
+    cells.push(cell.trim().to_string());
+    Some(cells)
+}
+
+/// The delimiter row `| --- | :---: | ---: |`: each cell only dashes and
+/// at most one leading and trailing colon. `None` when any cell breaks the
+/// rule or the count differs from the header.
+fn parse_delimiter(line: &str, columns: usize) -> Option<Vec<Alignment>> {
+    let cells = split_row(line)?;
+    if cells.len() != columns {
+        return None;
+    }
+    cells
+        .into_iter()
+        .map(|cell| {
+            let (left, right) = (cell.starts_with(':'), cell.ends_with(':') && cell.len() > 1);
+            // Only dashes and at most the two colons: anything else is not
+            // a delimiter cell.
+            if !cell.replace(['-', ':'], "").is_empty() {
+                return None;
+            }
+            Some(match (left, right) {
+                (true, true) => Alignment::Center,
+                (false, true) => Alignment::Right,
+                _ => Alignment::Left,
+            })
+        })
+        .collect()
+}
+
 /// Map a parsed span style to a ratatui style for a given accent color.
 /// Kept here so the theme mapping lives next to the parser, but callers
 /// pass their palette so themes stay in control of colors.
-pub fn ratatui_style(style: SpanStyle, accent: ratatui::style::Color) -> Style {
+/// The markdown span styles: code keeps `accent` (upstream's mdCode),
+/// links take their own color (mdLink).
+pub fn ratatui_style_with_link(
+    style: SpanStyle,
+    accent: ratatui::style::Color,
+    link: ratatui::style::Color,
+) -> Style {
     match style {
         SpanStyle::Plain => Style::default(),
         SpanStyle::Bold => Style::default().add_modifier(Modifier::BOLD),
         SpanStyle::Italic => Style::default().add_modifier(Modifier::ITALIC),
         SpanStyle::Code => Style::default().fg(accent),
         SpanStyle::Strike => Style::default().add_modifier(Modifier::CROSSED_OUT),
-        SpanStyle::Link => Style::default()
-            .fg(accent)
-            .add_modifier(Modifier::UNDERLINED),
+        SpanStyle::Link => Style::default().fg(link).add_modifier(Modifier::UNDERLINED),
         // Some terminals (kitty among them) don't visually combine SGR 1+3
         // distinctly on all fonts; tinting with the accent keeps bold-italic
         // recognizable even when the font renders both weights identically.
@@ -318,21 +553,33 @@ pub enum BlockKind {
         language: String,
         closing: bool,
     },
-    /// `- ` or `* ` bullet, or `1. ` ordered.
+    /// `- ` or `* ` bullet, or `1. ` ordered. `marker` carries the source's
+    /// ordered-list number (`1. ` → `Some(1)`) so the display can number the
+    /// list; `None` for bullets.
     ListItem {
         ordered: bool,
+        marker: Option<u64>,
     },
     /// `> text` blockquote.
     Blockquote,
     Plain,
 }
 
+/// The fence marker a line opens or closes a code block with: ``` or
+/// ~~~ (#158: both, as upstream's renderer reads them).
+pub fn fence_marker(line: &str) -> Option<&'static str> {
+    let trimmed = line.trim_start();
+    ["```", "~~~"]
+        .into_iter()
+        .find(|marker| trimmed.starts_with(marker))
+}
+
 /// Classify one source line for block rendering.
 pub fn classify_line(line: &str) -> BlockKind {
     let trimmed = line.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("```") {
+    if let Some(marker) = fence_marker(trimmed) {
         return BlockKind::Fence {
-            language: rest.trim().to_string(),
+            language: trimmed[marker.len()..].trim().to_string(),
             closing: false,
         };
     }
@@ -349,7 +596,10 @@ pub fn classify_line(line: &str) -> BlockKind {
         return BlockKind::Blockquote;
     }
     if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-        return BlockKind::ListItem { ordered: false };
+        return BlockKind::ListItem {
+            ordered: false,
+            marker: None,
+        };
     }
     // Ordered list: digits followed by `. ` — but not decimals in prose
     // ("3.14") because those have no space after the dot.
@@ -358,7 +608,11 @@ pub fn classify_line(line: &str) -> BlockKind {
         .take_while(|ch| ch.is_ascii_digit())
         .collect();
     if !digits.is_empty() && trimmed[digits.len()..].starts_with(". ") {
-        return BlockKind::ListItem { ordered: true };
+        let number = digits.parse::<u64>().ok().filter(|n| *n > 0);
+        return BlockKind::ListItem {
+            ordered: true,
+            marker: number,
+        };
     }
     BlockKind::Plain
 }
@@ -392,13 +646,27 @@ pub fn block_render(kind: &BlockKind, line: &str) -> BlockRender {
             emphasis_blocks: false,
             inline: false,
         },
-        BlockKind::ListItem { ordered } => BlockRender {
+        BlockKind::ListItem { ordered, marker } => BlockRender {
+            // Ordered items display the number the caller supplies (the
+            // list's sequence, like upstream's list renderer, which numbers
+            // items from the first marker and ignores later source numbers).
             prefix: if *ordered {
-                "  1. ".to_string()
+                format!("  {}. ", marker.unwrap_or(1))
             } else {
                 "  • ".to_string()
             },
-            content_byte: line.len() - line.trim_start().len() + 2,
+            // Skip the marker: two characters for a bullet, or the digits,
+            // dot, and space for an ordered item.
+            content_byte: line.len() - line.trim_start().len()
+                + if *ordered {
+                    line.trim_start()
+                        .chars()
+                        .take_while(|ch| ch.is_ascii_digit())
+                        .count()
+                        + 2
+                } else {
+                    2
+                },
             emphasis_blocks: false,
             inline: true,
         },
@@ -530,25 +798,58 @@ mod block_tests {
                 closing: false
             }
         );
+        // #158: tilde fences too; each closes only on its own marker.
+        assert_eq!(
+            classify_line("~~~ python"),
+            BlockKind::Fence {
+                language: "python".into(),
+                closing: false
+            }
+        );
+        assert_eq!(fence_marker("  ~~~"), Some("~~~"));
+        assert_eq!(fence_marker("```js"), Some("```"));
+        assert_eq!(fence_marker("~~ not"), None);
         assert_eq!(
             classify_line("- item"),
-            BlockKind::ListItem { ordered: false }
+            BlockKind::ListItem {
+                ordered: false,
+                marker: None
+            }
         );
         assert_eq!(
             classify_line("1. step"),
-            BlockKind::ListItem { ordered: true }
+            BlockKind::ListItem {
+                ordered: true,
+                marker: Some(1)
+            }
         );
         assert_eq!(classify_line("> quoted"), BlockKind::Blockquote);
         assert_eq!(classify_line("plain text"), BlockKind::Plain);
     }
 
     #[test]
-    fn ordered_list_requires_two_digits() {
-        // 1. is one digit — treat as plain per our subset (avoid matching
-        // decimals like 3.14 in prose).
+    fn ordered_lists_carry_their_source_number() {
         assert_eq!(
             classify_line("1. single"),
-            BlockKind::ListItem { ordered: true }
+            BlockKind::ListItem {
+                ordered: true,
+                marker: Some(1)
+            }
+        );
+        assert_eq!(
+            classify_line("10. ten"),
+            BlockKind::ListItem {
+                ordered: true,
+                marker: Some(10)
+            }
+        );
+        // A zero or overflowing number still renders as the first item.
+        assert_eq!(
+            classify_line("0. zero"),
+            BlockKind::ListItem {
+                ordered: true,
+                marker: None
+            }
         );
         assert_eq!(classify_line("3.14 pi"), BlockKind::Plain);
     }
@@ -557,11 +858,102 @@ mod block_tests {
     fn block_render_prefixes_and_content() {
         let heading = block_render(&BlockKind::Heading(2), "## Title");
         assert_eq!(heading.content_byte, 3);
-        let item = block_render(&BlockKind::ListItem { ordered: false }, "- thing");
+        let item = block_render(
+            &BlockKind::ListItem {
+                ordered: false,
+                marker: None,
+            },
+            "- thing",
+        );
         assert_eq!(item.prefix, "  • ");
         assert_eq!(item.content_byte, 2);
+        let ordered = block_render(
+            &BlockKind::ListItem {
+                ordered: true,
+                marker: Some(3),
+            },
+            "10. ten",
+        );
+        assert_eq!(ordered.prefix, "  3. ");
+        assert_eq!(ordered.content_byte, 4);
         let quote = block_render(&BlockKind::Blockquote, "> wisdom");
         assert_eq!(quote.prefix, "  │ ");
         assert_eq!(quote.content_byte, 1);
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    fn plain(line: &[TableSegment]) -> String {
+        line.iter().map(|segment| segment.text.as_str()).collect()
+    }
+
+    #[test]
+    fn parses_and_renders_a_table() {
+        let lines = [
+            "| Feature | noel | Claude |",
+            "|:--------|:----:|------:|",
+            "| speed   | fast | ok    |",
+            "| price   | free | paid  |",
+        ];
+        let (table, end) = parse_table(&lines, 0).expect("table");
+        assert_eq!(end, 4);
+        assert_eq!(table.header, ["Feature", "noel", "Claude"]);
+        assert_eq!(
+            table.align,
+            [Alignment::Left, Alignment::Center, Alignment::Right]
+        );
+        assert_eq!(table.rows.len(), 2);
+        let rendered = table.render();
+        assert_eq!(rendered.len(), 4);
+        assert_eq!(plain(&rendered[0]), "  │ Feature │ noel │ Claude │");
+        assert_eq!(plain(&rendered[1]), "  ├─────────┼──────┼────────┤");
+        assert_eq!(plain(&rendered[2]), "  │ speed   │ fast │     ok │");
+    }
+
+    #[test]
+    fn escaped_pipes_and_missing_cells() {
+        let lines = ["| a \\| b | c |", "| --- | --- |", "| only-one |"];
+        let (table, _) = parse_table(&lines, 0).expect("table");
+        assert_eq!(table.header, ["a | b", "c"]);
+        assert_eq!(table.rows, [["only-one"]]);
+        // The short row pads; the missing cell is empty.
+        let rendered = table.render();
+        assert!(plain(&rendered[2]).contains("only-one"));
+        assert!(plain(&rendered[2]).ends_with("│   │"));
+    }
+
+    #[test]
+    fn a_delimiter_without_data_rows_is_not_a_table() {
+        let lines = ["| a | b |", "| --- | --- |", "", "prose after"];
+        assert!(parse_table(&lines, 0).is_none());
+    }
+
+    #[test]
+    fn a_bad_delimiter_is_not_a_table() {
+        let lines = ["| a | b |", "| x | --- |", "| 1 | 2 |"];
+        assert!(parse_table(&lines, 0).is_none());
+    }
+
+    #[test]
+    fn wide_cells_truncate_with_an_ellipsis() {
+        let long = "x".repeat(TABLE_MAX_COLUMN_WIDTH + 10);
+        let lines = ["| col |", "| --- |", &format!("| {long} |")];
+        let (table, _) = parse_table(&lines, 0).expect("table");
+        let rendered = table.render();
+        let row = plain(&rendered[2]);
+        assert!(row.contains('…'));
+        assert!(row.chars().count() < long.chars().count() + 8);
+    }
+
+    #[test]
+    fn header_segments_carry_their_flag() {
+        let lines = ["| h |", "| --- |", "| d |"];
+        let (table, _) = parse_table(&lines, 0).expect("table");
+        let rendered = table.render();
+        assert!(rendered[0].iter().any(|segment| segment.header));
+        assert!(rendered[2].iter().all(|segment| !segment.header));
     }
 }

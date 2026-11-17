@@ -10,9 +10,10 @@ use noel_config::{
     model_context_window, LoadedConfig, ModelCost, ModelDefinition, ProviderApi, SourceInfo,
     ThinkingLevelMap,
 };
+use noel_core::controller::{Outcome, Queue, Repeat, SubmissionState};
 use noel_core::{
-    CompactionRecord, ConversationMessage, MessageRole, Run, RunStatus, Runtime, SessionState,
-    SteeringMailbox, ToolEvent, TurnEvent, RETRY_CANCELLED, STEERING_JOIN,
+    CompactionRecord, ConversationMessage, MessageRole, RunStatus, Runtime, SessionState,
+    ToolEvent, TurnEvent, RETRY_CANCELLED,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -324,17 +325,21 @@ impl Data {
         }
     }
 
-    /// The reply to a prompt that repeats the `requestId` of `run`, which
-    /// starts nothing: `started` until the run has finished, `handled`
-    /// after.
-    pub fn repeated(run: &Run) -> Self {
+    /// The reply to a prompt that repeats the `requestId` of an earlier
+    /// one, which starts nothing: `started` until its run has finished,
+    /// `handled` after.
+    pub fn repeated(repeat: &Repeat) -> Self {
+        let (disposition, run_id) = match &repeat.state {
+            SubmissionState::Placed { run_id } => ("started", Some(run_id.clone())),
+            SubmissionState::Settled { run_id, .. } => ("handled", Some(run_id.clone())),
+            // Only prompts carry a requestId here, and a prompt starts a
+            // run; a session another mode queued into may name others.
+            SubmissionState::Queued(_) => ("queued", None),
+            SubmissionState::Withdrawn => ("handled", None),
+        };
         Data::Disposition {
-            disposition: if run.status.is_finished() {
-                "handled"
-            } else {
-                "started"
-            },
-            run_id: Some(run.id.clone()),
+            disposition,
+            run_id,
         }
     }
 
@@ -584,6 +589,8 @@ impl Message {
     }
 
     /// A saved reply: its thinking, text and tool calls, and how it stopped.
+    /// An aborted reply has upstream's stop reason and error text for an
+    /// aborted request.
     fn reply(message: &ConversationMessage) -> Self {
         let mut content = Vec::new();
         if !message.thinking.is_empty() {
@@ -595,9 +602,15 @@ impl Message {
             content.push(Content::text(&message.content));
         }
         content.extend(message.tool_calls.iter().map(Content::tool_call));
+        let (stop_reason, error_message) = if message.aborted {
+            ("aborted", Some(ABORTED.to_owned()))
+        } else {
+            (stop_reason(None, !message.tool_calls.is_empty()), None)
+        };
         Message::Assistant(Assistant {
             content,
-            stop_reason: stop_reason(None, !message.tool_calls.is_empty()),
+            stop_reason,
+            error_message,
             ..Assistant::default()
         })
     }
@@ -808,14 +821,26 @@ struct Cost {
     cache_read: u64,
     cache_write: u64,
     total: u64,
+    /// Whether `total` is a provider-reported billed cost. Present exactly
+    /// when the usage went through cost accounting (upstream's
+    /// `calculateCost` sets it false); a reply cut off before the final
+    /// usage chunk never has one, and the field stays absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_from_provider: Option<bool>,
 }
 
 impl Usage {
+    /// Usage the provider reported with its final accounting: cost ran, so
+    /// `total` is a computed total and the field says so.
     fn new(input: u64, output: u64) -> Self {
         Self {
             input,
             output,
             total_tokens: input.saturating_add(output),
+            cost: Cost {
+                total_from_provider: Some(false),
+                ..Cost::default()
+            },
             ..Self::default()
         }
     }
@@ -877,7 +902,7 @@ pub(crate) enum Event<'a> {
     },
     QueueUpdate {
         steering: Vec<String>,
-        follow_up: &'a [String],
+        follow_up: Vec<String>,
     },
     AutoRetryStart {
         attempt: u64,
@@ -976,10 +1001,13 @@ pub(crate) enum AssistantEvent<'a> {
     },
 }
 
-/// A tool's result, or what it has printed so far: its output as text.
+/// A tool's result, or what it has printed so far: its output as text,
+/// and for a running `codemode` call its nested calls (`details.calls`).
 #[derive(Serialize)]
 pub(crate) struct ExecutionResult<'a> {
     content: &'a [Content],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
 }
 
 /// Where records go, in order.
@@ -987,48 +1015,13 @@ pub(crate) type Sink<'s> = &'s mut dyn FnMut(Event<'_>);
 
 // The queue.
 
-/// Messages waiting for the agent. Steering joins a run's next provider
+/// `queue_update`: what is queued. Steering joins a run's next provider
 /// round; follow-ups start another turn when the run would end. Both are
 /// delivered batched, like the TUI's queue.
-#[derive(Default)]
-pub(crate) struct Queue {
-    pub steering: SteeringMailbox,
-    pub follow_ups: Vec<String>,
-}
-
-/// A queue's steering and follow-ups.
-pub(crate) type Contents = (Vec<String>, Vec<String>);
-
-impl Queue {
-    pub fn pending(&self) -> usize {
-        self.steering.pending() + self.follow_ups.len()
-    }
-
-    pub fn update(&self) -> Event<'_> {
-        Event::QueueUpdate {
-            steering: self.steering.list(),
-            follow_up: &self.follow_ups,
-        }
-    }
-
-    pub fn contents(&self) -> Contents {
-        (self.steering.list(), self.follow_ups.clone())
-    }
-
-    /// Makes `contents` the queue. The steering mailbox stays the one the
-    /// active run reads.
-    pub fn replace(&mut self, (steering, follow_ups): Contents) {
-        self.steering.drain();
-        for message in steering {
-            self.steering.send(message);
-        }
-        self.follow_ups = follow_ups;
-    }
-
-    /// The queued follow-ups as one prompt.
-    pub fn take_follow_ups(&mut self) -> Option<String> {
-        (!self.follow_ups.is_empty())
-            .then(|| std::mem::take(&mut self.follow_ups).join(STEERING_JOIN))
+pub(crate) fn queue_update(queue: &Queue) -> Event<'static> {
+    Event::QueueUpdate {
+        steering: queue.steering(),
+        follow_up: queue.follow_ups(),
     }
 }
 
@@ -1051,23 +1044,6 @@ pub(crate) enum Prompt {
     FollowUps,
 }
 
-/// How a run ended.
-pub(crate) enum Outcome {
-    Completed,
-    Aborted,
-    Failed(String),
-}
-
-impl Outcome {
-    pub fn status(&self) -> RunStatus {
-        match self {
-            Outcome::Completed => RunStatus::Completed,
-            Outcome::Aborted => RunStatus::Aborted,
-            Outcome::Failed(_) => RunStatus::Failed,
-        }
-    }
-}
-
 /// Writes one run's records from the engine's events. A run is one upstream
 /// run whatever its engine calls (one per batch of follow-ups): agent_start,
 /// its turns, agent_end, and one agent_settled. As upstream does, a run that
@@ -1084,16 +1060,28 @@ pub(crate) struct Recorder {
     reported_round: bool,
     round: Option<Round>,
     reply: Option<Streaming>,
-    tool: Option<ChatToolCall>,
+    /// Tools started and not ended, in the order they started (#143: one
+    /// slot, which a second tool overwrote).
+    tools: Vec<ChatToolCall>,
     /// The retry not yet reported as ended, and the error it ended with if
     /// the engine has reported one.
     retry: Option<(u64, Option<String>)>,
-    compacting: bool,
-    /// The compaction answers a context overflow: its reason is overflow,
-    /// and the run asks again once it succeeds.
-    overflowed: bool,
+    compaction: CompactionPhase,
     /// agent_end is written and nothing has started since.
     ended: bool,
+}
+
+/// Where the run's compaction is (#143: two flags, reset at different
+/// points).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CompactionPhase {
+    #[default]
+    None,
+    /// The reply ran out of context: the next compaction answers it.
+    Overflowed,
+    /// A compaction runs; `overflow` when it answers an overflow (its
+    /// reason, and the run asks again once it succeeds).
+    Running { overflow: bool },
 }
 
 /// An open turn: when it started and where its reply is in the run's
@@ -1120,10 +1108,9 @@ impl Recorder {
             reported_round: false,
             round: None,
             reply: None,
-            tool: None,
+            tools: Vec::new(),
             retry: None,
-            compacting: false,
-            overflowed: false,
+            compaction: CompactionPhase::None,
             ended: false,
         }
     }
@@ -1133,7 +1120,7 @@ impl Recorder {
     }
 
     pub fn compacting(&self) -> bool {
-        self.compacting
+        matches!(self.compaction, CompactionPhase::Running { .. })
     }
 
     /// An engine call starts with `prompt`, or continues a stopped run.
@@ -1157,6 +1144,17 @@ impl Recorder {
                 if let Some(round) = &mut self.round {
                     round.reply = Some(self.messages.len() - 1);
                 }
+            }
+            // A user hook's notice is a system message (Claude's
+            // non-blocking hook error): shown, changing nothing.
+            TurnEvent::Notice(text) => {
+                self.start_round(sink);
+                self.add(
+                    Message::System {
+                        content: text.clone(),
+                    },
+                    sink,
+                );
             }
             TurnEvent::MessageAdded(message) if message.role == MessageRole::Assistant => {
                 let raw = self
@@ -1200,7 +1198,7 @@ impl Recorder {
             TurnEvent::Overflowed { error } => {
                 let stop = if error.is_some() { "error" } else { "length" };
                 self.drop_reply(stop, error.as_deref(), false, sink);
-                self.overflowed = true;
+                self.compaction = CompactionPhase::Overflowed;
             }
             TurnEvent::ToolStarted { call } => {
                 sink(Event::ToolExecutionStart {
@@ -1208,7 +1206,7 @@ impl Recorder {
                     tool_name: &call.name,
                     args: parse_arguments(&call.arguments),
                 });
-                self.tool = Some(call.clone());
+                self.tools.push(call.clone());
             }
             TurnEvent::ToolUpdate { call, output } => {
                 // Like upstream's bash, the report that the command starts
@@ -1220,6 +1218,18 @@ impl Recorder {
                     args: parse_arguments(&call.arguments),
                     partial_result: ExecutionResult {
                         content: content.as_slice(),
+                        details: None,
+                    },
+                });
+            }
+            TurnEvent::NestedToolCalls { call, calls } => {
+                sink(Event::ToolExecutionUpdate {
+                    tool_call_id: &call.id,
+                    tool_name: &call.name,
+                    args: parse_arguments(&call.arguments),
+                    partial_result: ExecutionResult {
+                        content: &[],
+                        details: Some(serde_json::json!({ "calls": calls })),
                     },
                 });
             }
@@ -1233,8 +1243,12 @@ impl Recorder {
                 let content = Content::text_and_images(output, images);
                 self.tool_output(call, content, *is_error, duration.map(millis), sink);
             }
+            // The compaction's end reports it.
+            TurnEvent::HistoryRewritten(_) => {}
             TurnEvent::CompactionStarted => {
-                self.compacting = true;
+                self.compaction = CompactionPhase::Running {
+                    overflow: self.compaction == CompactionPhase::Overflowed,
+                };
                 sink(Event::CompactionStart {
                     reason: self.compaction_reason(),
                 });
@@ -1270,12 +1284,9 @@ impl Recorder {
     /// Ends the run: closes what an abort or a failure left open, then
     /// agent_end, unless the run ended with a reply it had dropped, and
     /// agent_settled.
-    pub fn finish(mut self, outcome: Outcome, sink: Sink) {
+    pub fn finish(mut self, outcome: &Outcome, sink: Sink) {
         let aborted = matches!(outcome, Outcome::Aborted);
-        let error = match &outcome {
-            Outcome::Failed(error) => Some(error.as_str()),
-            Outcome::Completed | Outcome::Aborted => None,
-        };
+        let error = outcome.error();
         if self.ended {
             // Only the compaction that was to recover the dropped reply can
             // still be open.
@@ -1332,17 +1343,16 @@ impl Recorder {
     }
 
     fn compaction_reason(&self) -> &'static str {
-        if self.overflowed {
-            "overflow"
-        } else {
-            "threshold"
+        match self.compaction {
+            CompactionPhase::Overflowed | CompactionPhase::Running { overflow: true } => "overflow",
+            _ => "threshold",
         }
     }
 
     /// Ends a compaction the engine left open when it stopped (`error` is
     /// `None` for an abort).
     fn interrupt_compaction(&mut self, error: Option<&str>, sink: Sink) {
-        if std::mem::take(&mut self.compacting) {
+        if let CompactionPhase::Running { .. } = self.compaction {
             sink(Event::CompactionEnd {
                 reason: self.compaction_reason(),
                 result: None,
@@ -1351,6 +1361,8 @@ impl Recorder {
                 error_message: error,
             });
         }
+        // The overflow went with the stop: nothing asks again.
+        self.compaction = CompactionPhase::None;
     }
 
     /// Closes what the engine left open when it stopped (`error` is `None`
@@ -1358,7 +1370,7 @@ impl Recorder {
     /// the turn awaiting one, or of a new turn, with no further delivery.
     fn stop(&mut self, error: Option<&str>, sink: Sink) {
         let message = error.unwrap_or(ABORTED);
-        if let Some(call) = self.tool.take() {
+        for call in std::mem::take(&mut self.tools) {
             let content = vec![Content::text(error.unwrap_or("Operation aborted"))];
             self.tool_output(&call, content, true, None, sink);
         }
@@ -1386,7 +1398,7 @@ impl Recorder {
     fn add_user(&mut self, message: &ConversationMessage, queue: &Queue, sink: Sink) {
         // Steering and follow-ups leave the queue as they are delivered.
         if self.prompt.take() != Some(Prompt::Initial) {
-            sink(queue.update());
+            sink(queue_update(queue));
         }
         self.add(Message::user(message, Some(now())), sink);
     }
@@ -1483,11 +1495,14 @@ impl Recorder {
         duration_ms: Option<u64>,
         sink: Sink,
     ) {
-        self.tool = None;
+        self.tools.retain(|open| open.id != call.id);
         sink(Event::ToolExecutionEnd {
             tool_call_id: &call.id,
             tool_name: &call.name,
-            result: ExecutionResult { content: &content },
+            result: ExecutionResult {
+                content: &content,
+                details: None,
+            },
             is_error,
             duration_ms,
         });
@@ -1505,16 +1520,16 @@ impl Recorder {
     }
 
     fn end_compaction(&mut self, result: Result<&CompactionRecord, &String>, sink: Sink) {
-        self.compacting = false;
+        let overflow = matches!(self.compaction, CompactionPhase::Running { overflow: true });
         sink(Event::CompactionEnd {
             reason: self.compaction_reason(),
             result: result.ok().map(Compaction::from),
             aborted: false,
             // After an overflow, the run asks again with the smaller context.
-            will_retry: self.overflowed && result.is_ok(),
+            will_retry: overflow && result.is_ok(),
             error_message: result.err().map(String::as_str),
         });
-        self.overflowed = false;
+        self.compaction = CompactionPhase::None;
     }
 }
 
@@ -1567,17 +1582,29 @@ impl Streaming {
         self.update(block.delta(index, delta), sink);
     }
 
-    /// Ends the block taking deltas with its whole text.
+    /// Ends the block taking deltas with its whole text. A tool call
+    /// ends here too: upstream's streaming parser ends a tool call with
+    /// the reply's finish, after the final usage chunk, so its
+    /// `toolcall_end` carries the accounted usage.
     fn close(&mut self, sink: Sink) {
         let Some(index) = self.open.take() else {
             return;
         };
         if let Some((block, text)) = self.assistant.content[index].streamed() {
             self.update(block.end(index, text), sink);
+        } else if let Content::ToolCall { .. } = &self.assistant.content[index] {
+            self.update(
+                AssistantEvent::ToolcallEnd {
+                    content_index: index,
+                    tool_call: &self.assistant.content[index],
+                },
+                sink,
+            );
         }
     }
 
-    /// Tool calls arrive whole: their start, their arguments, their end.
+    /// Tool calls arrive whole: their start and their arguments; their end
+    /// comes with the reply's finish, like a text block's.
     fn tool_call(&mut self, id: &str, name: &str, arguments: &str, sink: Sink) {
         self.close(sink);
         let index = self.assistant.content.len();
@@ -1601,13 +1628,8 @@ impl Streaming {
             },
             sink,
         );
-        self.update(
-            AssistantEvent::ToolcallEnd {
-                content_index: index,
-                tool_call: &self.assistant.content[index],
-            },
-            sink,
-        );
+        // The call stays open: `close` ends it with the reply's finish.
+        self.open = Some(index);
     }
 }
 
@@ -1638,4 +1660,46 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(millis)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod recorder_tests {
+    use super::*;
+
+    /// #143: two tools running at once each end, in order, when the run
+    /// stops; one slot used to keep only the last.
+    #[test]
+    fn a_stop_ends_every_open_tool() {
+        let mut ended = Vec::new();
+        let mut sink = |event: Event<'_>| {
+            if let Event::ToolExecutionEnd {
+                tool_call_id,
+                is_error,
+                ..
+            } = event
+            {
+                ended.push((tool_call_id.to_owned(), is_error));
+            }
+        };
+        let source = Source {
+            api: ProviderApi::Faux,
+            provider: "faux".into(),
+            model: "script".into(),
+            thinking_level: "off".into(),
+        };
+        let mut recorder = Recorder::start("r1".into(), source, &mut sink);
+        recorder.call(Some(Prompt::Initial));
+        let queue = Queue::default();
+        recorder.record(&TurnEvent::RoundStarted, &queue, &mut sink);
+        for id in ["c1", "c2"] {
+            let call = ChatToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            };
+            recorder.record(&TurnEvent::ToolStarted { call }, &queue, &mut sink);
+        }
+        recorder.finish(&Outcome::Aborted, &mut sink);
+        assert_eq!(ended, [("c1".to_owned(), true), ("c2".to_owned(), true)]);
+    }
 }

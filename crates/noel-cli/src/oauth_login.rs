@@ -121,7 +121,8 @@ pub async fn poll_device_token(
             return Err(anyhow!("device auth failed with status {status}: {body}"));
         }
         if start.elapsed() >= timeout {
-            return Err(anyhow!("device auth timed out after 15 minutes"));
+            let minutes = timeout.as_secs().div_ceil(60);
+            return Err(anyhow!("device auth timed out after {minutes} minutes"));
         }
         tokio::time::sleep(Duration::from_secs(device.interval)).await;
     }
@@ -165,7 +166,7 @@ pub struct Pkce {
 
 fn random_urlsafe(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
-    getrandom::getrandom(&mut buffer).expect("system randomness unavailable");
+    getrandom::fill(&mut buffer).expect("system randomness unavailable");
     URL_SAFE_NO_PAD.encode(buffer)
 }
 
@@ -377,7 +378,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use noel_config::{AuthCredential, AuthData, DEFAULT_ACCOUNT_NAME};
     use std::io::{BufRead, BufReader, Read, Write};
@@ -386,13 +387,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    struct StubServer {
-        url: String,
+    pub(crate) struct StubServer {
+        pub(crate) url: String,
         hits: Arc<AtomicUsize>,
-        requests: Arc<Mutex<Vec<String>>>,
+        pub(crate) requests: Arc<Mutex<Vec<String>>>,
     }
 
-    fn spawn_stub(responses: Vec<(u16, &'static str)>) -> StubServer {
+    pub(crate) fn spawn_stub(responses: Vec<(u16, &'static str)>) -> StubServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let url = format!("http://{}", listener.local_addr().expect("stub addr"));
         let hits = Arc::new(AtomicUsize::new(0));
@@ -454,7 +455,7 @@ mod tests {
         server
     }
 
-    fn fake_jwt(payload: &str) -> String {
+    pub(crate) fn fake_jwt(payload: &str) -> String {
         let encode = |json: &str| URL_SAFE_NO_PAD.encode(json.as_bytes());
         format!(
             "{}.{}.signature",

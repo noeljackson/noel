@@ -1,5 +1,16 @@
+mod fuzzy;
+mod oklab;
+pub use fuzzy::{fuzzy_filter, fuzzy_match};
+pub use oklab::Rgb;
+mod system_theme;
+mod terminal_colors;
 mod theme;
-pub use theme::{parse_theme_color, TerminalTheme, ThemePalette, BUILTIN_THEMES};
+pub use system_theme::system_theme_palette;
+pub use terminal_colors::{
+    detect_colorfgbg_appearance, parse_color_scheme_report, parse_terminal_reply,
+    terminal_appearance, OscColorTarget, TerminalAppearance, TerminalColors, TerminalReply,
+};
+pub use theme::{parse_theme_color, TerminalTheme, ThemePalette, ToolPhase, BUILTIN_THEMES};
 
 use serde::{Deserialize, Serialize};
 
@@ -211,6 +222,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "show session info",
     },
     CommandHelp {
+        command: "/app",
+        description: "open this session in the desktop app",
+    },
+    CommandHelp {
         command: "/changelog",
         description: "show changelog entries",
     },
@@ -233,6 +248,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
     CommandHelp {
         command: "/tree",
         description: "list session tree",
+    },
+    CommandHelp {
+        command: "/sessions",
+        description: "list the server's sessions, as noel client ls does",
     },
     CommandHelp {
         command: "/summaries",
@@ -259,6 +278,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "import a session export",
     },
     CommandHelp {
+        command: "/import claude [session]",
+        description: "import a Claude Code session of this directory",
+    },
+    CommandHelp {
         command: "/copy",
         description: "copy selected text or last assistant message",
     },
@@ -271,8 +294,32 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "write a bug report for the noel developers",
     },
     CommandHelp {
+        command: "/goal [condition|clear]",
+        description: "keep working until an evaluator confirms the condition; show it, or stop early",
+    },
+    CommandHelp {
+        command: "/plan",
+        description: "toggle plan mode: research and a plan to approve, no file edits",
+    },
+    CommandHelp {
+        command: "/bg [prompt]",
+        description: "run a prompt in a background fork of this session (also & <prompt>); list the forks",
+    },
+    CommandHelp {
+        command: "/runs",
+        description: "list each run's tokens and estimated cost",
+    },
+    CommandHelp {
+        command: "/cost",
+        description: "forecast the cost of the next work from recent runs",
+    },
+    CommandHelp {
+        command: "/rewind",
+        description: "rewind to an earlier prompt, with or without the file changes since; restores its prompt",
+    },
+    CommandHelp {
         command: "/undo",
-        description: "undo last conversation turn; restore prompt (files unchanged)",
+        description: "undo the last turn and its file changes; restore its prompt",
     },
     CommandHelp {
         command: "/usage",
@@ -483,10 +530,10 @@ impl Selector {
     }
 
     pub fn select_query(&self, query: &str) -> Option<&SelectorItem> {
-        if let Ok(index) = query.parse::<usize>() {
-            if index > 0 {
-                return self.items.get(index - 1);
-            }
+        if let Ok(index) = query.parse::<usize>()
+            && index > 0
+        {
+            return self.items.get(index - 1);
         }
         self.items
             .iter()
@@ -513,6 +560,42 @@ impl TerminalRenderer {
 
     pub fn banner(&self) -> String {
         format!("noel rust cli ({})", self.theme.name)
+    }
+
+    /// The startup screen: the logo (the two-line ANSI-shadow wordmark,
+    /// `noel` over `NOEL`, from `docs/logo.txt`), then the banner line.
+    /// Block-element glyphs only (\u{2580}/\u{2584}/\u{2588}/\u{258c}),
+    /// single-width; 45 columns at the widest row.
+    pub fn splash(&self) -> String {
+        const LOGO: [&str; 17] = [
+            "\u{2588}\u{2588}\u{2588}\u{2584}\u{2584}\u{2584}\u{2584}    \u{2584}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2584}     \u{2584}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}  \u{2584}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}\u{2580}\u{2580}\u{2580}\u{2588}\u{2588}\u{2584} \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588}   \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}   \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588}   \u{2588}\u{2588}\u{2588}    \u{2588}\u{2580}  \u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}   \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588}  \u{2584}\u{2588}\u{2588}\u{2588}\u{2584}\u{2584}\u{2584}     \u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}   \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588} \u{2580}\u{2580}\u{2588}\u{2588}\u{2588}\u{2580}\u{2580}\u{2580}     \u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}   \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588}   \u{2588}\u{2588}\u{2588}    \u{2588}\u{2584}  \u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}   \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588}   \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}\u{258c}    \u{2584}",
+            " \u{2580}\u{2588}   \u{2588}\u{2580}   \u{2580}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}    \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2584}\u{2584}\u{2588}\u{2588}",
+            "                                  \u{2580}",
+            " \u{2584}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}  \u{2584}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2584}  \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2584}     \u{2584}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}   \u{2580}\u{2588}\u{2588}\u{2588}   \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}    \u{2588}\u{2580}  \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588}   \u{2588}\u{2588}\u{2588}    \u{2588}\u{2580}",
+            "\u{2588}\u{2588}\u{2588}        \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588}  \u{2584}\u{2588}\u{2588}\u{2588}\u{2584}\u{2584}\u{2584}",
+            "\u{2588}\u{2588}\u{2588}        \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588} \u{2580}\u{2580}\u{2588}\u{2588}\u{2588}\u{2580}\u{2580}\u{2580}",
+            "\u{2588}\u{2588}\u{2588}    \u{2588}\u{2584}  \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588}   \u{2588}\u{2588}\u{2588}    \u{2588}\u{2584}",
+            "\u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}   \u{2584}\u{2588}\u{2588}\u{2588}   \u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}   \u{2580}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}  \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}    \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+        ];
+        let mut out = String::new();
+        for row in LOGO {
+            out.push_str("      ");
+            out.push_str(row);
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str("      ");
+        out.push_str(&self.banner());
+        out
     }
 
     pub fn prompt(&self) -> &'static str {

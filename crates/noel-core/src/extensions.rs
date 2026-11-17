@@ -1,0 +1,1708 @@
+//! The persistent extension host (JSON protocol v2).
+//!
+//! v1 (a manifest's `"protocol": "json"`) runs one process per request: the
+//! request goes in on stdin, one response comes back, and the process exits.
+//! v2 (a manifest's `"protocolVersion": 2`) keeps one process per extension
+//! for the session's life: an `init` handshake carries the extension's
+//! registered tools and commands (upstream's `registerTool` and
+//! `registerCommand`), tools and slash commands travel as requests over the
+//! same pipe, the host sends lifecycle notifications (`sessionStart`,
+//! `agentSettled`, `reload`, `shutdown`), and the extension can send
+//! `registerTools` at any time — the dynamic-tools pattern, where a command
+//! or a gate decides what the model may call next.
+//!
+//! A v2 host holds a child process and its stdin, so it is not part of
+//! [`crate::ReloadableSystems`](crate::ReloadableSystems): reloadable state
+//! stays plain data, the host is runtime state, and `/reload` restarts the
+//! hosts of the new extension set after notifying the old ones.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::sync::Mutex;
+
+use noel_tools::spawn_tool_process;
+
+use crate::{AgentError, ToolError};
+
+/// The protocol version of the persistent host.
+pub const EXTENSION_PROTOCOL_VERSION: u8 = 2;
+
+/// A registered tool, from a manifest (v1) or the v2 `init` handshake and
+/// `registerTools`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionRegistration {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+    pub replay_safe: bool,
+    /// The system prompt's one-line entry for the tool; `None` keeps it out
+    /// of the prompt's tool list (upstream `promptSnippet`).
+    pub prompt_snippet: Option<String>,
+    /// The system prompt's rules for the tool (upstream `promptGuidelines`).
+    pub prompt_guidelines: Vec<String>,
+}
+
+/// A registered `/`-command (upstream `registerCommand`): invoked as
+/// `/<command> [args]` from the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionCommandRegistration {
+    pub name: String,
+    pub description: String,
+}
+
+/// What one loaded extension contributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionRegistrationSet {
+    pub extension_name: String,
+    pub tools: Vec<ExtensionRegistration>,
+    pub commands: Vec<ExtensionCommandRegistration>,
+    /// The extension wants `toolCall` gate requests: before a tool the
+    /// model asked for runs, the host asks it to allow, modify, or block
+    /// the call (upstream's `tool_call` handlers, a permission gate).
+    pub tool_gate: bool,
+}
+
+/// One request's reply: the parsed response and the raw line it came in.
+struct HostResponse {
+    parsed: ExtensionResponse,
+    raw: String,
+}
+
+/// A v2 request to the extension process.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HostRequest<'a> {
+    protocol_version: u8,
+    kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+    input: &'a str,
+    cwd: &'a str,
+    /// `init` only: the session's id, like the environment a bash command
+    /// gets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+}
+
+/// A v2 response from the extension process. `output`/`error` are v1's
+/// command response; v2 adds the host-side effects.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionResponse {
+    output: Option<String>,
+    error: Option<String>,
+    /// Replacement tool registrations from this extension. An empty array
+    /// withdraws them all (upstream: tools cannot be unregistered, only
+    /// re-registered `hidden`, so withdrawing means "none for the model").
+    #[serde(default)]
+    tools: Option<Vec<ExtensionRegistrationWire>>,
+    /// Replacement command registrations from this extension.
+    #[serde(default)]
+    commands: Option<Vec<ExtensionCommandWire>>,
+    /// Ask for `toolCall` gate requests (upstream's `tool_call` handlers).
+    #[serde(default)]
+    tool_gate: bool,
+    /// A gate response: `false` (with `reason`) blocks the call.
+    #[serde(default)]
+    allow: Option<bool>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionRegistrationWire {
+    name: String,
+    description: Option<String>,
+    parameters: Option<Value>,
+    #[serde(default)]
+    replay_safe: bool,
+    prompt_snippet: Option<String>,
+    #[serde(default)]
+    prompt_guidelines: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionCommandWire {
+    name: String,
+    description: Option<String>,
+}
+
+impl From<ExtensionRegistrationWire> for ExtensionRegistration {
+    fn from(wire: ExtensionRegistrationWire) -> Self {
+        ExtensionRegistration {
+            name: wire.name,
+            description: wire.description.unwrap_or_default(),
+            parameters: wire.parameters.unwrap_or_else(
+                || serde_json::json!({"type": "object", "properties": {}, "required": []}),
+            ),
+            replay_safe: wire.replay_safe,
+            prompt_snippet: wire.prompt_snippet,
+            prompt_guidelines: wire.prompt_guidelines,
+        }
+    }
+}
+
+impl From<ExtensionCommandWire> for ExtensionCommandRegistration {
+    fn from(wire: ExtensionCommandWire) -> Self {
+        ExtensionCommandRegistration {
+            name: wire.name,
+            description: wire.description.unwrap_or_default(),
+        }
+    }
+}
+
+/// The outcome of one host request.
+/// A `toolCall` gate's decision for one tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateDecision {
+    /// `false` blocks the call; the model sees `reason` as its error.
+    pub allow: bool,
+    pub reason: String,
+}
+
+impl GateDecision {
+    pub fn allow() -> Self {
+        Self {
+            allow: true,
+            reason: String::new(),
+        }
+    }
+
+    pub fn blocked(reason: String) -> Self {
+        Self {
+            allow: false,
+            reason,
+        }
+    }
+}
+
+/// The outcome of one host request.
+#[derive(Debug)]
+pub struct HostOutcome {
+    pub output: String,
+    pub is_error: bool,
+    /// A gate's structured decision, when the response carried one.
+    pub allow: Option<bool>,
+    pub reason: Option<String>,
+    /// The raw response line, for kinds whose payload is the response
+    /// itself (a gate's `allow`/`reason`) rather than its `output`.
+    pub raw: String,
+    /// Registrations as the extension now wants them, when its response
+    /// carried any.
+    pub registrations: Option<ExtensionRegistrationSet>,
+}
+
+/// One persistent extension process.
+struct HostProcess {
+    child: Child,
+    /// `None` once closed for shutdown: the host reads end of input.
+    stdin: Option<ChildStdin>,
+    pipe: Pipe,
+}
+
+/// The host's stdout, held by the host so a request never takes it away
+/// (#131).
+enum Pipe {
+    /// Between requests: the next line answers the next request.
+    Idle(BufReader<ChildStdout>),
+    /// A request is reading. Found at the start of a request, it means the
+    /// last one was cancelled mid-read, and its answer is still to come.
+    Busy,
+    /// Out of step or closed: the host must be started again.
+    Broken(String),
+}
+impl HostProcess {
+    async fn spawn(
+        path: &Path,
+        extension_name: &str,
+        cwd: &Path,
+        bun: Option<&Path>,
+    ) -> Result<Self, AgentError> {
+        let mut command = host_command(path, bun)?;
+        command
+            .current_dir(cwd)
+            .env("NOEL_EXTENSION_NAME", extension_name)
+            .env("NOEL_EXTENSION_PATH", path)
+            .env("NOEL_EXTENSION_PROTOCOL", "2")
+            // A TypeScript extension resolves its imports against the
+            // directory noel found it in, not against the shim's own.
+            .env("NOEL_EXTENSION_DIR", path.parent().unwrap_or(cwd))
+            // Extensions written for pi read the same values under PI_ names.
+            .env("PI_EXTENSION_NAME", extension_name)
+            .env("PI_EXTENSION_PATH", path)
+            .env("PI_EXTENSION_PROTOCOL", "2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Like a tool call: no controlling terminal, and a dropped host
+        // kills the extension's whole process group. The group guard is
+        // finished (released, not killed): the host outlives the call, and
+        // the child's kill_on_drop still kills it when the host drops.
+        let (mut child, group) = spawn_tool_process(&mut command).map_err(|source| {
+            // Name what actually failed to start: for a `.ts` extension
+            // that is the bun program, not the extension's own file.
+            let program = Path::new(command.as_std().get_program());
+            let what = if program != path {
+                format!(
+                    "{} (needed for the TypeScript extension {}; run noel bun install \
+                     or put a bun on PATH)",
+                    program.display(),
+                    path.display()
+                )
+            } else {
+                path.display().to_string()
+            };
+            AgentError::Tool(ToolError::Io {
+                path: what.into(),
+                source,
+            })
+        })?;
+        group.finish();
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            pipe: Pipe::Idle(BufReader::new(stdout)),
+        })
+    }
+
+    async fn request(&mut self, request: &HostRequest<'_>) -> Result<HostResponse, String> {
+        let mut line = serde_json::to_string(request).map_err(|error| error.to_string())?;
+        line.push('\n');
+        // The pipe is Busy until the answer is read: a request dropped
+        // before then leaves it Busy, which the next request reads as
+        // broken.
+        let mut stdout = match std::mem::replace(&mut self.pipe, Pipe::Busy) {
+            Pipe::Idle(stdout) => stdout,
+            Pipe::Busy => return Err(self.broken("a cancelled request left its answer unread")),
+            Pipe::Broken(reason) => return Err(self.broken(&reason)),
+        };
+        let exchange = async {
+            let stdin = self.stdin.as_mut().ok_or(io::ErrorKind::BrokenPipe)?;
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.flush().await?;
+            // One line of JSON back per request, like v1's single response.
+            let mut response = String::new();
+            stdout.read_line(&mut response).await?;
+            Ok::<_, io::Error>(response)
+        };
+        let response = match exchange.await {
+            Ok(response) if response.is_empty() => {
+                return Err(self.broken("extension exited without a response"))
+            }
+            Ok(response) => response,
+            Err(error) => return Err(self.broken(&error.to_string())),
+        };
+        self.pipe = Pipe::Idle(stdout);
+        let parsed: ExtensionResponse =
+            serde_json::from_str(response.trim()).map_err(|error| error.to_string())?;
+        Ok(HostResponse {
+            parsed,
+            raw: response.trim().to_string(),
+        })
+    }
+
+    /// Fire-and-forget notification; the extension may exit afterwards
+    /// (`shutdown`), so no response is read.
+    async fn notify(&mut self, request: &HostRequest<'_>) -> Result<(), String> {
+        let mut line = serde_json::to_string(request).map_err(|error| error.to_string())?;
+        line.push('\n');
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "extension input is closed".to_string())?;
+        stdin.write_all(line.as_bytes()).await.map_err(io_error)?;
+        stdin.flush().await.map_err(io_error)
+    }
+
+    /// Marks the pipe broken and returns why.
+    fn broken(&mut self, reason: &str) -> String {
+        self.pipe = Pipe::Broken(reason.to_owned());
+        reason.to_owned()
+    }
+
+    fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Whether the host can answer a request: running, and its pipe idle.
+    fn usable(&mut self) -> bool {
+        matches!(self.pipe, Pipe::Idle(_)) && self.is_alive()
+    }
+}
+
+/// Spawns a v2 host and sends `init`, returning the host and the
+/// registrations it answered with.
+async fn launch(
+    extension_name: &str,
+    spec: &HostSpec,
+) -> Result<(HostProcess, Option<ExtensionRegistrationSet>), String> {
+    let mut process = HostProcess::spawn(&spec.path, extension_name, &spec.cwd, None)
+        .await
+        .map_err(|error| error.to_string())?;
+    let response = process
+        .request(&HostRequest {
+            protocol_version: EXTENSION_PROTOCOL_VERSION,
+            kind: "init",
+            command: None,
+            tool_call_id: None,
+            input: "",
+            cwd: &spec.cwd.display().to_string(),
+            session_id: Some(&spec.session_id),
+        })
+        .await;
+    match response {
+        Ok(response) => {
+            let set = registrations_from_response(extension_name, &response.parsed);
+            Ok((process, set))
+        }
+        Err(error) => {
+            let _ = process.child.kill().await;
+            Err(format!("extension {extension_name} init failed: {error}"))
+        }
+    }
+}
+
+fn io_error(error: io::Error) -> String {
+    error.to_string()
+}
+
+/// The session's extension hosts: one persistent process per v2 extension,
+/// plus the registrations the handshakes produced. v1 extensions keep their
+/// one-shot behavior and are not held here.
+#[derive(Default)]
+pub struct ExtensionHosts {
+    /// Each v2 extension's host, by extension name: how it was started and
+    /// where it is now.
+    entries: BTreeMap<String, HostEntry>,
+    /// Registrations by extension name, from `init` and later responses.
+    registrations: BTreeMap<String, ExtensionRegistrationSet>,
+    /// The one-shot v1 tools, by tool name, for dispatch.
+    v1_tools: BTreeMap<String, V1Tool>,
+}
+
+/// One v2 extension's host.
+struct HostEntry {
+    /// How it was started, to start it again when it broke.
+    spec: HostSpec,
+    phase: HostPhase,
+}
+
+enum HostPhase {
+    /// Started; an exited or broken process is started again on its next
+    /// call.
+    Running(Arc<Mutex<HostProcess>>),
+    /// Could not start: calls report the reason instead of running, fail
+    /// closed. Not retried until the spec or the file changes.
+    Failed(String),
+}
+
+/// How long a host gets to run its shutdown handlers and exit.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What a host's `init` was given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostSpec {
+    path: PathBuf,
+    cwd: PathBuf,
+    session_id: String,
+    /// The file's modification time when started, so a failed extension
+    /// that was edited is tried again.
+    modified: Option<std::time::SystemTime>,
+}
+
+impl HostSpec {
+    fn new(path: &Path, cwd: &Path, session_id: &str) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            cwd: cwd.to_path_buf(),
+            session_id: session_id.to_owned(),
+            modified: std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok(),
+        }
+    }
+}
+
+/// A v1 manifest tool and the extension it belongs to.
+#[derive(Debug, Clone)]
+pub struct V1Tool {
+    pub extension_name: String,
+    pub extension_path: PathBuf,
+    pub tool_name: String,
+}
+
+impl ExtensionHosts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start a v2 host: spawn, send `init`, and adopt its registrations.
+    /// A host already started for `extension_name` is stopped first.
+    pub async fn start(
+        &mut self,
+        extension_name: &str,
+        path: &Path,
+        cwd: &Path,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let spec = HostSpec::new(path, cwd, session_id);
+        if let Some(old) = self.entries.remove(extension_name)
+            && let HostPhase::Running(host) = old.phase
+        {
+            let _ = host.lock().await.child.start_kill();
+        }
+        match launch(extension_name, &spec).await {
+            Ok((process, set)) => {
+                tracing::debug!(extension = extension_name, "extension host started");
+                match set {
+                    Some(set) => {
+                        self.registrations.insert(extension_name.to_string(), set);
+                    }
+                    None => {
+                        self.registrations.remove(extension_name);
+                    }
+                }
+                self.entries.insert(
+                    extension_name.to_string(),
+                    HostEntry {
+                        spec,
+                        phase: HostPhase::Running(Arc::new(Mutex::new(process))),
+                    },
+                );
+                Ok(())
+            }
+            Err(message) => {
+                tracing::warn!(extension = extension_name, %message, "extension host failed to start");
+                // A spawn or init failure is recorded: later calls report
+                // it instead of "has no host", failing closed with the
+                // reason.
+                self.registrations.remove(extension_name);
+                self.entries.insert(
+                    extension_name.to_string(),
+                    HostEntry {
+                        spec,
+                        phase: HostPhase::Failed(message.clone()),
+                    },
+                );
+                Err(message)
+            }
+        }
+    }
+
+    /// Whether `extension_name` was started (running or failed) as it
+    /// would be now: the same file, unchanged for a failed one, cwd and
+    /// session. Otherwise `start` should run (again).
+    pub fn started_as(
+        &self,
+        extension_name: &str,
+        path: &Path,
+        cwd: &Path,
+        session_id: &str,
+    ) -> bool {
+        let Some(entry) = self.entries.get(extension_name) else {
+            return false;
+        };
+        let spec = HostSpec::new(path, cwd, session_id);
+        match entry.phase {
+            HostPhase::Running(_) => {
+                entry.spec.path == spec.path
+                    && entry.spec.cwd == spec.cwd
+                    && entry.spec.session_id == spec.session_id
+            }
+            HostPhase::Failed(_) => entry.spec == spec,
+        }
+    }
+
+    fn running(&self) -> impl Iterator<Item = (&String, &Arc<Mutex<HostProcess>>)> {
+        self.entries
+            .iter()
+            .filter_map(|(name, entry)| match &entry.phase {
+                HostPhase::Running(host) => Some((name, host)),
+                HostPhase::Failed(_) => None,
+            })
+    }
+
+    /// Register the one-shot v1 tools for dispatch.
+    pub fn set_v1_tools(&mut self, tools: Vec<V1Tool>) {
+        self.v1_tools = tools
+            .into_iter()
+            .map(|tool| (tool.tool_name.clone(), tool))
+            .collect();
+    }
+
+    /// The registrations of every live extension.
+    pub fn registration_sets(&self) -> Vec<ExtensionRegistrationSet> {
+        self.registrations.values().cloned().collect()
+    }
+
+    /// The extension that owns a tool name, if any (v2 first, then v1).
+    pub fn owning_extension(&self, tool: &str) -> Option<String> {
+        self.registrations
+            .values()
+            .find(|set| set.tools.iter().any(|tool_| tool_.name == tool))
+            .map(|set| set.extension_name.clone())
+            .or_else(|| {
+                self.v1_tools
+                    .get(tool)
+                    .map(|tool_| tool_.extension_name.clone())
+            })
+    }
+
+    /// Send a lifecycle notification to every live host. Returns the
+    /// failures to surface as diagnostics.
+    pub async fn notify(&mut self, kind: &str, cwd: &Path) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        for (name, host) in self.running() {
+            let mut host = host.lock().await;
+            if !host.is_alive() {
+                continue;
+            }
+            if let Err(error) = host
+                .notify(&HostRequest {
+                    protocol_version: EXTENSION_PROTOCOL_VERSION,
+                    kind,
+                    command: None,
+                    tool_call_id: None,
+                    input: "",
+                    cwd: &cwd.display().to_string(),
+                    session_id: None,
+                })
+                .await
+            {
+                diagnostics.push(format!("extension {name} {kind} failed: {error}"));
+            }
+        }
+        diagnostics
+    }
+
+    /// A v2 tool call or slash command. Returns the output and any
+    /// registration changes.
+    pub async fn call(
+        &mut self,
+        extension_name: &str,
+        kind: &str,
+        command: &str,
+        input: &str,
+        cwd: &Path,
+        tool_call_id: Option<&str>,
+    ) -> Result<HostOutcome, String> {
+        let entry = self
+            .entries
+            .get(extension_name)
+            .ok_or_else(|| format!("extension {extension_name} has no host"))?;
+        let host = match &entry.phase {
+            HostPhase::Failed(failure) => return Err(failure.clone()),
+            HostPhase::Running(host) => host,
+        };
+        let mut host = host.lock().await;
+        if !host.usable() {
+            // Exited, or its pipe broke (a request cancelled mid-read, or
+            // one that failed): start it again, as `/reload` would.
+            tracing::debug!(
+                extension = extension_name,
+                "extension host unusable; starting it again"
+            );
+            let (process, set) = launch(extension_name, &entry.spec)
+                .await
+                .map_err(|error| format!("extension {extension_name} exited; {error}"))?;
+            let _ = host.child.start_kill();
+            *host = process;
+            if let Some(set) = set {
+                self.registrations.insert(extension_name.to_string(), set);
+            }
+        }
+        let response = host
+            .request(&HostRequest {
+                protocol_version: EXTENSION_PROTOCOL_VERSION,
+                kind,
+                command: Some(command),
+                tool_call_id,
+                input,
+                cwd: &cwd.display().to_string(),
+                session_id: None,
+            })
+            .await?;
+        let HostResponse {
+            parsed: response,
+            raw: raw_line,
+        } = response;
+        let is_error = response.error.is_some();
+        let allow = response.allow;
+        let reason = response.reason.clone();
+        let output = response
+            .output
+            .clone()
+            .unwrap_or_else(|| format!("extension {extension_name} {kind} {command} completed"));
+        Ok(HostOutcome {
+            output,
+            is_error,
+            allow,
+            reason,
+            raw: raw_line,
+            registrations: registrations_from_response(extension_name, &response),
+        })
+    }
+
+    /// Ask every gate-registered host to allow, modify, or block a tool
+    /// call (upstream's `tool_call` handlers, in registration order). A
+    /// gate that fails closes: the call is blocked with the failure, never
+    /// run, because a gate is a safety decision.
+    pub async fn gate_tool_call(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        cwd: &Path,
+    ) -> Result<GateDecision, String> {
+        let gated: Vec<String> = self
+            .registrations
+            .values()
+            .filter(|set| set.tool_gate)
+            .map(|set| set.extension_name.clone())
+            .collect();
+        let mut decision = GateDecision::allow();
+        for extension_name in gated {
+            let outcome = self
+                .call(&extension_name, "toolCall", tool_name, input, cwd, None)
+                .await;
+            match outcome {
+                Ok(outcome) => {
+                    if outcome.is_error {
+                        return Ok(GateDecision::blocked(format!(
+                            "extension {extension_name} gate failed: {}",
+                            outcome.output
+                        )));
+                    }
+                    if let Some(set) = outcome.registrations {
+                        self.apply_registrations(set);
+                    }
+                    // The structured decision wins; a response without
+                    // one allows, and a plain-text `output` is a block
+                    // reason, so a script can gate without building JSON.
+                    if let Some(allow) = outcome.allow {
+                        if allow {
+                            continue;
+                        }
+                        let reason = outcome
+                            .reason
+                            .or(Some(outcome.output))
+                            .filter(|reason| !reason.is_empty())
+                            .unwrap_or_else(|| "blocked by extension gate".to_string());
+                        decision = GateDecision::blocked(reason);
+                        continue;
+                    }
+                    let payload = outcome.output.trim();
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    decision = GateDecision::blocked(payload.to_string());
+                }
+                Err(error) => {
+                    // Fail closed: a host that cannot answer a safety
+                    // question does not silently allow the call.
+                    return Ok(GateDecision::blocked(format!(
+                        "extension {extension_name} gate failed: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(decision)
+    }
+
+    /// A one-shot v1 tool call: spawn, ask, exit.
+    pub async fn call_v1(
+        &mut self,
+        extension_name: &str,
+        path: &Path,
+        tool_name: &str,
+        tool_call_id: &str,
+        input: &str,
+        cwd: &Path,
+    ) -> Result<HostOutcome, String> {
+        let mut process = HostProcess::spawn(path, extension_name, cwd, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        let outcome = process
+            .request(&HostRequest {
+                protocol_version: 1,
+                kind: "tool",
+                command: Some(tool_name),
+                tool_call_id: Some(tool_call_id),
+                input,
+                cwd: &cwd.display().to_string(),
+                session_id: None,
+            })
+            .await
+            .map(|response| HostOutcome {
+                output: response.parsed.output.unwrap_or_else(|| {
+                    format!("extension {extension_name} tool {tool_name} completed")
+                }),
+                is_error: response.parsed.error.is_some(),
+                allow: response.parsed.allow,
+                reason: response.parsed.reason.clone(),
+                raw: response.raw,
+                registrations: None,
+            })
+            .map_err(|error| format!("extension {extension_name} failed: {error}"));
+        let _ = process.child.kill().await;
+        outcome
+    }
+
+    /// Adopt registration changes from a response.
+    pub fn apply_registrations(&mut self, set: ExtensionRegistrationSet) {
+        self.registrations.insert(set.extension_name.clone(), set);
+    }
+
+    /// Stop every host, notifying `shutdown` first.
+    pub async fn shutdown(&mut self, cwd: &Path) {
+        self.notify("shutdown", cwd).await;
+        // A host runs its shutdown handlers and exits; end of input asks a
+        // host that ignores the notification to exit too. One that has not
+        // exited in time is killed.
+        for (_, host) in self.running() {
+            let mut host = host.lock().await;
+            drop(host.stdin.take());
+            let exited = tokio::time::timeout(SHUTDOWN_GRACE, host.child.wait()).await;
+            if exited.is_err() {
+                let _ = host.child.kill().await;
+            }
+        }
+        self.entries.clear();
+        self.registrations.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.v1_tools.is_empty()
+    }
+
+    /// Drop the hosts of extensions no longer loaded and their
+    /// registrations, so a reload that removes a v2 extension stops
+    /// offering its tools.
+    pub fn retain_extensions(&mut self, keep: &[String]) {
+        self.entries.retain(|name, entry| {
+            let kept = keep.contains(name);
+            if let (false, HostPhase::Running(host)) = (kept, &entry.phase)
+                && let Ok(mut host) = host.try_lock()
+            {
+                let _ = host.child.start_kill();
+            }
+            kept
+        });
+        self.registrations.retain(|name, _| keep.contains(name));
+    }
+}
+
+fn registrations_from_response(
+    extension_name: &str,
+    response: &ExtensionResponse,
+) -> Option<ExtensionRegistrationSet> {
+    if response.tools.is_none() && response.commands.is_none() {
+        return None;
+    }
+    Some(ExtensionRegistrationSet {
+        extension_name: extension_name.to_string(),
+        tools: response
+            .tools
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(ExtensionRegistration::from)
+            .collect(),
+        commands: response
+            .commands
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(ExtensionCommandRegistration::from)
+            .collect(),
+        tool_gate: response.tool_gate,
+    })
+}
+
+/// Read a manifest's declared protocol version. `Some(2)` is the persistent
+/// host; anything else is v1's one-shot behavior.
+pub fn manifest_protocol_version(path: &Path) -> Option<u8> {
+    let manifest_paths = crate::extension_manifest_paths(path);
+    for manifest_path in manifest_paths {
+        let Ok(content) = std::fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        // A manifest can name the persistent protocol either way.
+        let protocol = value
+            .get("protocolVersion")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                value
+                    .get("protocol")
+                    .and_then(Value::as_str)
+                    .and_then(|protocol| protocol.strip_prefix("json").map(str::to_string))
+                    .map(|suffix| {
+                        let trimmed = suffix.trim();
+                        if trimmed.is_empty() {
+                            1
+                        } else {
+                            trimmed.parse::<u64>().unwrap_or(1)
+                        }
+                    })
+            });
+        return protocol.map(|version| version.clamp(1, 2) as u8);
+    }
+    None
+}
+
+/// Map a host error onto the agent error type used for tool failures.
+pub fn host_error_as_agent_error(extension_name: &str, error: String) -> AgentError {
+    AgentError::Tool(ToolError::Failed(format!(
+        "extension {extension_name}: {error}"
+    )))
+}
+
+/// The command that runs one extension. An executable file runs itself
+/// (v1's one-shot programs and v2 hosts); a `.ts` file runs under the bun
+/// host: `bun <noel-bun-host.ts> <extension.ts>`, with the bun binary
+/// resolved as [`find_bun_binary`] describes and the shim as
+/// [`find_bun_host`] does.
+fn host_command(path: &Path, bun: Option<&Path>) -> Result<tokio::process::Command, AgentError> {
+    let is_typescript = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension == "ts");
+    if !is_typescript {
+        // An executable file is its own host, as before.
+        return Ok(tokio::process::Command::new(path));
+    }
+    let shim = find_bun_host().ok_or_else(|| {
+        AgentError::Tool(ToolError::Failed(
+            "a TypeScript extension needs noel's shim (shipped beside the noel \
+             binary or in the agent dir); set NOEL_BUN_HOST to the shim's path"
+                .to_string(),
+        ))
+    })?;
+    let bun = bun
+        .map(Path::to_path_buf)
+        .or_else(find_bun_binary)
+        .ok_or_else(|| {
+            AgentError::Tool(ToolError::Failed(
+                "a TypeScript extension needs bun; install it (noel bun install \
+                 downloads it into the agent dir) or put a bun on PATH"
+                    .to_string(),
+            ))
+        })?;
+    let mut command = tokio::process::Command::new(bun);
+    command.arg(shim).arg(path);
+    Ok(command)
+}
+
+/// Where noel's bun shim lives: `NOEL_BUN_HOST`, else beside the running
+/// binary, else the agent dir's `extension-hosts/noel-bun-host.ts`, the
+/// same agent dir the config discovers.
+fn find_bun_host() -> Option<PathBuf> {
+    if let Some(override_path) = std::env::var_os(noel_config::env::BUN_HOST) {
+        let path = PathBuf::from(override_path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let beside = exe.parent().map(|dir| dir.join("noel-bun-host.ts"));
+        if let Some(beside) = beside.filter(|path| path.is_file()) {
+            return Some(beside);
+        }
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let (paths, _import) = noel_config::ConfigPaths::discover(cwd, None).ok()?;
+    let shim = paths.agent_dir.join("extension-hosts/noel-bun-host.ts");
+    shim.is_file().then_some(shim)
+}
+
+/// The bun binary for a TypeScript host: `NOEL_BUN_BIN` (a path or `path`,
+/// for PATH resolution), else the agent dir's `bin/bun` (what `noel bun
+/// install` puts there), else a `bun` on PATH. Musl and glibc systems both
+/// run the stock release build; the download picks the right asset.
+pub fn find_bun_binary() -> Option<PathBuf> {
+    if let Some(override_value) = std::env::var_os(noel_config::env::BUN_BIN) {
+        let value = override_value.to_string_lossy().to_string();
+        let value = value.trim();
+        if value == "path" {
+            return which_bun();
+        }
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    // The agent dir's install (what `noel bun install` put there): a
+    // discover failure (test isolation, odd HOME) never hides a PATH bun.
+    if let Ok(cwd) = std::env::current_dir()
+        && let Ok((paths, _import)) = noel_config::ConfigPaths::discover(cwd, None)
+    {
+        let installed = paths.agent_dir.join("bin/bun");
+        if installed.is_file() {
+            return Some(installed);
+        }
+    }
+    which_bun()
+}
+
+/// A `bun` on PATH, by direct probe (no `which` crate in the core).
+fn which_bun() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join("bun"))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// #131: a gate request cancelled mid-read (its tool call was aborted)
+    /// leaves the host out of step; the next call gets an answer from a
+    /// fresh host instead of failing closed for the rest of the session.
+    #[tokio::test]
+    async fn a_cancelled_request_does_not_break_the_host() {
+        let cwd = std::env::temp_dir().join(format!("noel-ext-cancel-{}", std::process::id()));
+        fs::create_dir_all(&cwd).unwrap();
+        let path = cwd.join("gate.sh");
+        fs::write(
+            &path,
+            concat!(
+                "#!/bin/sh\n",
+                "while read line; do\n",
+                "  case \"$line\" in\n",
+                "    *'\"kind\":\"init\"'*) printf '%s\\n' '{\"output\":\"\",\"tools\":[],\"toolGate\":true}';;\n",
+                "    *slow*) sleep 5; printf '%s\\n' '{\"allow\":false,\"reason\":\"stale\"}';;\n",
+                "    *) printf '%s\\n' '{\"allow\":true}';;\n",
+                "  esac\n",
+                "done\n",
+            ),
+        )
+        .unwrap();
+        make_executable(&path);
+        let mut hosts = ExtensionHosts::new();
+        hosts.start("gate", &path, &cwd, "s1").await.unwrap();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            hosts.gate_tool_call("read", r#"{"path":"slow"}"#, &cwd),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the slow gate is cut off");
+        let next = hosts
+            .gate_tool_call("read", r#"{"path":"fine"}"#, &cwd)
+            .await;
+        assert_eq!(next, Ok(GateDecision::allow()));
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    /// #139: a host that failed to start is not started again on every
+    /// run, its failure goes once a later start succeeds, and a host
+    /// started for another session is started again.
+    #[tokio::test]
+    async fn a_failed_host_waits_for_a_change_and_a_success_clears_it() {
+        let cwd = std::env::temp_dir().join(format!("noel-ext-failed-{}", std::process::id()));
+        fs::create_dir_all(&cwd).unwrap();
+        let path = cwd.join("ext.sh");
+        fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        make_executable(&path);
+        let mut hosts = ExtensionHosts::new();
+        assert!(hosts.start("ext", &path, &cwd, "s1").await.is_err());
+        assert!(
+            hosts.started_as("ext", &path, &cwd, "s1"),
+            "not retried as is"
+        );
+        let failed = hosts.call("ext", "command", "go", "", &cwd, None).await;
+        assert!(failed.is_err_and(|error| error.contains("init failed")));
+
+        fs::write(
+            &path,
+            concat!(
+                "#!/bin/sh\n",
+                "while read line; do\n",
+                "  case \"$line\" in\n",
+                "    *'\"kind\":\"init\"'*) printf '%s\\n' '{\"output\":\"\",\"tools\":[]}';;\n",
+                "    *) printf '%s\\n' '{\"output\":\"ran\"}';;\n",
+                "  esac\n",
+                "done\n",
+            ),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            !hosts.started_as("ext", &path, &cwd, "s1"),
+            "an edit retries"
+        );
+        hosts.start("ext", &path, &cwd, "s1").await.unwrap();
+        let outcome = hosts
+            .call("ext", "command", "go", "", &cwd, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.output, "ran");
+        assert!(hosts.started_as("ext", &path, &cwd, "s1"));
+        assert!(
+            !hosts.started_as("ext", &path, &cwd, "s2"),
+            "a new session restarts"
+        );
+        assert!(!hosts.started_as("ext", &cwd.join("other.sh"), &cwd, "s1"));
+        hosts.shutdown(&cwd).await;
+        assert!(hosts.is_empty());
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    /// Serializes the tests that change how bun and its shim are found
+    /// (`NOEL_BUN_HOST`, `NOEL_BUN_BIN`, `NOEL_DIR`): the variables are
+    /// process-wide, so a test pointing them at stubs must not run while
+    /// another test starts a real bun host.
+    static BUN_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Holds [`BUN_ENV`] with `NOEL_BUN_HOST` set to `shim`; dropping
+    /// it restores the variable, then releases the lock.
+    struct BunHostEnv {
+        previous: Option<std::ffi::OsString>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for BunHostEnv {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+                Some(value) => unsafe { std::env::set_var("NOEL_BUN_HOST", value) },
+                // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+                None => unsafe { std::env::remove_var("NOEL_BUN_HOST") },
+            }
+        }
+    }
+
+    /// The pi release the vendored examples (`examples/extensions/
+    /// typescript/`, synced from upstream 5f312dac) run against. With no
+    /// `node_modules`, bun installs an example's imports on first run; a
+    /// `package.json` beside it pins them, so a new pi release on npm cannot
+    /// change what these tests run (pi-ai 1.5.0 dropped `Type`, which
+    /// `hello.ts` imports). Move it with the next example sync.
+    const VENDORED_PI_VERSION: &str = "1.4.0";
+
+    /// Pins the pi packages the vendored examples import, in `dir`.
+    fn pin_vendored_pi_packages(dir: &Path) {
+        let dependencies: serde_json::Map<String, serde_json::Value> = [
+            "@earendil-works/pi-ai",
+            "@earendil-works/pi-coding-agent",
+            "@earendil-works/pi-tui",
+        ]
+        .into_iter()
+        .map(|name| (name.to_string(), VENDORED_PI_VERSION.into()))
+        .collect();
+        fs::write(
+            dir.join("package.json"),
+            serde_json::json!({ "private": true, "dependencies": dependencies }).to_string(),
+        )
+        .expect("write package.json");
+    }
+
+    async fn bun_host_env(shim: &Path) -> BunHostEnv {
+        let lock = BUN_ENV.lock().await;
+        let previous = std::env::var_os("NOEL_BUN_HOST");
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        unsafe { std::env::set_var("NOEL_BUN_HOST", shim) };
+        BunHostEnv {
+            previous,
+            _lock: lock,
+        }
+    }
+
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod");
+    }
+
+    #[tokio::test]
+    async fn v2_host_registers_tools_and_serves_tool_calls() {
+        let cwd = std::env::temp_dir().join(format!("noel-ext-host-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("mkdir");
+        let extension = cwd.join("hosted.sh");
+        fs::write(
+            &extension,
+            concat!(
+                "#!/bin/sh\n",
+                "while read line; do\n",
+                "  case \"$line\" in\n",
+                "    *'\"kind\":\"init\"'*) printf '%s\\n' '{\"output\":\"ready\",\"tools\":[{\"name\":\"dyn\",\"parameters\":{\"type\":\"object\"}}],\"commands\":[{\"name\":\"hi\"}]}';;\n",
+                "    *) printf '%s\\n' '{\"output\":\"ran\"}';;\n",
+                "  esac\n",
+                "done\n",
+            ),
+        )
+        .expect("write");
+        make_executable(&extension);
+        let mut hosts = ExtensionHosts::new();
+        hosts
+            .start("hosted", &extension, &cwd, "session-1")
+            .await
+            .expect("start host");
+        let sets = hosts.registration_sets();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].tools[0].name, "dyn");
+        assert_eq!(sets[0].commands[0].name, "hi");
+        let outcome = hosts
+            .call("hosted", "tool", "dyn", "{}", &cwd, Some("call-1"))
+            .await
+            .expect("call tool");
+        assert_eq!(outcome.output, "ran");
+        hosts.shutdown(&cwd).await;
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    /// A `.ts` extension runs under the bun host: the same handshake, tool
+    /// call, and gate as the shell host above, through noel's shipped shim.
+    /// Skipped when bun or the repo's shim is not available (CI without
+    /// bun keeps passing; the drift image covers the full chain).
+    #[tokio::test]
+    async fn v2_typescript_extension_runs_under_bun_host() {
+        let Ok(bun) = which_bun() else {
+            eprintln!("skipping: bun not found");
+            return;
+        };
+        let Some(shim) = repo_bun_host_shim() else {
+            eprintln!("skipping: shim not found");
+            return;
+        };
+        let cwd = std::env::temp_dir().join(format!("noel-ext-bun-{}", std::process::id()));
+        let agent_dir = cwd.join("agent");
+        let extensions_dir = agent_dir.join("extensions");
+        fs::create_dir_all(&extensions_dir).expect("mkdir");
+        let extension = extensions_dir.join("gate.ts");
+        fs::write(
+            &extension,
+            r#"
+            export default function (pi) {
+              pi.registerTool({
+                name: "echo_tool",
+                description: "Echo its input back.",
+                parameters: { type: "object", properties: { text: { type: "string" } } },
+                // Upstream's execute signature; AgentToolResult content.
+                execute: async (_id, params) => ({
+                  content: [{ type: "text", text: "echo: " + params.text }],
+                }),
+              });
+              pi.registerCommand("greet", { handler: async (args) => "hello, " + (args || "world") });
+              pi.on("toolCall", async (event) => {
+                if (String(event.input.command ?? "").includes("secret")) {
+                  return { allow: false, reason: "secret path is protected" };
+                }
+                return { allow: true };
+              });
+            }
+            "#,
+        )
+        .expect("write extension");
+        fs::write(
+            extensions_dir.join("gate.ts.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+
+        // The shim lookup checks NOEL_BUN_HOST first; point it at the repo's
+        // shim so the test does not depend on an installed agent dir.
+        let _guard = bun_host_env(&shim).await;
+
+        let mut hosts = ExtensionHosts::new();
+        hosts
+            .start("gate", &extension, &cwd, "session-1")
+            .await
+            .expect("start bun host");
+        let sets = hosts.registration_sets();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].tools[0].name, "echo_tool");
+        assert_eq!(sets[0].commands[0].name, "greet");
+        assert!(sets[0].tool_gate);
+        let outcome = hosts
+            .call(
+                "gate",
+                "tool",
+                "echo_tool",
+                r#"{"text":"hi"}"#,
+                &cwd,
+                Some("c1"),
+            )
+            .await
+            .expect("call tool");
+        assert_eq!(outcome.output, "echo: hi");
+        let outcome = hosts
+            .call("gate", "command", "greet", "noel", &cwd, None)
+            .await
+            .expect("call command");
+        assert_eq!(outcome.output, "hello, noel");
+        let gate = hosts
+            .gate_tool_call("bash", r#"{"command":"cat secret.txt"}"#, &cwd)
+            .await
+            .expect("gate call");
+        assert_eq!(
+            gate,
+            GateDecision::blocked("secret path is protected".to_string())
+        );
+        let gate = hosts
+            .gate_tool_call("bash", r#"{"command":"ls"}"#, &cwd)
+            .await
+            .expect("gate call");
+        assert_eq!(gate, GateDecision::allow());
+        hosts.shutdown(&cwd).await;
+        let _ = fs::remove_dir_all(cwd);
+        drop(bun);
+    }
+
+    /// #132: `session_start` handlers run when the session starts (the
+    /// host's `init`), and `session_shutdown` handlers, their own list, run
+    /// before the host exits.
+    #[tokio::test]
+    async fn bun_host_runs_session_start_and_shutdown_handlers() {
+        let Ok(bun) = which_bun() else {
+            eprintln!("skipping: bun not found");
+            return;
+        };
+        let Some(shim) = repo_bun_host_shim() else {
+            eprintln!("skipping: shim not found");
+            return;
+        };
+        let cwd = std::env::temp_dir().join(format!("noel-ext-session-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("mkdir");
+        let extension = cwd.join("session.ts");
+        fs::write(
+            &extension,
+            r#"
+            export default function (pi) {
+              pi.on("session_start", async (_event, ctx) => {
+                await Bun.write(ctx.cwd + "/started-" + ctx.sessionId, "");
+              });
+              pi.on("session_shutdown", async (_event, ctx) => {
+                await Bun.write(ctx.cwd + "/stopped-" + ctx.sessionId, "");
+              });
+            }
+            "#,
+        )
+        .expect("write extension");
+        let _guard = bun_host_env(&shim).await;
+        let mut hosts = ExtensionHosts::new();
+        hosts
+            .start("session", &extension, &cwd, "s1")
+            .await
+            .expect("start bun host");
+        assert!(cwd.join("started-s1").exists(), "session_start ran");
+        assert!(!cwd.join("stopped-s1").exists(), "not a shutdown");
+        hosts.shutdown(&cwd).await;
+        assert!(cwd.join("stopped-s1").exists(), "session_shutdown ran");
+        let _ = fs::remove_dir_all(cwd);
+        drop(bun);
+    }
+
+    /// Upstream's own example extension, verbatim from the pinned
+    /// reference checkout, runs under the bun host: its `tool_call`
+    /// handler blocks dangerous bash commands with no UI (headless), the
+    /// exact semantics upstream documents. Skipped without bun or the
+    /// reference checkout.
+    #[tokio::test]
+    async fn upstream_permission_gate_example_runs_under_bun_host() {
+        let Ok(_bun) = which_bun() else {
+            return;
+        };
+        let shim = repo_bun_host_shim();
+        let example = upstream_example("permission-gate.ts");
+        let (shim, example) = match (shim, example) {
+            (Some(shim), Some(example)) => (shim, example),
+            _ => return,
+        };
+        let cwd = std::env::temp_dir().join(format!("noel-ext-bun-pi-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("mkdir");
+        let extension = cwd.join("permission-gate.ts");
+        fs::copy(&example, &extension).expect("copy example");
+        pin_vendored_pi_packages(&cwd);
+        fs::write(
+            cwd.join("permission-gate.ts.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+
+        let _guard = bun_host_env(&shim).await;
+
+        let mut hosts = ExtensionHosts::new();
+        hosts
+            .start("permission-gate", &extension, &cwd, "session-1")
+            .await
+            .expect("start bun host for upstream example");
+        let sets = hosts.registration_sets();
+        assert_eq!(sets.len(), 1);
+        assert!(sets[0].tool_gate, "the example takes the tool_call gate");
+        for command in ["rm -rf /tmp/x", "sudo reboot", "chmod 777 /etc"] {
+            let gate = hosts
+                .gate_tool_call("bash", &format!(r#"{{"command":"{command}"}}"#), &cwd)
+                .await
+                .expect("gate call");
+            assert_eq!(
+                gate,
+                GateDecision::blocked(
+                    "Dangerous command blocked (no UI for confirmation)".to_string()
+                ),
+                "the example blocks {command}"
+            );
+        }
+        let gate = hosts
+            .gate_tool_call("bash", r#"{"command":"ls"}"#, &cwd)
+            .await
+            .expect("gate call");
+        assert_eq!(gate, GateDecision::allow());
+        hosts.shutdown(&cwd).await;
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    /// Upstream's `hello.ts`, the minimal `defineTool` example, verbatim:
+    /// its TypeBox parameters reach the handshake as JSON schema and its
+    /// `AgentToolResult` content flattens to the protocol's output.
+    #[tokio::test]
+    async fn upstream_hello_tool_example_runs_under_bun_host() {
+        let Ok(_bun) = which_bun() else {
+            return;
+        };
+        let shim = repo_bun_host_shim();
+        let example = upstream_example("hello.ts");
+        let (shim, example) = match (shim, example) {
+            (Some(shim), Some(example)) => (shim, example),
+            _ => return,
+        };
+        let cwd = std::env::temp_dir().join(format!("noel-ext-bun-hello-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("mkdir");
+        let extension = cwd.join("hello.ts");
+        fs::copy(&example, &extension).expect("copy example");
+        pin_vendored_pi_packages(&cwd);
+        fs::write(
+            cwd.join("hello.ts.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+
+        let _guard = bun_host_env(&shim).await;
+
+        let mut hosts = ExtensionHosts::new();
+        hosts
+            .start("hello", &extension, &cwd, "session-1")
+            .await
+            .expect("start bun host for upstream example");
+        let sets = hosts.registration_sets();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].tools.len(), 1);
+        let tool = &sets[0].tools[0];
+        assert_eq!(tool.name, "hello");
+        // TypeBox's schema crosses as JSON schema: required name, string.
+        let parameters = tool.parameters.clone();
+        assert_eq!(parameters["required"], serde_json::json!(["name"]));
+        assert_eq!(parameters["properties"]["name"]["type"], "string");
+        let outcome = hosts
+            .call(
+                "hello",
+                "tool",
+                "hello",
+                r#"{"name":"noel"}"#,
+                &cwd,
+                Some("c1"),
+            )
+            .await
+            .expect("call tool");
+        assert_eq!(outcome.output, "Hello, noel!");
+        hosts.shutdown(&cwd).await;
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    /// A session can host all three extension kinds at once: an
+    /// executable Rust program (this repo's example, compiled on the fly),
+    /// a `.ts` extension under the bun host, and a shell one-shot host.
+    /// Each keeps its own process and registrations; a tool call routes to
+    /// the extension that registered it. Skipped without bun (the Rust
+    /// host alone is covered by the shell-host test's mechanics).
+    #[tokio::test]
+    async fn rust_typescript_and_shell_extensions_host_together() {
+        let Ok(_bun) = which_bun() else {
+            return;
+        };
+        let Some(shim) = repo_bun_host_shim() else {
+            return;
+        };
+        let cwd = std::env::temp_dir().join(format!("noel-ext-mixed-{}", std::process::id()));
+        let extensions_dir = cwd.join("extensions");
+        fs::create_dir_all(&extensions_dir).expect("mkdir");
+
+        // The Rust host: the shipped example, compiled with rustc.
+        let example = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/rust/host.rs");
+        if !example.is_file() {
+            return;
+        }
+        let rust_host = extensions_dir.join("rust-host");
+        let compiled =
+            std::process::Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+                .arg("-O")
+                .arg(&example)
+                .arg("-o")
+                .arg(&rust_host)
+                .output()
+                .expect("spawn rustc");
+        assert!(
+            compiled.status.success(),
+            "rustc failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        make_executable(&rust_host);
+        fs::write(
+            extensions_dir.join("rust-host.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+
+        // The TypeScript host: a counter tool under the bun shim.
+        let ts_host = extensions_dir.join("ts-host.ts");
+        fs::write(
+            &ts_host,
+            r#"
+            export default function (pi) {
+              let calls = 0;
+              pi.registerTool({
+                name: "ts_echo",
+                description: "Echo from the TypeScript host.",
+                parameters: { type: "object", properties: { text: { type: "string" } } },
+                execute: async (_id, params) => ({
+                  content: [{ type: "text", text: "ts says " + params.text + " (call " + (++calls) + ")" }],
+                }),
+              });
+            }
+            "#,
+        )
+        .expect("write extension");
+        fs::write(
+            extensions_dir.join("ts-host.ts.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+
+        // The shell host: a persistent responder, like the v2 shell test.
+        let shell_host = extensions_dir.join("shell-host");
+        fs::write(
+            &shell_host,
+            r#"#!/bin/sh
+while read line; do
+  case "$line" in
+    *'"kind":"init"'*) printf '%s\n' '{"output":"ready","tools":[{"name":"sh_version","parameters":{"type":"object"}}]}';;
+    *) printf '%s\n' '{"output":"sh host alive"}';;
+  esac
+done
+"#,
+        )
+        .expect("write extension");
+        make_executable(&shell_host);
+        fs::write(
+            extensions_dir.join("shell-host.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+
+        let _guard = bun_host_env(&shim).await;
+
+        let mut hosts = ExtensionHosts::new();
+        hosts
+            .start("rust-host", &rust_host, &cwd, "session-1")
+            .await
+            .expect("start rust host");
+        hosts
+            .start("ts-host", &ts_host, &cwd, "session-1")
+            .await
+            .expect("start ts host");
+        hosts
+            .start("shell-host", &shell_host, &cwd, "session-1")
+            .await
+            .expect("start shell host");
+
+        // Every host's registrations landed, each under its own name.
+        let sets = hosts.registration_sets();
+        let names: Vec<&str> = sets.iter().map(|set| set.extension_name.as_str()).collect();
+        assert!(names.contains(&"rust-host"));
+        assert!(names.contains(&"ts-host"));
+        assert!(names.contains(&"shell-host"));
+
+        // Tools route to the host that registered them, with state.
+        let outcome = hosts
+            .call(
+                "rust-host",
+                "tool",
+                "word_count",
+                r#"{"text":"one two three"}"#,
+                &cwd,
+                Some("c1"),
+            )
+            .await
+            .expect("rust tool");
+        assert_eq!(outcome.output, "3 words");
+        let outcome = hosts
+            .call("rust-host", "command", "stats", "", &cwd, None)
+            .await
+            .expect("rust command");
+        assert!(outcome.output.contains("run 1 time(s)"));
+        let outcome = hosts
+            .call(
+                "ts-host",
+                "tool",
+                "ts_echo",
+                r#"{"text":"hi"}"#,
+                &cwd,
+                Some("c2"),
+            )
+            .await
+            .expect("ts tool");
+        assert_eq!(outcome.output, "ts says hi (call 1)");
+        let outcome = hosts
+            .call(
+                "ts-host",
+                "tool",
+                "ts_echo",
+                r#"{"text":"again"}"#,
+                &cwd,
+                Some("c3"),
+            )
+            .await
+            .expect("ts tool again");
+        assert_eq!(outcome.output, "ts says again (call 2)");
+        let outcome = hosts
+            .call("shell-host", "tool", "sh_version", "{}", &cwd, Some("c4"))
+            .await
+            .expect("shell tool");
+        assert_eq!(outcome.output, "sh host alive");
+
+        // The rust host's gate decides; the others registered none.
+        let gate = hosts
+            .gate_tool_call("write", r#"{"path":"/etc/passwd","content":"x"}"#, &cwd)
+            .await
+            .expect("gate");
+        assert_eq!(
+            gate,
+            GateDecision::blocked("/etc is protected by rust-host".to_string())
+        );
+
+        hosts.shutdown(&cwd).await;
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    /// Bun resolution order: `NOEL_BUN_BIN` (a path, or `path` for PATH),
+    /// else the agent dir's `bin/bun` (what `noel bun install` put there),
+    /// else a `bun` on PATH. The installed copy outranks PATH so the
+    /// private download never shadows - and never is shadowed by - a
+    /// system bun the user did not consent to for extensions.
+    #[test]
+    fn bun_binary_resolution_prefers_override_then_install_dir() {
+        struct EnvGuard {
+            bun_bin: Option<std::ffi::OsString>,
+            dir: std::path::PathBuf,
+            old_dir: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.bun_bin.take() {
+                    // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+                    Some(value) => unsafe { std::env::set_var("NOEL_BUN_BIN", value) },
+                    // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+                    None => unsafe { std::env::remove_var("NOEL_BUN_BIN") },
+                }
+                match self.old_dir.take() {
+                    // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+                    Some(value) => unsafe { std::env::set_var("NOEL_DIR", value) },
+                    // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+                    None => unsafe { std::env::remove_var("NOEL_DIR") },
+                }
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+        let _lock = BUN_ENV.blocking_lock();
+        let dir = std::env::temp_dir().join(format!("noel-bun-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bin")).expect("mkdir");
+        std::fs::write(dir.join("bin/bun"), b"stub").expect("stub bun");
+        let guard = EnvGuard {
+            bun_bin: std::env::var_os("NOEL_BUN_BIN"),
+            dir: dir.clone(),
+            old_dir: std::env::var_os("NOEL_DIR"),
+        };
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        unsafe { std::env::set_var("NOEL_DIR", &dir) };
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        unsafe { std::env::remove_var("NOEL_BUN_BIN") };
+
+        // The agent dir's install wins over PATH.
+        let resolved = find_bun_binary().expect("installed bun");
+        assert_eq!(resolved, dir.join("bin/bun"));
+
+        // An explicit path wins over the install.
+        let override_path = dir.join("other-bun");
+        std::fs::write(&override_path, b"stub").expect("stub");
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        unsafe { std::env::set_var("NOEL_BUN_BIN", &override_path) };
+        let resolved = find_bun_binary().expect("override bun");
+        assert_eq!(resolved, override_path);
+
+        // `path` resolves from PATH, ignoring the install.
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        unsafe { std::env::set_var("NOEL_BUN_BIN", "path") };
+        let resolved = find_bun_binary();
+        assert_ne!(resolved.as_ref(), Some(&dir.join("bin/bun")));
+        drop(guard);
+    }
+
+    fn which_bun() -> Result<PathBuf, ()> {
+        let path = std::env::var_os("PATH").ok_or(())?;
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("bun");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+        Err(())
+    }
+
+    /// The repo's shipped shim: `crates/noel-cli/src/extension-hosts/`.
+    fn repo_bun_host_shim() -> Option<PathBuf> {
+        let shim = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../noel-cli/src/extension-hosts/noel-bun-host.ts");
+        shim.is_file().then_some(shim)
+    }
+
+    /// An upstream example: the vendored copy in `examples/extensions/
+    /// typescript/` (kept current by scripts/sync-upstream-examples.sh),
+    /// else the local reference checkout.
+    fn upstream_example(name: &str) -> Option<PathBuf> {
+        let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/typescript")
+            .join(name);
+        if vendored.is_file() {
+            return Some(vendored);
+        }
+        let reference = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/ts-reference-pi/packages/coding-agent/examples/extensions")
+            .join(name);
+        reference.is_file().then_some(reference)
+    }
+}

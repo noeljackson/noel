@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use noel_config::{
-    auth_for_provider, is_expired, listed_accounts_for_provider, read_usage_cache,
-    write_usage_cache, AccountSource, AccountUsage, Balance, LoadedConfig, ResolvedAuth,
+    auth_for_provider, is_expired, listed_accounts_for_provider, read_auth_file, read_usage_cache,
+    write_usage_cache, AccountSource, AccountUsage, AuthData, Balance, LoadedConfig, ResolvedAuth,
     UsageWindow,
 };
 use serde_json::Value;
@@ -59,13 +59,12 @@ pub async fn get_usage(
         .ok()
         .flatten()
         .and_then(|cache| cache.accounts.get(&key).cloned());
-    if !request.refresh {
-        if let Some(usage) = cached
+    if !request.refresh
+        && let Some(usage) = cached
             .as_ref()
             .filter(|usage| now - usage.fetched_at < USAGE_CACHE_TTL_SECONDS)
-        {
-            return UsageProbeResult::Usage(usage.clone());
-        }
+    {
+        return UsageProbeResult::Usage(usage.clone());
     }
 
     match probe(
@@ -356,6 +355,36 @@ fn window(label: &str, used_pct: Option<f64>, resets_at: Option<i64>) -> Option<
         label: label.to_string(),
         used_pct: used_pct?,
         resets_at,
+        active: None,
+        severity: None,
+    })
+}
+
+/// A window from Anthropic's `limits[]`: the kind's display name (scoped
+/// limits name their scope), its used percent, reset, active flag, and
+/// severity.
+fn window_from_limit(
+    kind: &str,
+    scope_model: Option<&str>,
+    percent: Option<f64>,
+    resets_at: Option<i64>,
+    active: Option<bool>,
+    severity: Option<&str>,
+) -> Option<UsageWindow> {
+    let label = match kind {
+        "session" => "5h".to_string(),
+        "weekly_all" => "weekly".to_string(),
+        other => match scope_model {
+            Some(model) => format!("weekly ({model})"),
+            None => other.to_string(),
+        },
+    };
+    Some(UsageWindow {
+        label,
+        used_pct: percent?,
+        resets_at,
+        active,
+        severity: severity.map(str::to_string),
     })
 }
 
@@ -398,19 +427,47 @@ fn parse_codex_usage(body: &str, now: i64) -> Result<AccountUsage, String> {
 
 fn parse_claude_usage(body: &str, now: i64) -> Result<AccountUsage, String> {
     let value = serde_json::from_str::<Value>(body).map_err(|error| error.to_string())?;
+    // The `limits` array is the current truth: it names each limit
+    // (session, weekly_all, and per-model weekly_scoped entries), says which
+    // is active, and how severe it is. Legacy five_hour/seven_day remain the
+    // fallback for responses without it.
     let mut windows = Vec::new();
-    for (key, label) in [("five_hour", "5h"), ("seven_day", "weekly")] {
-        let window_value = value.get(key);
-        if let Some(window) = window(
-            label,
-            window_value
-                .and_then(|window| window.get("utilization"))
-                .and_then(flexible_f64),
-            window_value
-                .and_then(|window| window.get("resets_at"))
-                .and_then(flexible_epoch),
-        ) {
-            windows.push(window);
+    if let Some(limits) = value.get("limits").and_then(Value::as_array) {
+        for limit in limits {
+            let scope_model = limit
+                .get("scope")
+                .and_then(|scope| scope.get("model"))
+                .and_then(|model| model.get("display_name"))
+                .and_then(Value::as_str);
+            if let Some(window) = window_from_limit(
+                limit
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                scope_model,
+                limit.get("percent").and_then(flexible_f64),
+                limit.get("resets_at").and_then(flexible_epoch),
+                limit.get("is_active").and_then(Value::as_bool),
+                limit.get("severity").and_then(Value::as_str),
+            ) {
+                windows.push(window);
+            }
+        }
+    }
+    if windows.is_empty() {
+        for (key, label) in [("five_hour", "5h"), ("seven_day", "weekly")] {
+            let window_value = value.get(key);
+            if let Some(window) = window(
+                label,
+                window_value
+                    .and_then(|window| window.get("utilization"))
+                    .and_then(flexible_f64),
+                window_value
+                    .and_then(|window| window.get("resets_at"))
+                    .and_then(flexible_epoch),
+            ) {
+                windows.push(window);
+            }
         }
     }
     Ok(AccountUsage {
@@ -610,20 +667,30 @@ pub async fn collect_account_status(
     config: &LoadedConfig,
     refresh: bool,
     endpoint_override: Option<&str>,
+    token_endpoint_override: Option<(&str, &str)>,
     now: i64,
 ) -> Vec<AccountStatusRow> {
     let client = usage_http_client();
     let cache_path = config.paths.agent_dir.join("usage-cache.json");
+    let (auth, refresh_failures) =
+        refresh_stored_oauth(config, token_endpoint_override, now.max(0) as u64).await;
     let mut rows = Vec::new();
+    let context = ProbeContext {
+        client: &client,
+        config,
+        auth: &auth,
+        cache_path: &cache_path,
+        refresh,
+        endpoint_override,
+    };
     for target in account_status_targets(config) {
         rows.push(
             probe_account_row(
-                &client,
-                config,
-                &cache_path,
+                &context,
                 &target,
-                refresh,
-                endpoint_override,
+                refresh_failures
+                    .get(&(target.provider.clone(), target.account.clone()))
+                    .map(String::as_str),
                 now,
             )
             .await,
@@ -632,15 +699,100 @@ pub async fn collect_account_status(
     rows
 }
 
-async fn probe_account_row(
-    client: &reqwest::Client,
+fn refresh_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Rotate every stored OAuth credential that carries a refresh token and is
+/// expiring, so status probes run with live tokens and stored credentials
+/// stay rotated without an active session. Environment and imported-login
+/// credentials are not noel's to rotate and are skipped. Refresh failures
+/// are returned per account and surface as that row's note; the probe then
+/// still runs with the stored token.
+async fn refresh_stored_oauth(
     config: &LoadedConfig,
-    cache_path: &Path,
-    target: &AccountStatusTarget,
+    token_endpoint_override: Option<(&str, &str)>,
+    now: u64,
+) -> (AuthData, BTreeMap<(String, String), String>) {
+    let client = refresh_http_client();
+    let mut failures = BTreeMap::new();
+    let mut touched = false;
+    for target in account_status_targets(config) {
+        if target.source != AccountSource::Stored {
+            continue;
+        }
+        let Some(resolved) =
+            auth_for_provider(&config.auth, &target.provider, Some(&target.account))
+        else {
+            continue;
+        };
+        let window = crate::oauth_refresh::REFRESH_WINDOW_SECONDS;
+        if !crate::oauth_refresh::needs_refresh(&resolved, now, window) {
+            continue;
+        }
+        let outcome = crate::oauth_refresh::refresh_auth_expiring_within(
+            &client,
+            &config.paths.auth_path,
+            &config.auth,
+            &target.provider,
+            Some(&target.account),
+            token_endpoint_override,
+            now,
+            window,
+        )
+        .await;
+        match outcome {
+            // The auth file holds a newer credential than the snapshot,
+            // refreshed here or by another process: read it again below.
+            Ok(Some(
+                crate::oauth_refresh::RefreshOutcome::Refreshed(_)
+                | crate::oauth_refresh::RefreshOutcome::Fresh(_),
+            )) => touched = true,
+            Ok(_) => {}
+            Err(error) => {
+                failures.insert(
+                    (target.provider.clone(), target.account.clone()),
+                    error.to_string(),
+                );
+            }
+        }
+    }
+    let auth = if touched {
+        read_auth_file(&config.paths.auth_path).unwrap_or_else(|_| config.auth.clone())
+    } else {
+        config.auth.clone()
+    };
+    (auth, failures)
+}
+
+/// Per-collection invariants shared by every row probe.
+struct ProbeContext<'a> {
+    client: &'a reqwest::Client,
+    config: &'a LoadedConfig,
+    auth: &'a AuthData,
+    cache_path: &'a Path,
     refresh: bool,
-    endpoint_override: Option<&str>,
+    endpoint_override: Option<&'a str>,
+}
+
+async fn probe_account_row(
+    context: &ProbeContext<'_>,
+    target: &AccountStatusTarget,
+    refresh_failure: Option<&str>,
     now: i64,
 ) -> AccountStatusRow {
+    let ProbeContext {
+        client,
+        config,
+        auth,
+        cache_path,
+        refresh,
+        endpoint_override,
+    } = *context;
     let base_row = |auth_state, usage, unsupported, error| AccountStatusRow {
         provider: target.provider.clone(),
         account: target.account.clone(),
@@ -649,8 +801,7 @@ async fn probe_account_row(
         unsupported,
         error,
     };
-    let Some(auth) = auth_for_provider(&config.auth, &target.provider, Some(&target.account))
-    else {
+    let Some(auth) = auth_for_provider(auth, &target.provider, Some(&target.account)) else {
         return base_row(AuthState::Missing, None, false, None);
     };
     let mut auth_state = if is_expired(auth.expires(), now.max(0) as u64) {
@@ -684,16 +835,22 @@ async fn probe_account_row(
             if reason.contains("status 401") {
                 auth_state = AuthState::Invalid;
             }
-            base_row(auth_state, None, false, Some(short_reason(&reason)))
+            let note = refresh_failure
+                .map(|reason| short_reason_max(reason, 200))
+                .unwrap_or_else(|| short_reason(&reason));
+            base_row(auth_state, None, false, Some(note))
         }
     }
 }
 
 fn short_reason(reason: &str) -> String {
+    short_reason_max(reason, 80)
+}
+
+fn short_reason_max(reason: &str, max_len: usize) -> String {
     let first_line = reason.lines().next().unwrap_or(reason);
-    const MAX_LEN: usize = 80;
-    if first_line.len() > MAX_LEN {
-        format!("{}…", &first_line[..MAX_LEN])
+    if first_line.len() > max_len {
+        format!("{}…", &first_line[..max_len])
     } else {
         first_line.to_string()
     }
@@ -715,112 +872,259 @@ fn format_relative_duration(seconds: i64) -> String {
     }
 }
 
-fn windows_cell(row: &AccountStatusRow) -> String {
-    if row.error.is_some() {
-        return "error".to_string();
+pub fn format_account_status(rows: &[AccountStatusRow], now: i64) -> String {
+    if rows.is_empty() {
+        return format!(
+            "no accounts configured\n\n{}",
+            account_howto_lines().join("\n")
+        );
     }
-    if row.unsupported {
-        return "n/a".to_string();
+    // One table per provider: the columns are the limits that provider's
+    // accounts have (5h, weekly, the scoped weekly, balance, resets), so no
+    // n/a filler anywhere; one row per account, `!` marks a limit at its
+    // threshold, and the resets column shows the soonest binding reset.
+    let mut lines = Vec::new();
+    let mut providers: Vec<&str> = Vec::new();
+    for row in rows {
+        if providers.last() != Some(&row.provider.as_str()) {
+            providers.push(row.provider.as_str());
+        }
     }
-    let Some(usage) = &row.usage else {
-        return "-".to_string();
-    };
-    if usage.windows.is_empty() {
-        return "-".to_string();
+    for provider in providers {
+        let group: Vec<&AccountStatusRow> =
+            rows.iter().filter(|row| row.provider == provider).collect();
+        lines.push(provider.to_string());
+
+        // The columns this provider's accounts actually have.
+        let has_short = group.iter().any(|row| short_window(row).is_some());
+        let weekly_labels = scoped_weekly_labels(&group);
+        let has_balance = group.iter().any(|row| {
+            row.usage
+                .as_ref()
+                .and_then(|usage| usage.balance.as_ref())
+                .is_some()
+        });
+        let has_resets = group.iter().any(|row| soonest_reset(row, now).is_some());
+        let has_notes = group.iter().any(|row| account_note(row).is_some());
+
+        let mut headers: Vec<String> = Vec::new();
+        if has_short {
+            headers.push("5h".to_string());
+        }
+        let weekly_column = group.iter().any(|row| {
+            row.usage
+                .as_ref()
+                .is_some_and(|usage| usage.windows.iter().any(|window| window.label == "weekly"))
+        });
+        if weekly_column || !weekly_labels.is_empty() {
+            headers.push("weekly".to_string());
+        }
+        for label in &weekly_labels {
+            headers.push(label.clone());
+        }
+        if has_balance {
+            headers.push("balance".to_string());
+        }
+        if has_resets {
+            headers.push("resets".to_string());
+        }
+        let mut header_cells = vec![String::new()];
+        header_cells.extend(headers.iter().cloned());
+        if has_notes {
+            header_cells.push(String::new());
+        }
+
+        let mut table: Vec<Vec<String>> = Vec::new();
+        for row in &group {
+            let auth = row.auth_state.label();
+            let name = match row.auth_state {
+                AuthState::Ok => row.account.clone(),
+                _ => format!("{} ({auth})", row.account),
+            };
+            let mut cells = vec![name];
+            if has_short {
+                cells.push(
+                    short_window(row)
+                        .map(|window| percent_cell(window, false))
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+            }
+            if weekly_column || !weekly_labels.is_empty() {
+                cells.push(
+                    find_window(row, "weekly", None)
+                        .map(|window| percent_cell(window, true))
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+            }
+            for label in &weekly_labels {
+                cells.push(
+                    find_window(row, "scoped", Some(label.as_str()))
+                        .map(|window| percent_cell(window, true))
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+            }
+            if has_balance {
+                cells.push(
+                    row.usage
+                        .as_ref()
+                        .and_then(|usage| usage.balance.as_ref())
+                        .map(|balance| format!("{:.0} {}", balance.amount, balance.currency))
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+            }
+            if has_resets {
+                cells.push(
+                    soonest_reset(row, now)
+                        .map(|at| format_relative_duration(at - now))
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+            }
+            if has_notes {
+                cells.push(account_note(row).unwrap_or_default());
+            }
+            table.push(cells);
+        }
+
+        // Widths: the account column from names, each limit column from its
+        // header (percent cells are fixed-width).
+        let mut widths = vec![table.iter().map(|cells| cells[0].len()).max().unwrap_or(0)];
+        widths[0] = widths[0].max(2);
+        for column in 1..header_cells.len() {
+            widths.push(
+                header_cells[column].len().max(
+                    table
+                        .iter()
+                        .map(|cells| cells[column].len())
+                        .max()
+                        .unwrap_or(0),
+                ),
+            );
+        }
+        let render = |cells: &[String]| {
+            cells
+                .iter()
+                .enumerate()
+                .map(|(column, cell)| {
+                    format!(
+                        "{cell:<width$}",
+                        width = widths.get(column).copied().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        };
+        if header_cells.iter().all(|cell| cell.is_empty()) {
+            // No limits at all: the account line with its note, if any.
+            for cells in &table {
+                let note = cells.last().filter(|note| !note.is_empty());
+                match note {
+                    Some(note) => lines.push(format!("  {}  {note}", cells[0])),
+                    None => lines.push(format!("  {}", cells[0])),
+                }
+            }
+        } else {
+            lines.push(format!("  {}", render(&header_cells)));
+            for cells in &table {
+                lines.push(format!("  {}", render(cells)));
+            }
+        }
     }
-    usage
+    lines.push(String::new());
+    lines.push("% used; ! = at its limit".to_string());
+    lines.push(String::new());
+    lines.extend(account_howto_lines().into_iter().map(String::from));
+    lines.join("\n")
+}
+
+/// The short (5h/session) window of a usage row, if it has one.
+fn short_window(row: &AccountStatusRow) -> Option<&UsageWindow> {
+    row.usage
+        .as_ref()?
         .windows
         .iter()
-        .map(|window| {
-            let left = (100.0 - window.used_pct).round().clamp(0.0, 100.0) as i64;
-            format!("{}: {left}% left", window.label)
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .find(|window| window.label == "5h")
 }
 
-fn balance_cell(row: &AccountStatusRow) -> String {
-    if row.error.is_some() {
-        return "-".to_string();
+/// The distinct scoped-weekly labels across a provider's accounts, in first
+/// seen order: `Fable` from `weekly (Fable)`.
+fn scoped_weekly_labels(group: &[&AccountStatusRow]) -> Vec<String> {
+    let mut labels = Vec::new();
+    for row in group {
+        for window in row.usage.iter().flat_map(|usage| &usage.windows) {
+            if let Some(label) = window
+                .label
+                .strip_prefix("weekly (")
+                .and_then(|rest| rest.strip_suffix(')'))
+                && !labels.iter().any(|seen| seen == label)
+            {
+                labels.push(label.to_string());
+            }
+        }
     }
-    if row.unsupported {
-        return "n/a".to_string();
-    }
+    labels
+}
+
+fn find_window<'a>(
+    row: &'a AccountStatusRow,
+    kind: &'static str,
+    label: Option<&str>,
+) -> Option<&'a UsageWindow> {
     row.usage
-        .as_ref()
-        .and_then(|usage| usage.balance.as_ref())
-        .map(|balance| format!("{:.2} {}", balance.amount, balance.currency))
-        .unwrap_or_else(|| "-".to_string())
+        .as_ref()?
+        .windows
+        .iter()
+        .find(|window| match (kind, label) {
+            ("weekly", _) => window.label == "weekly",
+            ("scoped", Some(label)) => window.label == format!("weekly ({label})"),
+            _ => false,
+        })
 }
 
-fn resets_cell(row: &AccountStatusRow, now: i64) -> String {
-    if row.error.is_some() {
-        return "-".to_string();
-    }
-    if row.unsupported {
-        return "n/a".to_string();
-    }
-    let Some(usage) = &row.usage else {
-        return "-".to_string();
-    };
-    let resets = usage
+/// The soonest reset among a row's windows that is still in the future.
+fn soonest_reset(row: &AccountStatusRow, now: i64) -> Option<i64> {
+    row.usage
+        .as_ref()?
         .windows
         .iter()
         .filter_map(|window| window.resets_at)
-        .map(|resets_at| format_relative_duration(resets_at - now))
-        .collect::<Vec<_>>();
-    if resets.is_empty() {
-        "-".to_string()
+        .filter(|at| *at > now)
+        .min()
+}
+
+/// The account's note: an error, or "no usage endpoint".
+fn account_note(row: &AccountStatusRow) -> Option<String> {
+    if let Some(note) = &row.error {
+        return Some(short_reason(note));
+    }
+    if row.unsupported {
+        return Some("no usage endpoint".to_string());
+    }
+    None
+}
+
+/// A limit's cell: `41%`, `100% !` at its threshold. Weekly cells bold the
+/// percent when critical; plain text terminals still read the `!`.
+fn percent_cell(window: &UsageWindow, _weekly: bool) -> String {
+    let used = window.used_pct.round().clamp(0.0, 100.0) as i64;
+    if window.severity.as_deref() == Some("critical") {
+        format!("{used}% !")
     } else {
-        resets.join(", ")
+        format!("{used}%")
     }
 }
 
-pub fn format_account_status(rows: &[AccountStatusRow], now: i64) -> String {
-    if rows.is_empty() {
-        return "no accounts configured".to_string();
-    }
-    let headers = [
-        "provider", "account", "auth", "windows", "balance", "resets", "note",
-    ];
-    let mut cells = Vec::with_capacity(rows.len());
-    for row in rows {
-        cells.push([
-            row.provider.clone(),
-            row.account.clone(),
-            row.auth_state.label().to_string(),
-            windows_cell(row),
-            balance_cell(row),
-            resets_cell(row, now),
-            row.error.clone().unwrap_or_default(),
-        ]);
-    }
-    let mut widths = [0usize; 7];
-    for column in 0..7 {
-        widths[column] = headers[column]
-            .len()
-            .max(cells.iter().map(|row| row[column].len()).max().unwrap_or(0));
-    }
-    let render = |row: &[String; 7]| {
-        row.iter()
-            .enumerate()
-            .map(|(column, cell)| {
-                if column == 6 {
-                    cell.clone()
-                } else {
-                    format!("{cell:<width$}", width = widths[column])
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("  ")
-            .trim_end()
-            .to_string()
-    };
-    let mut lines = vec![render(&headers.map(str::to_string))];
-    lines.extend(cells.iter().map(render));
-    lines.push(String::new());
-    lines.push("% = share of window quota remaining".to_string());
-    lines.join("\n")
+/// The add-and-use hint appended to account status: where another account
+/// comes from, and how to switch to one. The TUI's `/accounts`, mid-turn
+/// `/accounts`, and `noel accounts status` all show it.
+fn account_howto_lines() -> Vec<&'static str> {
+    vec![
+        "add an account: noel login <provider> --account <name> --api-key <key|env:VAR|->",
+        "             or noel login <provider> --account <name>  (OAuth: anthropic, openai-codex)",
+        "in the TUI: /login runs the same flow, /account switches (auto or a named account)",
+        "            /logout <provider> [account] removes one",
+    ]
 }
 
 #[cfg(test)]
@@ -958,6 +1262,46 @@ mod tests {
         assert_eq!(usage.plan.as_deref(), Some("free"));
         assert!(usage.windows.is_empty());
         assert_eq!(usage.balance, None);
+    }
+
+    #[test]
+    fn parse_claude_usage_prefers_limits_array_with_active_and_severity() {
+        // The live shape (2026-10): limits[] carries session/weekly_all plus
+        // per-model weekly_scoped entries, with is_active and severity.
+        let usage = parse_claude_usage(
+            r#"{"five_hour":{"utilization":0.0,"resets_at":null},"seven_day":{"utilization":100.0,"resets_at":"2026-10-28T17:00:00.059118+00:00"},"limits":[
+                {"kind":"session","group":"session","percent":0,"severity":"normal","resets_at":null,"scope":null,"is_active":false},
+                {"kind":"weekly_all","group":"weekly","percent":100,"severity":"critical","resets_at":"2026-10-28T17:00:00.059118+00:00","scope":null,"is_active":true},
+                {"kind":"weekly_scoped","group":"weekly","percent":8,"severity":"normal","resets_at":"2026-10-28T17:00:00.059263+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}
+            ]}"#,
+            1000,
+        )
+        .expect("parse claude usage");
+        assert_eq!(usage.windows.len(), 3);
+        assert_eq!(usage.windows[0].label, "5h");
+        assert_eq!(usage.windows[0].used_pct, 0.0);
+        assert_eq!(usage.windows[0].active, Some(false));
+        assert_eq!(usage.windows[1].label, "weekly");
+        assert_eq!(usage.windows[1].used_pct, 100.0);
+        assert_eq!(usage.windows[1].active, Some(true));
+        assert_eq!(usage.windows[1].severity.as_deref(), Some("critical"));
+        assert!(usage.windows[1].resets_at.is_some());
+        assert_eq!(usage.windows[2].label, "weekly (Fable)");
+        assert_eq!(usage.windows[2].used_pct, 8.0);
+        assert_eq!(usage.windows[2].active, Some(false));
+    }
+
+    #[test]
+    fn parse_claude_usage_falls_back_to_legacy_windows() {
+        let usage = parse_claude_usage(
+            r#"{"five_hour":{"utilization":42.0,"resets_at":"2027-11-24T15:00:00Z"},"seven_day":{"utilization":8.0,"resets_at":null}}"#,
+            1000,
+        )
+        .expect("parse claude usage");
+        assert_eq!(usage.windows.len(), 2);
+        assert_eq!(usage.windows[0].label, "5h");
+        assert_eq!(usage.windows[0].used_pct, 42.0);
+        assert_eq!(usage.windows[0].active, None);
     }
 
     #[test]
@@ -1366,6 +1710,8 @@ mod tests {
             context_files: Vec::new(),
             extensions: Vec::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
+            mcp_servers: Vec::new(),
             prompt_templates: Vec::new(),
             themes: Vec::new(),
             diagnostics: Vec::new(),
@@ -1393,31 +1739,39 @@ mod tests {
     }
 
     #[test]
-    fn format_account_status_renders_fixed_width_rows() {
+    fn format_account_status_groups_by_provider_with_limit_columns() {
         let now = 1_799_996_880;
         let rows = vec![
             status_row(
-                "openai-codex",
-                "default",
+                "anthropic",
+                "code@noeljackson.com",
                 AuthState::Ok,
                 Some(AccountUsage {
-                    plan: Some("plus".to_string()),
+                    plan: None,
                     windows: vec![
                         UsageWindow {
                             label: "5h".to_string(),
-                            used_pct: 5.0,
-                            resets_at: Some(1_800_000_000),
+                            used_pct: 41.0,
+                            resets_at: Some(now + 10_800),
+                            active: Some(false),
+                            severity: Some("normal".to_string()),
                         },
                         UsageWindow {
                             label: "weekly".to_string(),
-                            used_pct: 34.0,
-                            resets_at: Some(1_800_500_000),
+                            used_pct: 100.0,
+                            resets_at: Some(now + 133_200),
+                            active: Some(true),
+                            severity: Some("critical".to_string()),
+                        },
+                        UsageWindow {
+                            label: "weekly (Fable)".to_string(),
+                            used_pct: 0.0,
+                            resets_at: Some(now + 133_200),
+                            active: Some(false),
+                            severity: Some("normal".to_string()),
                         },
                     ],
-                    balance: Some(Balance {
-                        amount: 10.5,
-                        currency: "USD".to_string(),
-                    }),
+                    balance: None,
                     fetched_at: now - 60,
                 }),
                 false,
@@ -1433,6 +1787,8 @@ mod tests {
                         label: "5h".to_string(),
                         used_pct: 42.0,
                         resets_at: None,
+                        active: None,
+                        severity: None,
                     }],
                     balance: None,
                     fetched_at: now - 60,
@@ -1441,6 +1797,29 @@ mod tests {
                 None,
             ),
             status_row(
+                "openai-codex",
+                "codex-import",
+                AuthState::Ok,
+                Some(AccountUsage {
+                    plan: None,
+                    windows: vec![UsageWindow {
+                        label: "5h".to_string(),
+                        used_pct: 8.0,
+                        resets_at: Some(now + 573_000),
+                        active: None,
+                        severity: None,
+                    }],
+                    balance: Some(Balance {
+                        amount: 62500.0,
+                        currency: "USD".to_string(),
+                    }),
+                    fetched_at: now - 60,
+                }),
+                false,
+                None,
+            ),
+            status_row("kimi-coding", "env", AuthState::Ok, None, true, None),
+            status_row(
                 "openrouter",
                 "env",
                 AuthState::Invalid,
@@ -1448,57 +1827,34 @@ mod tests {
                 false,
                 Some("status 401: unauthorized"),
             ),
-            status_row(
-                "moonshotai",
-                "default",
-                AuthState::Missing,
-                None,
-                false,
-                None,
-            ),
-            status_row("zai-coding", "default", AuthState::Ok, None, true, None),
         ];
 
         let output = format_account_status(&rows, now);
         let lines: Vec<&str> = output.lines().collect();
-        let header = lines[0];
-        let starts: Vec<usize> = [
-            "provider", "account", "auth", "windows", "balance", "resets", "note",
-        ]
-        .iter()
-        .map(|name| header.find(name).expect("header column"))
-        .collect();
-        assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
-
-        let cell = |line: &str, column: usize| {
-            let end = if column + 1 < starts.len() {
-                starts[column + 1].min(line.len())
-            } else {
-                line.len()
-            };
-            line.get(starts[column].min(line.len())..end)
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        };
-        assert_eq!(cell(lines[1], 3), "5h: 95% left, weekly: 66% left");
-        assert_eq!(cell(lines[1], 4), "10.50 USD");
-        assert_eq!(cell(lines[1], 5), "52m, 5d19h");
-        assert_eq!(cell(lines[2], 2), "expired");
-        assert_eq!(cell(lines[2], 3), "5h: 58% left");
-        assert_eq!(cell(lines[3], 2), "invalid");
-        assert_eq!(cell(lines[3], 3), "error");
-        assert_eq!(cell(lines[3], 6), "status 401: unauthorized");
-        assert_eq!(cell(lines[4], 2), "missing");
-        assert_eq!(cell(lines[4], 3), "-");
-        assert_eq!(cell(lines[5], 3), "n/a");
-        assert_eq!(cell(lines[5], 4), "n/a");
-        assert_eq!(
-            lines[lines.len() - 1],
-            "% = share of window quota remaining"
-        );
-
-        assert_eq!(format_account_status(&[], now), "no accounts configured");
+        // anthropic: header carries the scoped column; rows align under it.
+        assert_eq!(lines[0], "anthropic");
+        let header = lines[1];
+        assert!(header.contains("5h"));
+        assert!(header.contains("weekly"));
+        assert!(header.contains("Fable"));
+        assert!(header.contains("resets"));
+        assert!(lines[2].contains("code@noeljackson.com"));
+        assert!(lines[2].contains("41%"));
+        assert!(lines[2].contains("100% !"));
+        // Non-ok auth appears beside the name.
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("claude-import (expired)")));
+        // A missing window in a row is a dash, not a shift.
+        let import = lines.iter().find(|l| l.contains("claude-import")).unwrap();
+        assert!(import.contains("42%"));
+        // Balance formats compactly under its own column.
+        assert!(output.contains("62500 USD"));
+        // No-endpoint providers say so on the account line.
+        assert!(output.contains("env  no usage endpoint"));
+        // Errors land beside the account.
+        assert!(output.contains("env (invalid)"));
+        assert!(output.contains("status 401: unauthorized"));
     }
 
     #[test]
@@ -1515,7 +1871,8 @@ mod tests {
     async fn collect_account_status_covers_stored_and_env_accounts() {
         let root = test_dir("noel-cli-accounts-status");
         let saved = std::env::var("OPENROUTER_API_KEY").ok();
-        std::env::set_var("OPENROUTER_API_KEY", "or-env-key");
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        unsafe { std::env::set_var("OPENROUTER_API_KEY", "or-env-key") };
 
         let mut auth = AuthData::default();
         auth.insert(
@@ -1539,7 +1896,7 @@ mod tests {
         }
         let stub = spawn_stub(200, r#"{"data":{"total_credits":10.0,"total_usage":2.5}}"#);
 
-        let rows = collect_account_status(&config, false, Some(&stub.url), 1_000).await;
+        let rows = collect_account_status(&config, false, Some(&stub.url), None, 1_000).await;
         assert_eq!(rows.len(), 2);
         let faux_row = rows
             .iter()
@@ -1565,18 +1922,157 @@ mod tests {
         );
         assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
 
-        let cached = collect_account_status(&config, false, Some(&stub.url), 1_100).await;
+        let cached = collect_account_status(&config, false, Some(&stub.url), None, 1_100).await;
         assert_eq!(cached.len(), 2);
         assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
 
-        let refreshed = collect_account_status(&config, true, Some(&stub.url), 1_100).await;
+        let refreshed = collect_account_status(&config, true, Some(&stub.url), None, 1_100).await;
         assert_eq!(refreshed.len(), 2);
         assert_eq!(stub.hits.load(Ordering::SeqCst), 2);
 
         match saved {
-            Some(value) => std::env::set_var("OPENROUTER_API_KEY", value),
-            None => std::env::remove_var("OPENROUTER_API_KEY"),
+            // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+            Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
+            // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn collect_account_status_rotates_expiring_stored_oauth() {
+        let root = test_dir("noel-cli-accounts-refresh");
+        let auth_path = root.join("agent").join("auth.json");
+        std::fs::create_dir_all(root.join("agent")).expect("create agent dir");
+        let mut auth = AuthData::default();
+        auth.insert(
+            "anthropic",
+            "work",
+            AuthCredential::OAuth {
+                access_token: "stale-access".to_string(),
+                refresh_token: Some("stale-refresh".to_string()),
+                expires: 900,
+                account_id: None,
+            },
+        );
+        std::fs::write(
+            &auth_path,
+            format!("{}\n", serde_json::to_string_pretty(&auth).unwrap()),
+        )
+        .expect("write auth file");
+        let config = status_test_config(&root, auth);
+
+        let token_stub = spawn_stub(
+            200,
+            r#"{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600}"#,
+        );
+        let usage_stub = spawn_stub(
+            200,
+            r#"{"five_hour":{"utilization":10.0,"resets_at":"2027-11-24T15:00:00Z"}}"#,
+        );
+
+        let rows = collect_account_status(
+            &config,
+            true,
+            Some(&usage_stub.url),
+            Some((&token_stub.url, "test-client")),
+            1_000,
+        )
+        .await;
+
+        let row = rows
+            .iter()
+            .find(|row| row.provider == "anthropic" && row.account == "work")
+            .expect("stored anthropic row");
+        assert_eq!(row.auth_state, AuthState::Ok, "note: {:?}", row.error);
+        assert!(row.usage.is_some(), "note: {:?}", row.error);
+
+        let token_requests = token_stub.requests.lock().expect("token requests");
+        assert_eq!(token_requests.len(), 1, "one refresh request");
+        assert!(
+            token_requests[0].contains("grant_type=refresh_token"),
+            "{}",
+            token_requests[0]
+        );
+        drop(token_requests);
+
+        let usage_requests = usage_stub.requests.lock().expect("usage requests");
+        assert!(
+            usage_requests
+                .iter()
+                .any(|request| request.contains("authorization: Bearer fresh-access")),
+            "probe must use the rotated token: {usage_requests:?}"
+        );
+        drop(usage_requests);
+
+        let persisted: AuthData =
+            serde_json::from_str(&std::fs::read_to_string(&auth_path).unwrap())
+                .expect("persisted auth parses");
+        match persisted.credential("anthropic", "work") {
+            Some(AuthCredential::OAuth {
+                access_token,
+                refresh_token,
+                expires,
+                ..
+            }) => {
+                assert_eq!(access_token, "fresh-access");
+                assert_eq!(refresh_token.as_deref(), Some("fresh-refresh"));
+                assert_eq!(*expires, 4_600);
+            }
+            other => panic!("expected persisted oauth credential, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn collect_account_status_reports_refresh_failure() {
+        let root = test_dir("noel-cli-accounts-refresh-failure");
+        let auth_path = root.join("agent").join("auth.json");
+        std::fs::create_dir_all(root.join("agent")).expect("create agent dir");
+        let mut auth = AuthData::default();
+        auth.insert(
+            "anthropic",
+            "work",
+            AuthCredential::OAuth {
+                access_token: "stale-access".to_string(),
+                refresh_token: Some("revoked-refresh".to_string()),
+                expires: 900,
+                account_id: None,
+            },
+        );
+        std::fs::write(
+            &auth_path,
+            format!("{}\n", serde_json::to_string_pretty(&auth).unwrap()),
+        )
+        .expect("write auth file");
+        let config = status_test_config(&root, auth);
+
+        let token_stub = spawn_stub(400, r#"{"error":"invalid_grant"}"#);
+        let usage_stub = spawn_stub(
+            401,
+            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+        );
+
+        let rows = collect_account_status(
+            &config,
+            true,
+            Some(&usage_stub.url),
+            Some((&token_stub.url, "test-client")),
+            1_000,
+        )
+        .await;
+
+        let row = rows
+            .iter()
+            .find(|row| row.provider == "anthropic" && row.account == "work")
+            .expect("stored anthropic row");
+        assert_eq!(row.auth_state, AuthState::Invalid);
+        let note = row.error.as_deref().expect("refresh failure note");
+        assert!(note.contains("invalid_grant"), "note: {note}");
+        assert!(note.contains("claude login"), "note: {note}");
+        assert_eq!(token_stub.hits.load(Ordering::SeqCst), 1);
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

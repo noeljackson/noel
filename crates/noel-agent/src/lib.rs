@@ -211,7 +211,16 @@ pub async fn run_turn(
             cancellation,
             |event| on_event(&AgentEvent::Provider(event.clone())),
         )
-        .await?;
+        .await;
+        // A cancel during the request or its backoff is reported as one
+        // between requests is (#159).
+        let events = match events {
+            Err(AgentError::Cancelled) => {
+                on_event(&AgentEvent::TurnCancelled);
+                return Err(AgentError::Cancelled);
+            }
+            events => events?,
+        };
         if cancellation.is_cancelled() {
             on_event(&AgentEvent::TurnCancelled);
             return Err(AgentError::Cancelled);
@@ -642,6 +651,35 @@ mod tests {
         );
     }
 
+    /// #159: a cancel that lands during the request ends the turn with
+    /// `TurnCancelled`, as one between requests does.
+    #[tokio::test]
+    async fn a_cancel_during_the_request_reports_the_turn_cancelled() {
+        let cancellation = CancellationToken::default();
+        let _cancelled_at = cancel_later(&cancellation, Duration::from_millis(20));
+        let mut state = AgentState {
+            messages: Vec::new(),
+        };
+        let mut events = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_turn(
+                &PendingProvider,
+                &mut state,
+                "hi".to_string(),
+                &AgentConfig::default(),
+                &NoTools,
+                &cancellation,
+                None,
+                |event| events.push(format!("{event:?}")),
+            ),
+        )
+        .await
+        .expect("the cancel ends the turn");
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_eq!(events.last().map(String::as_str), Some("TurnCancelled"));
+    }
+
     #[tokio::test]
     async fn cancellation_during_backoff_returns_promptly() {
         let provider = FailingProvider(Default::default());
@@ -907,7 +945,7 @@ mod tests {
                 if answer {
                     let _ = stream.write_all(
                         b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
-                          data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                          data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
                     );
                 } else {
                     stalled.push(stream);
@@ -929,7 +967,9 @@ mod tests {
                 session_id: None,
                 traits: noel_ai::ModelTraits::default(),
             },
-            noel_ai::provider_http_client_with_idle_timeout(Duration::from_millis(300)),
+            // Long enough for the stub's answer to the retry to arrive on a
+            // loaded machine: it too is cut off at this.
+            noel_ai::provider_http_client_with_idle_timeout(Duration::from_secs(2)),
         );
         let request = ProviderRequest {
             max_output_tokens: None,

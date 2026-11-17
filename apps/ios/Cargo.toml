@@ -1,0 +1,27 @@
+[package]
+name = "noel-ios"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "noel's iOS app backend: noel-client over a Rust SSH exec channel"
+publish = false
+
+[lib]
+path = "src/backend.rs"
+
+[dependencies]
+anyhow = "1"
+futures = "0.3"
+gpui = { package = "gpui-ce", version = "=0.3.0" }
+gpui_platform = { package = "gpui_ce_platform", version = "=0.3.0" }
+gpui_elements = { package = "gpui_ce_elements", version = "=0.3.0" }
+noel-app-ui = { path = "../shared/gpui-ui" }
+noel-chord = { path = "../../crates/noel-chord" }
+noel-client = { path = "../../crates/noel-client" }
+russh = { version = "0.65.1", default-features = false, features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+# Its own workspace: app dependencies stay out of the core `make check`.
+[workspace]

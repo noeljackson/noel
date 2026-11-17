@@ -14,13 +14,18 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "auth-discovery.json",
     "bedrock-claude-opus-4.6.json",
     "bedrock-tools.json",
+    "chord-delta.json",
+    "chord-v2-contracts.json",
+    "chord-v2-messages.json",
     "cli-contract.json",
     "cloudflare-ai-gateway-kimi.json",
+    "codemode-declarations.json",
     "error-classification.json",
-    "github-copilot-gpt-5.4.json",
+    "github-copilot-gpt-6.1-sol.json",
     "google-gemini-2.5-pro.json",
     "google-tool-image-routing.json",
     "google-tools.json",
+    "local-env.json",
     "local-tools.json",
     "mistral-devstral.json",
     "mistral-tool-id.json",
@@ -32,6 +37,8 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "openai-responses-tool-id.json",
     "openai-responses-tools.json",
     "openrouter-kimi.json",
+    "pi-env-ssh.json",
+    "pi-env.json",
     "rpc-protocol.json",
     "session-export.json",
     "settings.json",
@@ -39,6 +46,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "slash-commands.json",
     "system-prompt.json",
     "tool-behavior.json",
+    "tool-search.json",
     "tui-transcripts.json",
 ];
 
@@ -47,12 +55,17 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "anthropic-oauth-fixture.ts",
     "auth-discovery-fixture.ts",
     "bedrock-fixture.ts",
+    "chord-delta-fixture.ts",
+    "chord-v2-contracts-fixture.ts",
+    "chord-v2-messages-fixture.ts",
     "cli-contract-fixture.ts",
     "cloudflare-fixture.ts",
+    "codemode-declarations-fixture.ts",
     "codex-oauth-fixture.ts",
     "copilot-fixture.ts",
     "error-classification-fixture.ts",
     "google-fixture.ts",
+    "local-env-fixture.ts",
     "local-tools-fixture.ts",
     "mistral-fixture.ts",
     "model-catalog-fixture.ts",
@@ -60,6 +73,8 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "model-thinking-fixture.ts",
     "openai-tools-fixture.ts",
     "openrouter-fixture.ts",
+    "pi-env-fixture.ts",
+    "pi-env-ssh-fixture.ts",
     "rpc-protocol-fixture.ts",
     "session-export-fixture.ts",
     "settings-fixture.ts",
@@ -67,6 +82,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "slash-command-fixture.ts",
     "system-prompt-fixture.ts",
     "tool-behavior-fixture.ts",
+    "tool-search-fixture.ts",
     "tui-transcript-fixture.ts",
 ];
 
@@ -97,7 +113,11 @@ fn fixtures_have_source_metadata_and_payloads() {
             source.get("repository").and_then(Value::as_str),
             Some("https://github.com/earendil-works/pi")
         );
-        assert_eq!(source.get("ref").and_then(Value::as_str), Some("main"));
+        assert_eq!(
+            source.get("ref").and_then(Value::as_str),
+            Some(expected_ref(fixture_name).as_str()),
+            "{fixture_name} source.ref"
+        );
         let script = fixture_script_name(&fixture);
         assert!(
             EXPECTED_SCRIPTS.contains(&script),
@@ -143,6 +163,15 @@ fn every_script_output_is_committed() {
             "bedrock-fixture.ts",
             fixture_set(&["bedrock-claude-opus-4.6.json", "bedrock-tools.json"]),
         ),
+        ("chord-delta-fixture.ts", fixture_set(&["chord-delta.json"])),
+        (
+            "chord-v2-contracts-fixture.ts",
+            fixture_set(&["chord-v2-contracts.json"]),
+        ),
+        (
+            "chord-v2-messages-fixture.ts",
+            fixture_set(&["chord-v2-messages.json"]),
+        ),
         (
             "cli-contract-fixture.ts",
             fixture_set(&["cli-contract.json"]),
@@ -152,12 +181,16 @@ fn every_script_output_is_committed() {
             fixture_set(&["cloudflare-ai-gateway-kimi.json"]),
         ),
         (
+            "codemode-declarations-fixture.ts",
+            fixture_set(&["codemode-declarations.json"]),
+        ),
+        (
             "codex-oauth-fixture.ts",
             fixture_set(&["openai-codex-chatgpt-oauth.json"]),
         ),
         (
             "copilot-fixture.ts",
-            fixture_set(&["github-copilot-gpt-5.4.json"]),
+            fixture_set(&["github-copilot-gpt-6.1-sol.json"]),
         ),
         (
             "error-classification-fixture.ts",
@@ -171,6 +204,7 @@ fn every_script_output_is_committed() {
                 "google-tools.json",
             ]),
         ),
+        ("local-env-fixture.ts", fixture_set(&["local-env.json"])),
         ("local-tools-fixture.ts", fixture_set(&["local-tools.json"])),
         (
             "mistral-fixture.ts",
@@ -203,6 +237,8 @@ fn every_script_output_is_committed() {
             "openrouter-fixture.ts",
             fixture_set(&["openrouter-kimi.json"]),
         ),
+        ("pi-env-fixture.ts", fixture_set(&["pi-env.json"])),
+        ("pi-env-ssh-fixture.ts", fixture_set(&["pi-env-ssh.json"])),
         (
             "rpc-protocol-fixture.ts",
             fixture_set(&["rpc-protocol.json"]),
@@ -225,6 +261,7 @@ fn every_script_output_is_committed() {
             "tool-behavior-fixture.ts",
             fixture_set(&["tool-behavior.json"]),
         ),
+        ("tool-search-fixture.ts", fixture_set(&["tool-search.json"])),
         (
             "tui-transcript-fixture.ts",
             fixture_set(&["tui-transcripts.json"]),
@@ -235,6 +272,21 @@ fn every_script_output_is_committed() {
     .collect::<BTreeMap<_, _>>();
 
     assert_eq!(by_script, expected);
+}
+
+/// The upstream ref a fixture records: `main`, except for Chord v2's, which
+/// follow `CHORD2_REFERENCE_REF` in the Makefile.
+fn expected_ref(fixture_name: &str) -> String {
+    if fixture_name.starts_with("chord-v2-") {
+        let makefile = fs::read_to_string(repo_root().join("Makefile")).expect("read Makefile");
+        return makefile
+            .lines()
+            .find_map(|line| line.strip_prefix("CHORD2_REFERENCE_REF ?= "))
+            .expect("the Makefile pins Chord v2")
+            .trim()
+            .to_string();
+    }
+    "main".to_string()
 }
 
 fn fixture_set(names: &[&str]) -> BTreeSet<String> {
@@ -269,33 +321,59 @@ fn provider_request_headers_are_redacted() {
 #[test]
 fn committed_fixtures_are_referenced_by_rust_parity_tests() {
     let expected = [
-        ("agent-tool-loop.json", "crates/noel-core/src/lib.rs"),
-        ("anthropic-api-key.json", "crates/noel-ai/src/lib.rs"),
+        ("agent-tool-loop.json", "crates/noel-core/src/tests.rs"),
+        ("anthropic-api-key.json", "crates/noel-ai/src/tests.rs"),
         (
             "anthropic-claude-code-oauth.json",
-            "crates/noel-ai/src/lib.rs",
+            "crates/noel-ai/src/tests.rs",
         ),
-        ("anthropic-tools.json", "crates/noel-ai/src/lib.rs"),
-        ("auth-discovery.json", "crates/noel-config/src/lib.rs"),
-        ("bedrock-claude-opus-4.6.json", "crates/noel-ai/src/lib.rs"),
-        ("bedrock-tools.json", "crates/noel-ai/src/lib.rs"),
-        ("cli-contract.json", "crates/noel-cli/src/main.rs"),
+        ("anthropic-tools.json", "crates/noel-ai/src/tests.rs"),
+        ("auth-discovery.json", "crates/noel-config/src/tests.rs"),
+        (
+            "bedrock-claude-opus-4.6.json",
+            "crates/noel-ai/src/tests.rs",
+        ),
+        ("bedrock-tools.json", "crates/noel-ai/src/tests.rs"),
+        (
+            "chord-delta.json",
+            "crates/noel-chord/tests/chord_delta_parity.rs",
+        ),
+        (
+            "chord-v2-contracts.json",
+            "crates/noel-chord/tests/chord_v2_contracts.rs",
+        ),
+        (
+            "chord-v2-messages.json",
+            "crates/noel-chord/tests/chord_v2_messages.rs",
+        ),
+        ("cli-contract.json", "crates/noel-cli/src/tests.rs"),
         (
             "cloudflare-ai-gateway-kimi.json",
-            "crates/noel-ai/src/lib.rs",
+            "crates/noel-ai/src/tests.rs",
         ),
-        ("error-classification.json", "crates/noel-ai/src/lib.rs"),
-        ("github-copilot-gpt-5.4.json", "crates/noel-ai/src/lib.rs"),
-        ("google-gemini-2.5-pro.json", "crates/noel-ai/src/lib.rs"),
+        (
+            "codemode-declarations.json",
+            "crates/noel-codemode/src/declarations.rs",
+        ),
+        ("error-classification.json", "crates/noel-ai/src/tests.rs"),
+        (
+            "github-copilot-gpt-6.1-sol.json",
+            "crates/noel-ai/src/tests.rs",
+        ),
+        ("google-gemini-2.5-pro.json", "crates/noel-ai/src/tests.rs"),
         (
             "google-tool-image-routing.json",
-            "crates/noel-ai/src/lib.rs",
+            "crates/noel-ai/src/tests.rs",
         ),
-        ("google-tools.json", "crates/noel-ai/src/lib.rs"),
+        ("google-tools.json", "crates/noel-ai/src/tests.rs"),
+        (
+            "local-env.json",
+            "crates/noel-env/tests/local_env_conformance.rs",
+        ),
         ("local-tools.json", "crates/noel-tools/src/lib.rs"),
-        ("mistral-devstral.json", "crates/noel-ai/src/lib.rs"),
-        ("mistral-tool-id.json", "crates/noel-ai/src/lib.rs"),
-        ("mistral-tools.json", "crates/noel-ai/src/lib.rs"),
+        ("mistral-devstral.json", "crates/noel-ai/src/tests.rs"),
+        ("mistral-tool-id.json", "crates/noel-ai/src/tests.rs"),
+        ("mistral-tools.json", "crates/noel-ai/src/tests.rs"),
         ("model-catalog.json", "crates/noel-ai/src/catalog.rs"),
         (
             "model-resolution.json",
@@ -304,14 +382,25 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("model-thinking.json", "crates/noel-ai/src/catalog.rs"),
         (
             "openai-codex-chatgpt-oauth.json",
-            "crates/noel-ai/src/lib.rs",
+            "crates/noel-ai/src/tests.rs",
         ),
-        ("openai-responses-tool-id.json", "crates/noel-ai/src/lib.rs"),
-        ("openai-responses-tools.json", "crates/noel-ai/src/lib.rs"),
-        ("openrouter-kimi.json", "crates/noel-ai/src/lib.rs"),
+        (
+            "openai-responses-tool-id.json",
+            "crates/noel-ai/src/tests.rs",
+        ),
+        ("openai-responses-tools.json", "crates/noel-ai/src/tests.rs"),
+        ("openrouter-kimi.json", "crates/noel-ai/src/tests.rs"),
+        (
+            "pi-env-ssh.json",
+            "crates/noel-env-daemon/tests/ssh_deploy.rs",
+        ),
+        (
+            "pi-env.json",
+            "crates/noel-env-daemon/tests/pi_env_golden.rs",
+        ),
         ("rpc-protocol.json", "crates/noel-cli/tests/rpc_parity.rs"),
-        ("session-export.json", "crates/noel-core/src/lib.rs"),
-        ("settings.json", "crates/noel-config/src/lib.rs"),
+        ("session-export.json", "crates/noel-core/src/tests.rs"),
+        ("settings.json", "crates/noel-config/src/tests.rs"),
         ("skills.json", "crates/noel-config/src/skills.rs"),
         ("slash-commands.json", "crates/noel-tui/src/lib.rs"),
         (
@@ -322,6 +411,7 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
             "tool-behavior.json",
             "crates/noel-core/src/tool_parity_tests.rs",
         ),
+        ("tool-search.json", "crates/noel-codemode/src/search.rs"),
         ("tui-transcripts.json", "crates/noel-tui/src/lib.rs"),
     ]
     .into_iter()

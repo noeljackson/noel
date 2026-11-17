@@ -9,7 +9,9 @@ import type {
 	StreamFn,
 } from "/ts-reference/packages/agent/src/types.ts";
 import { getModel } from "/ts-reference/packages/ai/src/compat.ts";
-import { getCurrentTools, Type } from "/ts-reference/packages/ai/src/index.ts";
+import { getCurrentTools } from "/ts-reference/packages/ai/src/index.ts";
+// pi-ai stopped re-exporting TypeBox (upstream 6536f801).
+import { Type } from "/ts-reference/node_modules/typebox/build/index.mjs";
 import { createAssistantMessageEventStream } from "/ts-reference/packages/ai/src/utils/event-stream.ts";
 
 type StreamCall = {

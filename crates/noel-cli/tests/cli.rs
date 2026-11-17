@@ -298,7 +298,7 @@ fn print_mode_sends_the_default_system_prompt_and_the_prompt_files() {
     // Not trusted: the project's .noel/SYSTEM.md is ignored.
     let prompt = system_prompt_sent(&root, &["--no-approve"]);
     let role = format!(
-        "You are an expert coding assistant operating inside {}, a coding agent harness.",
+        "You are a coding assistant running inside {}, a coding agent harness.",
         noel_core::PRODUCT_NAME
     );
     assert!(prompt.starts_with(&role), "{prompt}");
@@ -1275,7 +1275,9 @@ fn accounts_status_prints_table_or_empty_state() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout.trim(), "no accounts configured");
+    assert!(stdout.trim_start().starts_with("no accounts configured"));
+    assert!(stdout.contains("noel login <provider>"), "{stdout}");
+    assert!(stdout.contains("/account switches"), "{stdout}");
 
     let refresh = base(&["accounts", "status", "--refresh"]);
     assert!(
@@ -2095,7 +2097,6 @@ fn usage_errors_import_nothing_and_the_first_command_that_loads_configuration_im
         &["config", "disable"],
         &["config", "disable", "bogus-kind", "name"],
         &["generate-image", "a prompt without an output"],
-        &["mcp", "list"],
     ] {
         let output = noel_on_default_dir(&root, &home, args);
         assert!(!output.status.success(), "{args:?}: {output:?}");
@@ -2181,6 +2182,7 @@ fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_origina
                     Err(error) => panic!("local server: {error}"),
                 }
             };
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
@@ -2316,7 +2318,7 @@ fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_origina
     assert!(requests[3]["messages"][0]["content"]
         .as_str()
         .unwrap()
-        .starts_with("You are an expert coding assistant"));
+        .starts_with("You are a coding assistant"));
     assert!(requests[3]["messages"][1]["content"]
         .as_str()
         .unwrap()
@@ -2364,9 +2366,15 @@ fn upstream_v1_1_flags_are_accepted_in_print_mode() {
     );
     assert!(!agent.join("settings.json").exists());
 
+    // A light/dark pair is upstream's auto setting: accepted, its half
+    // resolved from the terminal's appearance (dark without reports).
     let pair = run(&["--use-theme", "light/dark"]);
-    assert!(!pair.status.success());
-    assert!(String::from_utf8_lossy(&pair.stderr).contains("theme pairs are not supported"));
+    assert!(
+        pair.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pair.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&pair.stdout), "[faux/echo] hello\n");
     for args in [
         &["--no-themes", "--use-theme", "light"][..],
         &["--theme", "dark", "--use-theme", "light"],
@@ -2386,12 +2394,119 @@ fn upstream_v1_1_flags_are_accepted_in_print_mode() {
 }
 
 #[test]
-fn mcp_command_reports_missing_support_instead_of_prompting() {
-    let output = noel_command().args(["mcp", "list"]).output().unwrap();
+fn mcp_add_remove_round_trips() {
+    let root = test_dir("noel-cli-mcp-manager");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    fs::create_dir_all(root.join(".noel")).unwrap();
 
+    // stdio with args after --; http; then list names both, remove drops one.
+    let run = |args: &[&str]| {
+        noel_command()
+            .args(args)
+            .env("NOEL_DIR", agent.to_str().unwrap())
+            .current_dir(&root)
+            .output()
+            .unwrap()
+    };
+    let out = run(&[
+        "mcp",
+        "add",
+        "calc",
+        "--command",
+        "calc-server",
+        "--",
+        "--fast",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let out = run(&["mcp", "add", "docs", "--url", "https://example.com/mcp"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let listed = run(&["mcp", "list"]);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        stdout.contains("calc") && stdout.contains("calc-server --fast"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("docs"), "{stdout}");
+
+    // The stored shape round-trips with the dash-prefixed arg.
+    let stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(agent.join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(stored["mcpServers"]["calc"]["args"][0], "--fast");
+
+    // -l writes the project's .noel/mcp.json.
+    let out = run(&["mcp", "add", "ptool", "--command", "pt", "-l"]);
+    assert!(out.status.success());
+    assert!(root.join(".noel/mcp.json").exists());
+
+    // A file that does not parse is left as it is, not replaced.
+    fs::write(root.join(".noel/mcp.json"), "{ \"mcpServers\": { oops").unwrap();
+    let out = run(&["mcp", "add", "other", "--command", "x", "-l"]);
+    assert!(!out.status.success());
+    assert_eq!(
+        fs::read_to_string(root.join(".noel/mcp.json")).unwrap(),
+        "{ \"mcpServers\": { oops"
+    );
+
+    // remove drops the entry and keeps the rest.
+    let out = run(&["mcp", "remove", "calc"]);
+    assert!(out.status.success());
+    let listed = run(&["mcp", "list"]);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(!stdout.contains("calc-server"), "{stdout}");
+    assert!(stdout.contains("docs"), "{stdout}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn mcp_command_lists_configured_servers() {
+    let root = test_dir("noel-cli-mcp-command");
+    fs::create_dir_all(root.join(".noel")).unwrap();
+    fs::write(
+        root.join(".noel/mcp.json"),
+        r#"{"mcpServers": {"calc": {"command": "calc-server", "args": ["--fast"]}}}"#,
+    )
+    .unwrap();
+
+    // A trusted project lists its server; `mcp` with anything but list
+    // (or nothing) still refuses, as the slice ships list only.
+    let output = noel_command()
+        .args(["--approve", "mcp", "list"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("calc"), "{stdout}");
+    assert!(stdout.contains("calc-server"), "{stdout}");
+
+    // `mcp add` without a shape prints usage and changes nothing; an
+    // unknown subcommand is still an error.
+    let output = noel_command()
+        .args(["mcp", "add"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no MCP support"));
-    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("usage"));
+    assert!(!root.join("agent/mcp.json").exists());
+    let output = noel_command()
+        .args(["mcp", "frobnicate"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("noel mcp frobnicate"));
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -2806,4 +2921,185 @@ fn fatal_signals_during_a_print_mode_bash_tool_kill_its_tree_and_end_noel_like_u
         server.join().unwrap();
     }
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn attach_refuses_the_options_that_shape_a_local_session() {
+    for args in [
+        &["--attach", "s-1", "--model", "faux/echo"][..],
+        &["--attach", "s-1", "--session-dir", "sessions"],
+        &["--attach", "s-1", "--thinking", "high"],
+        &["--attach", "s-1", "--no-tools"],
+        &["--attach", "s-1", "-p", "hi"],
+    ] {
+        let output = noel_command().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("cannot be used with") && stderr.contains("--attach"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn remote_is_only_for_attach_and_client() {
+    for args in [&["--remote", "box", "-p", "hi"][..], &["--remote", "box"]] {
+        let output = noel_command().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--remote needs --attach"),
+            "{args:?}: {stderr}"
+        );
+    }
+    let output = noel_command()
+        .args(["--remote-noel", "/opt/noel", "--attach", "s-1"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--remote <DEST>"), "{stderr}");
+    // A destination ssh would read as an option is refused before ssh runs.
+    for args in [
+        &["client", "--remote=-oProxyCommand=x", "ls"][..],
+        &["client", "ls", "--remote", "a b"],
+    ] {
+        let output = noel_command().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("is not an ssh destination"),
+            "{args:?}: {stderr}"
+        );
+    }
+    // `new` needs a directory on the other machine.
+    let output = noel_command()
+        .args(["client", "--remote", "box", "new", "--model", "faux/echo"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("with --remote, pass --cwd: an absolute path on box"),
+        "{stderr}"
+    );
+}
+
+/// `--workspace` (spec §10): a session starts only on a host noel trusts,
+/// keeps its workspace in its journal, and refuses another one on reopen;
+/// `noel workspace forget` withdraws the trust. Nothing here connects: the
+/// faux model calls no tool, and `--no-context-files` reads none there.
+#[test]
+fn workspace_sessions_need_a_trusted_host_and_keep_their_workspace() {
+    let root = test_dir("noel-cli-workspace");
+    fs::create_dir_all(&root).expect("create root");
+    let sessions = root.join("sessions");
+    let run = |args: &[&str]| isolated_noel(&root, args).output().expect("run noel");
+    let stderr =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stderr).into_owned();
+    let url = "ssh://me@box:2222/work";
+
+    let untrusted = run(&["-p", "--workspace", url, "hi"]);
+    assert!(!untrusted.status.success());
+    assert!(
+        stderr(&untrusted).contains("noel workspace trust ssh://box:2222"),
+        "{}",
+        stderr(&untrusted)
+    );
+    assert!(!sessions.exists() || fs::read_dir(&sessions).unwrap().next().is_none());
+
+    let invalid = run(&["-p", "--workspace", "box:/work", "hi"]);
+    assert!(stderr(&invalid).contains("ssh://[user@]host[:port]/absolute/path"));
+
+    let known_hosts = root.join("agent/workspaces/known_hosts");
+    fs::create_dir_all(known_hosts.parent().unwrap()).unwrap();
+    fs::write(
+        &known_hosts,
+        "noel-env-[box]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEkTfD9MHTJ17XaccHgmbzbKL4eXWllTUvlX6Loix89\n",
+    )
+    .unwrap();
+    let first = run(&["-p", "--no-context-files", "--workspace", url, "hi"]);
+    assert!(first.status.success(), "{}", stderr(&first));
+    let journals = fs::read_dir(&sessions)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(journals.len(), 1);
+    let journal = fs::read_to_string(&journals[0]).unwrap();
+    let record: serde_json::Value = serde_json::from_str(journal.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(
+        record,
+        serde_json::json!({
+            "type": "workspace", "adapter": "ssh", "id": "ssh://box:2222", "cwd": "/work",
+            "host": "box", "user": "me", "port": 2222,
+        })
+    );
+
+    let other = run(&[
+        "-p",
+        "-c",
+        "--workspace",
+        "ssh://me@box:2222/other",
+        "again",
+    ]);
+    assert!(!other.status.success());
+    assert!(
+        stderr(&other).contains("runs its tools in ssh://me@box:2222/work"),
+        "{}",
+        stderr(&other)
+    );
+    let same = run(&[
+        "-p",
+        "-c",
+        "--no-context-files",
+        "--workspace",
+        url,
+        "again",
+    ]);
+    assert!(same.status.success(), "{}", stderr(&same));
+    let reopened = run(&["-p", "-c", "--no-context-files", "once more"]);
+    assert!(reopened.status.success(), "{}", stderr(&reopened));
+    assert_eq!(fs::read_dir(&sessions).unwrap().count(), 1);
+
+    let forget = noel_command()
+        .current_dir(&root)
+        .env("NOEL_DIR", root.join("agent"))
+        .args(["workspace", "forget", "ssh://box:2222"])
+        .output()
+        .unwrap();
+    assert!(forget.status.success(), "{}", stderr(&forget));
+    assert_eq!(fs::read_to_string(&known_hosts).unwrap(), "");
+    let forgotten = run(&["-p", "-c", "--no-context-files", "after forgetting"]);
+    assert!(!forgotten.status.success());
+    assert!(
+        stderr(&forgotten).contains("noel workspace trust ssh://box:2222"),
+        "{}",
+        stderr(&forgotten)
+    );
+
+    // A local session keeps running here.
+    let local_root = root.join("local");
+    fs::create_dir_all(&local_root).unwrap();
+    let local = isolated_noel(&local_root, &["-p", "local"])
+        .output()
+        .unwrap();
+    assert!(local.status.success(), "{}", stderr(&local));
+    let local_known_hosts = local_root.join("agent/workspaces/known_hosts");
+    fs::create_dir_all(local_known_hosts.parent().unwrap()).unwrap();
+    fs::write(
+        &local_known_hosts,
+        "noel-env-[box]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEkTfD9MHTJ17XaccHgmbzbKL4eXWllTUvlX6Loix89\n",
+    )
+    .unwrap();
+    let moved = isolated_noel(&local_root, &["-p", "-c", "--workspace", url, "moved"])
+        .output()
+        .unwrap();
+    assert!(!moved.status.success());
+    assert!(
+        stderr(&moved).contains("runs its tools on this machine"),
+        "{}",
+        stderr(&moved)
+    );
+    let _ = fs::remove_dir_all(root);
 }

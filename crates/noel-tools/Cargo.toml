@@ -16,11 +16,15 @@ base64.workspace = true
 globset = "=0.4.20"
 ignore = "=0.4.33"
 image.workspace = true
+noel-env = { path = "../noel-env" }
 reqwest.workspace = true
 regex = "1"
 serde_json.workspace = true
-scraper = { version = "0.24", default-features = false }
+scraper = { version = "0.29", default-features = false }
 serde.workspace = true
 thiserror.workspace = true
 nix.workspace = true
 tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,64 @@
+{
+  "name": "noel.models",
+  "version": 1,
+  "host": "server",
+  "params": [],
+  "variants": {
+    "owner": {
+      "state": {
+        "catalog": {
+          "type": "object",
+          "required": [
+            "models"
+          ],
+          "properties": {
+            "models": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "provider",
+                  "modelId",
+                  "name",
+                  "reasoning",
+                  "thinkingLevels",
+                  "available",
+                  "scoped"
+                ],
+                "properties": {
+                  "provider": {
+                    "type": "string"
+                  },
+                  "modelId": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "reasoning": {
+                    "type": "boolean"
+                  },
+                  "thinkingLevels": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "available": {
+                    "type": "boolean"
+                  },
+                  "scoped": {
+                    "type": "boolean"
+                  },
+                  "thinkingLevel": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -58,7 +58,9 @@ run_shell_command() {
   tmux send-keys -t "${session}" -l "${command}"
   tmux send-keys -t "${session}" Enter
   wait_for_file "${work_dir}/noel.pid"
-  noel_pid="$(cat "${work_dir}/noel.pid")"
+  # The TUI is the pane shell's child; the command runs under it, or under
+  # the session's worker when noel is a client of a local server.
+  noel_pid="$(pgrep -P "$(tmux display-message -p -t "${session}" '#{pane_pid}')" | head -n 1)"
   is_noel "${noel_pid}" || fail 'the shell command did not run under noel'
   if [ "$1" = waiting ]; then
     wait_for_file "${work_dir}/child.pid"

@@ -1,6 +1,6 @@
 name: PR Gate
 
-on:
+on: # zizmor: ignore[dangerous-triggers] Only GitHub metadata APIs are called; no pull-request code is checked out or executed.
   pull_request_target:
     types: [opened]
 
@@ -13,7 +13,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Check if contributor is approved
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
             const APPROVED_FILE = '.github/APPROVED_CONTRIBUTORS';

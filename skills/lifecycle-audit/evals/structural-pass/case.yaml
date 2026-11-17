@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: structural-pass
+expected_outcome: |
+  The response runs the metrics script (or equivalent measurements), reports
+  numbers rather than impressions, says which metrics are already fine, and
+  proposes a short ranked list of structural issues with concrete locations.

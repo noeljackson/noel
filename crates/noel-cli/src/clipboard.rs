@@ -14,10 +14,10 @@ pub async fn image_bytes() -> Result<Vec<u8>> {
         return read_command(&command).await;
     }
     for command in image_commands() {
-        if let Ok(bytes) = read_command(command).await {
-            if image::guess_format(&bytes).is_ok() {
-                return Ok(bytes);
-            }
+        if let Ok(bytes) = read_command(command).await
+            && image::guess_format(&bytes).is_ok()
+        {
+            return Ok(bytes);
         }
     }
     Err(anyhow!("no clipboard image available; use /image <path> [prompt] or install wl-clipboard/xclip on Linux"))

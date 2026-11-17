@@ -143,7 +143,7 @@ fn take_saved_output(text: &mut String) -> Option<Value> {
 fn builtin_tool_definitions_match_upstream() {
     for upstream in fixture()["definitions"].as_array().expect("definitions") {
         let name = upstream["name"].as_str().expect("tool name");
-        let definition = model_tool_definition(name).expect("tool definition");
+        let definition = model_tool_definition(name, &[]).expect("tool definition");
         assert_eq!(
             json!(definition.description),
             upstream["description"],
@@ -190,9 +190,14 @@ async fn builtin_tools_behave_like_upstream() {
             name: call["tool"].as_str().expect("call tool").to_string(),
             arguments: call["args"].to_string().replace("<tmp>", tmp_text),
         };
-        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
-            .await
-            .expect("record tool result");
+        execute_model_tool_call(
+            &mut runtime,
+            &crate::tests::unused_provider(),
+            &tool_call,
+            &mut |_| {},
+        )
+        .await
+        .expect("record tool result");
         let event = runtime.session.tool_history.last().expect("tool event");
         let message = runtime.session.messages.last().expect("tool message");
 

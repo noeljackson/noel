@@ -16,6 +16,7 @@ session_dir="${e2e_root}/e2e-tmux-sessions"
 work_dir="${e2e_root}/e2e-tmux-work"
 cwd_dir="${work_dir}/cwd"
 agent_dir="${work_dir}/agent"
+bun_host="${repo_root}/crates/noel-cli/src/extension-hosts/noel-bun-host.ts"
 prompt_file="${work_dir}/prompt-ready"
 
 cleanup() {
@@ -56,6 +57,16 @@ printf '{"output":"json-ext saw %s"}\n' "${input}"
 SH
 chmod +x "${agent_dir}/extensions/json-ext"
 printf '{"protocol":"json"}\n' > "${agent_dir}/extensions/json-ext.noel-extension.json"
+# A TypeScript extension under the bun host, when bun is available. The
+# shim is found via NOEL_BUN_HOST so cargo run (no installed binary) works.
+if command -v bun >/dev/null 2>&1; then
+  cat > "${agent_dir}/extensions/bun-ext.ts" <<'TS'
+export default function (pi) {
+  pi.registerCommand("greet", { handler: async (args) => "bun-ext says hello, " + (args || "world") });
+}
+TS
+  printf '{"protocolVersion":2}\n' > "${agent_dir}/extensions/bun-ext.ts.noel-extension.json"
+fi
 printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=' | base64 -d > "${work_dir}/pixel.png"
 
 (cd "${cwd_dir}" && NOEL_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p noel-cli -- config disable extension assist) > "${work_dir}/config-disable.txt"
@@ -67,7 +78,7 @@ grep -Fq "disabled extensions: -" "${work_dir}/config-enabled.txt"
 
 tmux new-session -d -s "${session_name}" -x 100 -y 30
 tmux send-keys -t "${session_name}" \
-  "cd '${cwd_dir}' && env -u NO_COLOR NOEL_TUI_E2E_DUMP=1 NOEL_DIR='${agent_dir}' NOEL_EXTENSION_EVENTS_LOG='${work_dir}/extension-events.txt' NOEL_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' NOEL_CLIPBOARD_IMAGE_COMMAND='cat ${work_dir}/pixel.png' NOEL_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p noel-cli -- --session-dir '${session_dir}' --model faux/echo; printf 'noel-%s\\n' exited" \
+  "cd '${cwd_dir}' && env -u NO_COLOR NOEL_TUI_E2E_DUMP=1 NOEL_DIR='${agent_dir}' NOEL_EXTENSION_EVENTS_LOG='${work_dir}/extension-events.txt' NOEL_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' NOEL_CLIPBOARD_IMAGE_COMMAND='cat ${work_dir}/pixel.png' NOEL_EDITOR_COMMAND='printf editor-prompt > {file}' NOEL_BUN_HOST="${NOEL_BUN_HOST:-${bun_host}}" '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p noel-cli -- --session-dir '${session_dir}' --model faux/echo; printf 'noel-%s\\n' exited" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -185,21 +196,25 @@ quit_noel() {
 
 # The main test process unsets NO_COLOR inherited from a shared tmux server.
 # Exercise real SGR transitions, including removal of fixed light/dark colors.
+# A reply may still be on its way (noel as a client of a local server), so
+# the pane is read until the color shows, for up to 5 s.
 require_live_color() {
   local expected="$1"
   local output="$2"
-  tmux capture-pane -t "${session_name}" -p -e > "${work_dir}/${output}.txt"
-  if ! grep -Fq "${expected}" "${work_dir}/${output}.txt"; then
-    cat "${work_dir}/${output}.txt" >&2
-    echo "missing terminal color ${expected}" >&2
-    exit 1
-  fi
+  for _ in $(seq 1 50); do
+    tmux capture-pane -t "${session_name}" -p -e > "${work_dir}/${output}.txt"
+    if grep -Fq "${expected}" "${work_dir}/${output}.txt"; then return; fi
+    sleep 0.1
+  done
+  cat "${work_dir}/${output}.txt" >&2
+  echo "missing terminal color ${expected}" >&2
+  exit 1
 }
 
 send_line "/theme light"
-require_live_color "38;2;36;41;50" "theme-light"
+require_live_color "38;2;59;63;65" "theme-light"
 send_line "/theme dark"
-require_live_color "38;2;228;231;236" "theme-dark"
+require_live_color "38;2;222;224;225" "theme-dark"
 send_line "/theme kimi"
 require_live_color "38;2;37;99;235" "theme-kimi"
 send_line "/accent magenta"
@@ -271,7 +286,7 @@ if ! grep -Fq '"content":"shift enter one\nshift enter two\nshift enter three\ns
 fi
 send_line "/image ${work_dir}/pixel.png describe image"
 # Ctrl+V stages an image in the draft (not sent before Enter), and /undo
-# restores both prompt and attachment without changing workspace files.
+# restores both prompt and attachment.
 clipboard_session="$(ls -t "${session_dir}"/*.jsonl | head -n 1)"
 before_paste="$(wc -l < "${clipboard_session}")"
 tmux send-keys -t "${session_name}" C-v
@@ -305,7 +320,12 @@ send_line "multiple clipboard images"
 send_line "/write ${cwd_dir}/file.txt e2e-ok"
 type_line "/undo"
 wait_for "│ > /write "
-grep -Fxq "e2e-ok" "${cwd_dir}/file.txt"
+# The undo is a rewind: the file the undone write created is gone, and
+# sending the restored draft writes it again.
+if [ -e "${cwd_dir}/file.txt" ]; then
+  echo "/undo left the file its turn created" >&2
+  exit 1
+fi
 send_enter
 send_line "/read ${cwd_dir}/file.txt"
 send_line "/todos"
@@ -357,7 +377,16 @@ send_line "/extensions"
 send_line "/extension:assist extension input"
 send_line "/extension:exec-ext executable input"
 send_line "/extension:json-ext protocol input"
+# Close any selector or completion the earlier commands left open
+# (Escape), so the next typed line reaches the draft, not a picker.
 send_line "/prompts"
+tmux send-keys -t "${session_name}" Escape
+absent "esc cancel"
+# The extension-registered command from the bun host. Its registration
+# surfaces when the unknown /command starts the v2 hosts and looks again.
+if command -v bun >/dev/null 2>&1; then
+  send_line "/greet bun"
+fi
 send_line "/explain tmux panes"
 send_line "/not-a-command stays text"
 send_line "/prompt fix broken thing"
@@ -399,7 +428,12 @@ send_line "/session"
 send_line "/fork"
 send_line "/session"
 send_line "/summaries"
+# /tree opens the branch navigator; esc closes it back to the prompt.
 send_line "/tree"
+tmux send-keys -t "${session_name}" Escape
+absent "esc cancel"
+# The printed tree keeps the fork summary lines.
+send_line "/tree --print"
 # /resume opens the interactive picker; esc closes it back to the prompt.
 send_line "/resume"
 tmux send-keys -t "${session_name}" Escape
@@ -433,22 +467,37 @@ quit_noel
 pane_output="$(tmux capture-pane -t "${session_name}" -p -S -2000 2>/dev/null || true)"
 printf '%s\n' "${pane_output}" > "${work_dir}/pane.txt"
 
+# The session is gone (quit_noel above); the pane's scrollback keeps its
+# output. A late render can still be flushing under load, so the pane is
+# recaptured briefly before an assertion fails (like wait_for, not the
+# one-shot grep that flaked under load >100).
+pane_poll() {
+  pane_output="$(tmux capture-pane -t "${session_name}" -p -S -2000 2>/dev/null || true)"
+  printf '%s\n' "${pane_output}" > "${work_dir}/pane.txt"
+}
+
 require_output() {
   local expected="$1"
-  if ! grep -Fq "${expected}" "${work_dir}/pane.txt"; then
-    cat "${work_dir}/pane.txt" >&2
-    echo "missing expected pane output: ${expected}" >&2
-    exit 1
-  fi
+  for _ in $(seq 1 100); do
+    grep -Fq "${expected}" "${work_dir}/pane.txt" && return
+    pane_poll
+    sleep 0.05
+  done
+  cat "${work_dir}/pane.txt" >&2
+  echo "missing expected pane output: ${expected}" >&2
+  exit 1
 }
 
 require_output_regex() {
   local pattern="$1"
-  if ! grep -Eq "${pattern}" "${work_dir}/pane.txt"; then
-    cat "${work_dir}/pane.txt" >&2
-    echo "missing expected pane output matching: ${pattern}" >&2
-    exit 1
-  fi
+  for _ in $(seq 1 100); do
+    grep -Eq "${pattern}" "${work_dir}/pane.txt" && return
+    pane_poll
+    sleep 0.05
+  done
+  cat "${work_dir}/pane.txt" >&2
+  echo "missing expected pane output matching: ${pattern}" >&2
+  exit 1
 }
 
 require_output "noel rust cli"
@@ -503,6 +552,9 @@ require_output "extension says {{input}}"
 require_output "extension input"
 require_output "exec-ext saw executable input"
 require_output "json-ext saw protocol input"
+if command -v bun >/dev/null 2>&1; then
+  require_output "bun-ext says hello, bun"
+fi
 require_output "Explain a thing"
 require_output "[faux/echo] explain tmux briefly"
 require_output "[faux/echo] /not-a-command stays text"
@@ -1098,7 +1150,7 @@ modern_require() {
   fi
 }
 modern_capture
-for marker in "  Todo" "╭" "│ >" "╰" "↑ to edit · runs after next turn" "reason-first" "4 more lines, ctrl+o to expand" "Used Read" "fixture.rs" "… output-last" "7 more lines" "done-recent" "active-task" "+3 more (3 done)" "❯ recall queued fixture"; do modern_require "${marker}"; done
+for marker in "  Todo" "╭" "│ >" "╰" "↑ to edit · ctrl+enter or Enter sends now" "reason-first" "4 more lines, ctrl+o to expand" "Used Read" "fixture.rs" "… output-last" "7 more lines" "done-recent" "active-task" "+3 more (3 done)" "❯ recall queued fixture"; do modern_require "${marker}"; done
 if grep -Eq 'reason-last|output-first|output-seventh|done-oldest' "${work_dir}/modern-pane.txt"; then
   cat "${work_dir}/modern-pane.txt" >&2
   echo "collapsed previews/tasks leaked hidden rows" >&2
@@ -1134,6 +1186,7 @@ tmux send-keys -t "${modern_session}" "/quit" Enter
 sleep 0.3
 
 "${repo_root}/scripts/e2e-scrollback.sh"
+"${repo_root}/scripts/e2e-render.sh"
 "${repo_root}/scripts/e2e-transcript.sh"
 "${repo_root}/scripts/e2e-selection.sh"
 "${repo_root}/scripts/e2e-tool-output.sh"
@@ -1142,5 +1195,6 @@ sleep 0.3
 "${repo_root}/scripts/e2e-failover.sh"
 "${repo_root}/scripts/e2e-signals.sh"
 "${repo_root}/scripts/e2e-import.sh"
+"${repo_root}/scripts/e2e-attach.sh"
 
 echo "tmux e2e passed: ${first_session}"

@@ -1,0 +1,112 @@
+{
+  "name": "noel.devices",
+  "version": 1,
+  "host": "server",
+  "params": [],
+  "variants": {
+    "owner": {
+      "state": {
+        "devices": {
+          "type": "object",
+          "required": [
+            "devices",
+            "pending",
+            "fingerprint"
+          ],
+          "properties": {
+            "devices": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "label",
+                  "created"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "created": {
+                    "type": "integer"
+                  }
+                }
+              }
+            },
+            "pending": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "code",
+                  "label"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "listening": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "methods": {
+        "approve": {
+          "args": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code"
+            ],
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "id"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "revoke": {
+          "args": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  }
+}

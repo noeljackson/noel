@@ -97,7 +97,7 @@ pub(crate) fn normalized_thinking_level(level: &str) -> Option<&'static str> {
 /// The level a session of `model` starts on when nothing set one (upstream
 /// `createAgentSession`): the model's level in `modelThinkingLevels`, else
 /// `defaultThinkingLevel`, else `medium`.
-fn configured_thinking_level(config: &LoadedConfig, model: &ModelRef) -> &'static str {
+pub(crate) fn configured_thinking_level(config: &LoadedConfig, model: &ModelRef) -> &'static str {
     [
         config
             .settings
@@ -185,8 +185,13 @@ pub(crate) fn switch_model(
     .flatten()
     .find_map(normalized_thinking_level)
     .unwrap_or(before);
-    runtime.set_active_model(Some(model.clone()))?;
-    set_thinking_level(runtime, config, level)
+    // The level clamped to the new model, saved with it in one write.
+    let clamped = match model_definition(config, model) {
+        Some(definition) => definition.clamp_thinking_level(level),
+        None => normalized_thinking_level(level).unwrap_or("off"),
+    };
+    runtime.set_active_model_and_thinking_level(Some(model.clone()), Some(clamped.to_string()))?;
+    Ok(clamped)
 }
 
 /// The model `/model <reference>` and a queued mid-turn switch name: an
@@ -266,13 +271,13 @@ pub(crate) fn resolve_scope(cli: &Cli, config: &LoadedConfig, offline: bool) -> 
 /// ([`model_definition`]). Upstream ignores a saved default it cannot find.
 pub(crate) fn default_model(config: &LoadedConfig, offline: bool) -> Option<ModelRef> {
     let settings = &config.settings;
-    if let (Some(provider), Some(id)) = (&settings.default_provider, &settings.default_model) {
-        if provider_usable(config, provider, offline) {
-            return Some(ModelRef {
-                provider: provider.clone(),
-                id: id.clone(),
-            });
-        }
+    if let (Some(provider), Some(id)) = (&settings.default_provider, &settings.default_model)
+        && provider_usable(config, provider, offline)
+    {
+        return Some(ModelRef {
+            provider: provider.clone(),
+            id: id.clone(),
+        });
     }
     let (faux, real): (Vec<&ModelDefinition>, Vec<&ModelDefinition>) = config
         .models
@@ -302,7 +307,7 @@ pub(crate) fn register_cli_model(
     offline: bool,
 ) -> Option<CliModel> {
     let resolved = resolve_cli(cli, config, offline)?;
-    if let (true, Some(model)) = (resolved.custom, &resolved.model) {
+    if let CliModel::Custom { model, .. } = &resolved {
         config.models.push(model.clone());
     }
     Some(resolved)
@@ -337,14 +342,14 @@ pub(crate) fn resolve_cli_selection(
         warn(diagnostic);
     }
     if let Some(resolved) = register_cli_model(cli, config, offline) {
-        if let Some(warning) = &resolved.warning {
+        if let Some(warning) = resolved.warning() {
             warn(warning);
         }
-        if let Some(error) = resolved.error {
-            return Err(anyhow!(error));
+        if let Some(error) = resolved.error() {
+            return Err(anyhow!(error.to_owned()));
         }
-        selection.model = resolved.model.as_ref().map(ModelDefinition::model_ref);
-        selection.thinking = selection.thinking.or(resolved.thinking_level);
+        selection.model = resolved.model().map(ModelDefinition::model_ref);
+        selection.thinking = selection.thinking.or(resolved.thinking_level());
     }
     Ok(selection)
 }

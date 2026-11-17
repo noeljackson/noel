@@ -11,8 +11,9 @@ use serde_json::json;
 
 use crate::{
     active_tool_definitions, available_tool_names, bash_timeout_ms, execute_model_tool_call,
-    extension_tools_from_resources, prompt_tools, provider_messages, runtime_system_prompt,
-    ChatToolCall, ConversationMessage, ExtensionTool, MessageRole, ReloadableSystems, ResourceFile,
+    execute_model_tool_call_with, extension_tools_from_resources, prompt_tools, provider_messages,
+    runtime_system_prompt, tests::unused_provider, ChatToolCall, ConversationMessage,
+    ExtensionTool, MessageRole, NestedCallStatus, NestedToolCall, ReloadableSystems, ResourceFile,
     Runtime, SessionState,
 };
 
@@ -69,7 +70,7 @@ async fn call_tool(
         name: name.to_string(),
         arguments: arguments.to_string(),
     };
-    execute_model_tool_call(runtime, &call, &mut |_| {})
+    execute_model_tool_call(runtime, &unused_provider(), &call, &mut |_| {})
         .await
         .expect("save tool result");
     let event = runtime.session.tool_history.last().expect("tool event");
@@ -155,6 +156,7 @@ async fn read_of_an_image_attaches_it_to_the_tool_result() {
                 name: "read".to_string(),
                 arguments: json!({ "path": "pixel.png" }).to_string(),
             }],
+            aborted: false,
         })
         .expect("save reply");
     let (output, is_error) = call_tool(&mut runtime, "read", json!({ "path": "pixel.png" })).await;
@@ -225,7 +227,7 @@ fn extension_tool(name: &str) -> (String, ExtensionTool) {
         parameters: json!({}),
         extension_name: "ext".to_string(),
         extension_path: PathBuf::from("ext"),
-        protocol: "json".to_string(),
+        protocol: crate::ExtensionToolProtocol::Json,
         replay_safe: false,
         prompt_snippet: None,
         prompt_guidelines: Vec::new(),
@@ -256,6 +258,7 @@ fn tool_selection_follows_default_tools_allowlist_and_exclusions() {
         "grep",
         "ls",
         "read",
+        "task",
         "todo",
         "web_fetch",
         "web_search",
@@ -297,9 +300,162 @@ fn tool_selection_follows_default_tools_allowlist_and_exclusions() {
     assert_eq!(
         selected(
             json!({ "enabledTools": ["*"] }),
-            &["web_*", "ext_echo", "todo"]
+            &["web_*", "ext_echo", "todo", "task"]
         ),
         names(&["bash", "edit", "find", "grep", "ls", "read", "write"])
+    );
+    // Codemode is never on by default, nor matched by a pattern: `+codemode`
+    // or its name selects it.
+    assert!(!selected(json!({ "defaultTools": ["-bash"] }), &[]).contains("codemode"));
+    assert!(selected(json!({ "defaultTools": ["+codemode"] }), &[]).contains("codemode"));
+    assert_eq!(
+        selected(json!({ "defaultTools": ["read", "codemode"] }), &[]),
+        names(&["codemode", "ext_echo", "read"])
+    );
+    assert!(selected(json!({ "enabledTools": ["codemode"] }), &[]).contains("codemode"));
+}
+
+/// A session in a new directory with codemode and the given tools selected.
+fn runtime_with_codemode(test: &str, tools: &[&str]) -> (Runtime, PathBuf) {
+    let cwd = std::env::current_dir()
+        .expect("current dir")
+        .join("target")
+        .join(format!("noel-codemode-tests-{test}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&cwd);
+    fs::create_dir_all(&cwd).expect("create test dir");
+    let mut session = SessionState::new("session-1", cwd.clone());
+    session.active_tool_names = crate::default_active_tool_names();
+    let runtime = Runtime::new(
+        session,
+        ReloadableSystems {
+            available_tool_names: tools.iter().map(ToString::to_string).collect(),
+            tool_scope_configured: true,
+            ..ReloadableSystems::default()
+        },
+    );
+    (runtime, cwd)
+}
+
+#[tokio::test]
+async fn codemode_is_declared_only_when_selected_and_lists_its_nested_tools() {
+    let (runtime, _) = runtime_with_codemode("declared", &["read", "write", "todo", "codemode"]);
+    let definitions = active_tool_definitions(&runtime);
+    let codemode = definitions
+        .iter()
+        .find(|definition| definition.name == "codemode")
+        .expect("codemode declared");
+    assert!(codemode
+        .description
+        .starts_with("Run JavaScript that calls other tools."));
+    // `codemode.mode: "on"`: the tools stay declared and say how scripts
+    // call them; codemode lists none (they all have direct exposure).
+    assert!(!codemode.description.contains("Nested tools:"));
+    let described = |name: &str| {
+        definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .map(|definition| definition.description.clone())
+            .unwrap_or_default()
+    };
+    assert!(described("read").contains("\n\nCodemode: `tools.read(args)` resolves to"));
+    assert!(described("write").ends_with("Codemode: `tools.write(args)` resolves to a string."));
+    // Model-only tools are not callable from scripts.
+    assert!(!described("todo").contains("Codemode:"));
+    assert_eq!(codemode.parameters["required"], json!(["code"]));
+
+    // `"only"`: codemode lists the callable tools, which are not declared.
+    let (mut runtime, _) = runtime_with_codemode("only", &["read", "write", "todo", "codemode"]);
+    runtime.systems.codemode.only = true;
+    let definitions = active_tool_definitions(&runtime);
+    let names: Vec<&str> = definitions.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, ["todo", "codemode"]);
+    assert!(definitions[1].description.contains("### `read`"));
+    assert!(definitions[1].description.contains("### `write`"));
+
+    let (runtime, _) = runtime_with_codemode("not-selected", &["read", "write"]);
+    assert!(!active_tool_definitions(&runtime)
+        .iter()
+        .any(|definition| definition.name == "codemode"));
+}
+
+#[tokio::test]
+async fn a_codemode_script_runs_tools_in_parallel_and_reports_its_output() {
+    let (mut runtime, cwd) = runtime_with_codemode("run", &["read", "write", "codemode"]);
+    fs::write(cwd.join("a.txt"), "alpha\n").expect("write a");
+    fs::write(cwd.join("b.txt"), "beta\n").expect("write b");
+    let code = r#"
+        const [a, b] = await Promise.all([
+          tools.read({ path: "a.txt" }),
+          tools.read({ path: "b.txt" }),
+        ]);
+        await tools.write({ path: "joined.txt", content: a.trim() + "+" + b.trim() });
+        console.log("wrote");
+        return { a: a.trim(), b: b.trim() };
+    "#;
+    let (output, is_error) = call_tool(&mut runtime, "codemode", json!({ "code": code })).await;
+    assert!(!is_error, "{output}");
+    assert!(
+        output.starts_with("Script completed\nWall time "),
+        "{output}"
+    );
+    assert!(
+        output.ends_with(" seconds\nOutput:\n{\"a\":\"alpha\",\"b\":\"beta\"}\n<console_output>\nwrote\n</console_output>"),
+        "{output}"
+    );
+    assert_eq!(
+        fs::read_to_string(cwd.join("joined.txt")).unwrap(),
+        "alpha+beta"
+    );
+    assert_eq!(runtime.session.edited_files, ["joined.txt".to_string()]);
+    // Nested calls are not results of their own.
+    assert_eq!(runtime.session.tool_history.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_codemode_script_names_the_calls_it_made() {
+    let (mut runtime, _) = runtime_with_codemode("failed", &["read", "codemode"]);
+    let code = "await tools.read({ path: 'missing.txt' }).catch(() => {});
+throw new Error('stop here');";
+    let (output, is_error) = call_tool(&mut runtime, "codemode", json!({ "code": code })).await;
+    assert!(is_error);
+    assert!(output.starts_with("Script failed\n"), "{output}");
+    assert!(
+        output.contains("Script error:\nError: stop here"),
+        "{output}"
+    );
+    assert!(
+        output.ends_with("Tool calls made before the failure (they are not undone): read (error)"),
+        "{output}"
+    );
+}
+
+#[tokio::test]
+async fn the_codemode_store_lasts_across_calls_and_scripts_cannot_call_codemode() {
+    let (mut runtime, _) = runtime_with_codemode("store", &["read", "codemode"]);
+    let first = "store('count', (load('count') ?? 0) + 1);\n\
+                 try { tools.codemode; return 'callable'; } catch (e) { return e.name; }";
+    let (output, is_error) = call_tool(&mut runtime, "codemode", json!({ "code": first })).await;
+    assert!(!is_error, "{output}");
+    assert!(output.ends_with("Output:\nTypeError"), "{output}");
+    let second = "store('count', load('count') + 1); return load('count');";
+    let (output, _) = call_tool(&mut runtime, "codemode", json!({ "code": second })).await;
+    assert!(output.ends_with("Output:\n2"), "{output}");
+    assert_eq!(runtime.session.codemode_store.get("count"), Some(&json!(2)));
+    // A failed script keeps nothing it stored.
+    let failed = "store('count', 99); throw new Error('no');";
+    call_tool(&mut runtime, "codemode", json!({ "code": failed })).await;
+    assert_eq!(runtime.session.codemode_store.get("count"), Some(&json!(2)));
+}
+
+#[tokio::test]
+async fn codemode_rejects_options_that_are_not_on_the_first_line() {
+    let (mut runtime, _) = runtime_with_codemode("options", &["codemode"]);
+    let code = "text(1)\n// @options: {\"timeout_ms\": 5}";
+    let (output, is_error) = call_tool(&mut runtime, "codemode", json!({ "code": code })).await;
+    assert!(is_error);
+    assert_eq!(
+        output,
+        "The // @options: line must be the first line of the input; found one on line 2"
     );
 }
 
@@ -395,4 +551,350 @@ fn system_prompt_lists_the_tools_the_request_declares() {
             assert!(!prompt.contains("List directory contents"), "{prompt}");
         }
     }
+}
+
+/// Each tool call runs in the workspace the runtime's env provider gives it
+/// (Durable's `env(target)` hook), asked anew for every call; a provider
+/// that fails fails that call.
+#[tokio::test]
+async fn tool_calls_run_in_the_workspace_the_env_provider_chooses() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::{EnvProvider, LocalEnv};
+
+    let root = std::env::temp_dir().join(format!("noel-env-hook-{}", std::process::id()));
+    let (session_cwd, workspace) = (root.join("session"), root.join("workspace"));
+    fs::create_dir_all(&session_cwd).expect("create session dir");
+    fs::create_dir_all(&workspace).expect("create workspace");
+    fs::write(workspace.join("notes.txt"), "from the workspace\n").expect("write notes");
+    let mut runtime = Runtime::new(
+        SessionState::new("session-env", session_cwd.clone()),
+        ReloadableSystems::default(),
+    );
+
+    // By default the workspace is local, at the session's directory.
+    let (output, is_error) = call_tool(&mut runtime, "read", json!({"path": "notes.txt"})).await;
+    assert!(is_error && output.starts_with("ENOENT"), "{output}");
+
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    runtime.set_env_provider(EnvProvider::Hook(Arc::new({
+        let (targets, workspace) = (targets.clone(), workspace.clone());
+        move |target| {
+            let mut targets = targets.lock().unwrap();
+            targets.push((target.session_id.to_string(), target.cwd.to_path_buf()));
+            Ok(Arc::new(LocalEnv::new(&workspace)))
+        }
+    })));
+    let (output, is_error) = call_tool(&mut runtime, "read", json!({"path": "notes.txt"})).await;
+    assert_eq!((output.as_str(), is_error), ("from the workspace\n", false));
+    let (output, is_error) = call_tool(&mut runtime, "bash", json!({"command": "pwd"})).await;
+    assert!(!is_error, "{output}");
+    assert_eq!(
+        PathBuf::from(output.trim()),
+        fs::canonicalize(&workspace).expect("canonical workspace")
+    );
+    assert_eq!(
+        *targets.lock().unwrap(),
+        [
+            ("session-env".to_string(), session_cwd.clone()),
+            ("session-env".to_string(), session_cwd.clone()),
+        ]
+    );
+
+    runtime.set_env_provider(EnvProvider::Hook(Arc::new(|_| {
+        Err("the workspace is unavailable".to_string())
+    })));
+    let (output, is_error) = call_tool(&mut runtime, "read", json!({"path": "notes.txt"})).await;
+    assert_eq!(
+        (output.as_str(), is_error),
+        ("the workspace is unavailable", true)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A session whose journal names a workspace runs its tools there and only
+/// there (spec §10): without a provider that opens it, its calls fail; with
+/// one, the hook gets the record. Its system prompt states the workspace's
+/// directory, keeps the user's own context file, reads the project's from
+/// the workspace once a run loads them, and lists no local skills.
+#[tokio::test]
+async fn sessions_in_a_workspace_run_their_tools_only_there() {
+    use std::sync::{Arc, Mutex};
+
+    use noel_config::{ContextFile, Skill, SourceInfo, SourceScope};
+
+    use crate::{EnvProvider, LocalEnv, RunControl, SessionWorkspace};
+
+    let root = std::env::temp_dir().join(format!("noel-ws-session-{}", std::process::id()));
+    let (here, there) = (root.join("here"), root.join("there"));
+    fs::create_dir_all(&here).expect("create session dir");
+    fs::create_dir_all(there.join("project")).expect("create workspace");
+    fs::write(here.join("notes.txt"), "from here\n").expect("write local notes");
+    fs::write(there.join("project/notes.txt"), "from there\n").expect("write remote notes");
+    fs::write(there.join("AGENTS.md"), "workspace rules").expect("write context");
+    let workspace = SessionWorkspace {
+        adapter: "test".into(),
+        id: "test:there".into(),
+        cwd: there.join("project").display().to_string(),
+        options: serde_json::Map::new(),
+    };
+    let mut session = SessionState::new("session-ws", here.clone());
+    session.workspace = Some(workspace.clone());
+    let mut runtime = Runtime::new(
+        session,
+        ReloadableSystems {
+            context_files: vec![
+                ContextFile {
+                    path: "/agent/AGENTS.md".into(),
+                    content: "my rules".into(),
+                },
+                ContextFile {
+                    path: here.join("AGENTS.md"),
+                    content: "local project rules".into(),
+                },
+            ],
+            agent_context_files: vec![ContextFile {
+                path: "/agent/AGENTS.md".into(),
+                content: "my rules".into(),
+            }],
+            skills: vec![Skill {
+                name: "local-skill".into(),
+                description: "A skill on this machine.".into(),
+                file_path: "/agent/skills/local-skill/SKILL.md".into(),
+                base_dir: "/agent/skills/local-skill".into(),
+                source_info: SourceInfo {
+                    path: "/agent/skills/local-skill/SKILL.md".into(),
+                    source: "auto".into(),
+                    scope: SourceScope::User,
+                    from_package: false,
+                    base_dir: None,
+                },
+                disable_model_invocation: false,
+            }],
+            ..ReloadableSystems::default()
+        },
+    );
+
+    // Never this machine: without a provider that opens it, calls fail.
+    let (output, is_error) = call_tool(&mut runtime, "read", json!({"path": "notes.txt"})).await;
+    assert!(is_error, "{output}");
+    assert!(output.contains("test workspace test:there"), "{output}");
+
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    runtime.set_env_provider(EnvProvider::Workspaces(Arc::new({
+        let opened = opened.clone();
+        move |target, record| {
+            opened
+                .lock()
+                .unwrap()
+                .push((target.session_id.to_string(), record.id.clone()));
+            Ok(Arc::new(LocalEnv::new(&record.cwd)))
+        }
+    })));
+    let (output, is_error) = call_tool(&mut runtime, "read", json!({"path": "notes.txt"})).await;
+    assert_eq!((output.as_str(), is_error), ("from there\n", false));
+    assert_eq!(
+        *opened.lock().unwrap(),
+        [("session-ws".to_string(), "test:there".to_string())]
+    );
+
+    let prompt = runtime_system_prompt(&runtime);
+    assert!(
+        prompt.ends_with(&format!("<cwd>\n{}\n</cwd>", workspace.cwd)),
+        "{prompt}"
+    );
+    assert!(prompt.contains("my rules"), "{prompt}");
+    assert!(!prompt.contains("local project rules"), "{prompt}");
+    assert!(!prompt.contains("workspace rules"), "{prompt}");
+    assert!(!prompt.contains("local-skill"), "{prompt}");
+    runtime
+        .load_workspace_context(&RunControl::default())
+        .await
+        .expect("load context");
+    let prompt = runtime_system_prompt(&runtime);
+    let (mine, theirs) = (
+        prompt.find("my rules").expect("agent rules"),
+        prompt.find("workspace rules").expect("workspace rules"),
+    );
+    assert!(mine < theirs, "{prompt}");
+
+    // `--no-context-files` reads none there.
+    runtime.set_workspace_context_enabled(false);
+    runtime
+        .load_workspace_context(&RunControl::default())
+        .await
+        .expect("load context");
+    assert!(!runtime_system_prompt(&runtime).contains("workspace rules"));
+
+    // A session without a workspace, under the same provider, is local.
+    let opens = opened.lock().unwrap().len();
+    runtime.replace_session(SessionState::new("session-local", here.clone()), None);
+    let (output, is_error) = call_tool(&mut runtime, "read", json!({"path": "notes.txt"})).await;
+    assert_eq!((output.as_str(), is_error), ("from here\n", false));
+    assert_eq!(opened.lock().unwrap().len(), opens);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn codemode_reports_its_nested_calls_as_they_change() {
+    let (mut runtime, cwd) = runtime_with_codemode("nested", &["read", "codemode"]);
+    fs::write(cwd.join("a.txt"), "alpha").expect("write a");
+    let call = ChatToolCall {
+        id: "cm1".to_string(),
+        name: "codemode".to_string(),
+        arguments: json!({ "code": "await tools.read({ path: 'a.txt' });\nawait tools.read({ path: 'missing.txt' }).catch(() => {});" }).to_string(),
+    };
+    let mut snapshots: Vec<Vec<NestedToolCall>> = Vec::new();
+    execute_model_tool_call_with(
+        &mut runtime,
+        &unused_provider(),
+        &call,
+        &mut |_| {},
+        &mut |calls| snapshots.push(calls),
+        None,
+    )
+    .await
+    .expect("run codemode");
+    // First the script as running, then each call starting and ending.
+    assert!(snapshots[0].is_empty());
+    let last = snapshots.last().expect("a final snapshot");
+    let rows: Vec<_> = last
+        .iter()
+        .map(|row| {
+            (
+                row.id.as_str(),
+                row.name.as_str(),
+                row.status,
+                row.args.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                "cm1/1",
+                "read",
+                NestedCallStatus::Ok,
+                "{\"path\":\"a.txt\"}"
+            ),
+            (
+                "cm1/2",
+                "read",
+                NestedCallStatus::Error,
+                "{\"path\":\"missing.txt\"}"
+            ),
+        ]
+    );
+    assert!(last[1].error.is_some());
+    assert!(snapshots.iter().any(|rows| rows
+        .first()
+        .is_some_and(|row| row.status == NestedCallStatus::Running)));
+    // Upstream's `details.calls` shape.
+    let row = serde_json::to_value(&last[0]).unwrap();
+    assert_eq!(row["status"], "ok");
+    assert!(row["durationMs"].is_u64());
+}
+
+#[tokio::test]
+async fn an_aborted_codemode_script_reports_it_as_upstream_does() {
+    let (mut runtime, _) = runtime_with_codemode("abort", &["bash", "codemode"]);
+    let call = ChatToolCall {
+        id: "cm-abort".to_string(),
+        name: "codemode".to_string(),
+        arguments: json!({ "code": "text('before');\nawait tools.bash({ command: 'sleep 30' });\ntext('after');" })
+            .to_string(),
+    };
+    let cancellation = crate::CancellationToken::default();
+    let cancel = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        cancel.cancel();
+    });
+    let mut last = Vec::new();
+    let started = std::time::Instant::now();
+    execute_model_tool_call_with(
+        &mut runtime,
+        &unused_provider(),
+        &call,
+        &mut |_| {},
+        &mut |calls| last = calls,
+        Some(&cancellation),
+    )
+    .await
+    .expect("run codemode");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    let event = runtime.session.tool_history.last().expect("a result");
+    assert!(event.is_error);
+    assert!(
+        event.result.starts_with("Script failed\n"),
+        "{}",
+        event.result
+    );
+    assert!(
+        event.result.ends_with(
+            "Output:\nbefore\nScript error:\nScript aborted: This operation was aborted\n\nTool calls made before the failure (they are not undone): bash (cancelled)"
+        ),
+        "{}",
+        event.result
+    );
+    assert_eq!(last[0].status, NestedCallStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn a_codemode_bash_call_resolves_to_its_structured_output() {
+    let (mut runtime, _) = runtime_with_codemode("bash-structured", &["bash", "codemode"]);
+    let code = "const r = await tools.bash({ command: 'echo hi; exit 3' });\n\
+                return { output: r.output, exit: r.exit_code, truncated: r.truncated, timed: typeof r.wall_time_seconds };";
+    let (output, is_error) = call_tool(&mut runtime, "codemode", json!({ "code": code })).await;
+    assert!(!is_error, "{output}");
+    assert!(
+        output.ends_with(
+            "Output:\n{\"output\":\"hi\\n\",\"exit\":3,\"truncated\":false,\"timed\":\"number\"}"
+        ),
+        "{output}"
+    );
+    let definitions = active_tool_definitions(&runtime);
+    let codemode = definitions
+        .iter()
+        .find(|tool| tool.name == "codemode")
+        .unwrap();
+    assert!(!codemode.description.contains("Nested tools:"));
+    let bash = definitions.iter().find(|tool| tool.name == "bash").unwrap();
+    assert!(bash.description.contains(
+        "Codemode: `tools.bash(args)` resolves to `{ output, truncated, full_output_path?, exit_code, wall_time_seconds }`."
+    ));
+}
+
+#[tokio::test]
+async fn codemode_scripts_find_tools_with_the_discovery_globals() {
+    let (mut runtime, _) =
+        runtime_with_codemode("discovery", &["read", "write", "bash", "todo", "codemode"]);
+    let code = "const found = await searchTools('write file', { limit: 1 });\n\
+                const sample = await describeTool('read');\n\
+                const entry = ALL_TOOLS.find((tool) => tool.name === 'bash');\n\
+                return {\n\
+                  found: found.map((tool) => tool.name),\n\
+                  sample: sample.includes('codemode tool declaration:'),\n\
+                  all: entry.description.includes('declare const tools: { bash('),\n\
+                  missing: await describeTool('todo'),\n\
+                  namespace: await describeNamespace('mcp__x'),\n\
+                };";
+    let (output, is_error) = call_tool(&mut runtime, "codemode", json!({ "code": code })).await;
+    assert!(!is_error, "{output}");
+    assert!(
+        output.ends_with("Output:\n{\"found\":[\"write\"],\"sample\":true,\"all\":true}"),
+        "{output}"
+    );
+    let (output, is_error) = call_tool(
+        &mut runtime,
+        "codemode",
+        json!({ "code": "await searchTools(1)" }),
+    )
+    .await;
+    assert!(is_error);
+    assert!(
+        output.contains("searchTools() expects a query string"),
+        "{output}"
+    );
 }

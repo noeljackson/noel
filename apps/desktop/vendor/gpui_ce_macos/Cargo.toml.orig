@@ -1,0 +1,90 @@
+[package]
+name = "gpui_ce_macos"
+version = "0.3.0"
+description.workspace = true
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/gpui_macos.rs"
+doctest = false
+
+[features]
+bench-support = ["gpui/bench-support", "gpui_apple/bench-support"]
+test-support = [
+  "gpui/test-support",
+  "gpui_apple/test-support",
+  "gpui_wgpu?/test-support",
+]
+runtime_shaders = ["gpui_apple/runtime_shaders"]
+font-kit = ["gpui_apple/font-kit"]
+screen-capture = [
+  "gpui/screen-capture",
+  "dep:objc2-core-graphics",
+  "dep:objc2-core-media",
+  "dep:objc2-screen-capture-kit",
+]
+# Draw windows with the WGPU renderer instead of Metal, so applications can
+# share its device and composite their own WGPU textures (with gpui's
+# `custom-gpu` feature).
+wgpu = ["dep:gpui_wgpu"]
+
+[dependencies]
+gpui.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accesskit.workspace = true
+accesskit_macos.workspace = true
+anyhow.workspace = true
+block2.workspace = true
+cocoa.workspace = true
+collections.workspace = true
+core-foundation.workspace = true
+core-foundation-sys.workspace = true
+core-graphics.workspace = true
+core-text.workspace = true
+ctor.workspace = true
+dispatch2 = { workspace = true, features = ["block2", "objc2"] }
+etagere.workspace = true
+font-kit = { version = "0.14.1-zed", package = "zed-font-kit" }
+foreign-types.workspace = true
+futures.workspace = true
+gpui_apple.workspace = true
+gpui_parley = { workspace = true, features = ["system-fonts"] }
+gpui_util.workspace = true
+gpui_wgpu = { workspace = true, optional = true }
+image.workspace = true
+itertools.workspace = true
+log.workspace = true
+metal.workspace = true
+objc.workspace = true
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-core-graphics = { workspace = true, optional = true }
+objc2-core-media = { workspace = true, optional = true }
+objc2-core-video = { workspace = true, features = ["CVHostTime"] }
+objc2-foundation.workspace = true
+objc2-screen-capture-kit = { workspace = true, optional = true }
+objc2-user-notifications.workspace = true
+palette.workspace = true
+parking_lot.workspace = true
+raw-window-handle.workspace = true
+scheduler.workspace = true
+semver.workspace = true
+smallvec.workspace = true
+skrifa.workspace = true
+strum.workspace = true
+uuid.workspace = true
+url.workspace = true
+
+# The macOS test-only window implementation depends on test-only APIs from both
+# GPUI and the extracted renderer. A dependency does not inherit this crate's
+# `cfg(test)`, so dev-dependencies enable those APIs only for test builds.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui = { workspace = true, features = ["test-support"], default-features = false }
+gpui_apple = { workspace = true, features = ["test-support"] }
+gpui_fonts = { path = "../gpui_ce_fonts", package = "gpui-ce-fonts" }

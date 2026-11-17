@@ -5,13 +5,20 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tracing.workspace = true
+getrandom.workspace = true
 noel-ai = { path = "../noel-ai" }
+noel-codemode = { path = "../noel-codemode" }
 noel-agent = { path = "../noel-agent" }
 noel-config = { path = "../noel-config" }
+noel-env = { path = "../noel-env" }
+noel-mcp = { path = "../noel-mcp" }
 noel-session = { path = "../noel-session" }
 noel-tools = { path = "../noel-tools" }
 serde.workspace = true
 serde_json.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
@@ -19,5 +26,7 @@ tokio.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 base64.workspace = true
-sha2.workspace = true
 tokio.workspace = true
+
+[lints]
+workspace = true

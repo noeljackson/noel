@@ -51,7 +51,7 @@ async function captureCopilotRequest(): Promise<CapturedRequest> {
 			import("/ts-reference/packages/ai/src/compat.ts"),
 			import("/ts-reference/packages/ai/src/compat.ts"),
 		]);
-		const model = getModel("github-copilot", "gpt-5.4");
+		const model = getModel("github-copilot", "gpt-6.1-sol");
 		const stream = streamSimple(
 			model,
 			{
@@ -95,7 +95,7 @@ async function main() {
 	}
 	await mkdir(outputDir, { recursive: true });
 	await writeFile(
-		join(outputDir, "github-copilot-gpt-5.4.json"),
+		join(outputDir, "github-copilot-gpt-6.1-sol.json"),
 		`${JSON.stringify(
 			{
 				source: {

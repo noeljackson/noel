@@ -14,6 +14,10 @@ pub const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CLAUDE_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 pub const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+/// Fallback for the Claude token endpoint: the same OAuth server is also
+/// served from the API host, which some egress filters allow when they block
+/// `platform.claude.com`.
+pub const CLAUDE_TOKEN_FALLBACK_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 
 /// The request path refreshes OAuth tokens this close to expiry.
 pub const REFRESH_WINDOW_SECONDS: u64 = 60;
@@ -129,6 +133,39 @@ pub async fn execute_refresh(
     parse_refresh_response(&body, refresh_token, now)
 }
 
+/// A transport-level failure (connect error, timeout, TLS) rather than an
+/// OAuth decision: worth retrying against a fallback endpoint.
+fn is_transport_failure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+        !matches!(
+            error.status(),
+            Some(status) if status.is_client_error() || status.is_server_error()
+        )
+    })
+}
+
+/// Refresh with endpoint fallback: when `token_url` is the canonical Claude
+/// primary, retry once against `api.anthropic.com` if the first attempt never
+/// reached a server (connect error, timeout, TLS). OAuth denials are
+/// returned as-is so callers keep reporting `invalid_grant` instead of
+/// masking it by trying the mirror.
+async fn execute_refresh_with_fallback(
+    client: &reqwest::Client,
+    token_url: &str,
+    fallback_url: Option<&str>,
+    client_id: &str,
+    refresh_token: &str,
+    now: u64,
+) -> Result<RefreshedTokens> {
+    let primary = execute_refresh(client, token_url, client_id, refresh_token, now).await;
+    if let (Some(fallback_url), Err(error)) = (fallback_url, &primary)
+        && is_transport_failure(error)
+    {
+        return execute_refresh(client, fallback_url, client_id, refresh_token, now).await;
+    }
+    primary
+}
+
 type RefreshLockMap = BTreeMap<(String, String), Arc<tokio::sync::Mutex<()>>>;
 
 fn refresh_lock(provider: &str, account: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -184,24 +221,44 @@ fn persist_tokens(
     Ok(())
 }
 
-fn tokens_to_auth(
-    provider: &str,
-    previous: &ResolvedAuth,
-    tokens: &RefreshedTokens,
-) -> ResolvedAuth {
-    let account_id = account_id_of(previous);
-    match provider {
-        "anthropic" => ResolvedAuth::ClaudeCodeOAuth {
+/// The refreshed credential, of the kind the refreshed one was (#148: not
+/// guessed from the provider's name).
+fn tokens_to_auth(previous: &ResolvedAuth, tokens: &RefreshedTokens) -> ResolvedAuth {
+    match previous {
+        ResolvedAuth::ChatGptOAuth { account_id, .. } => ResolvedAuth::ChatGptOAuth {
             access_token: tokens.access_token.clone(),
             refresh_token: Some(tokens.refresh_token.clone()),
             expires: tokens.expires,
+            account_id: account_id.clone(),
         },
-        _ => ResolvedAuth::ChatGptOAuth {
-            access_token: tokens.access_token.clone(),
-            refresh_token: Some(tokens.refresh_token.clone()),
-            expires: tokens.expires,
-            account_id,
-        },
+        // Only OAuth credentials refresh; an API key has no refresh token.
+        ResolvedAuth::ClaudeCodeOAuth { .. } | ResolvedAuth::ApiKey(_) => {
+            ResolvedAuth::ClaudeCodeOAuth {
+                access_token: tokens.access_token.clone(),
+                refresh_token: Some(tokens.refresh_token.clone()),
+                expires: tokens.expires,
+            }
+        }
+    }
+}
+
+/// What a refresh did with a stored credential that exists (#148).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// Not within the window: left as it was.
+    Fresh(ResolvedAuth),
+    /// Refreshed, and saved.
+    Refreshed(ResolvedAuth),
+    /// Within the window but not refreshed, and still valid: no refresh
+    /// token or endpoint, or the refresh failed (`reason`).
+    Kept { auth: ResolvedAuth, reason: String },
+}
+
+impl RefreshOutcome {
+    pub fn into_auth(self) -> ResolvedAuth {
+        match self {
+            Self::Fresh(auth) | Self::Refreshed(auth) | Self::Kept { auth, .. } => auth,
+        }
     }
 }
 
@@ -221,7 +278,7 @@ pub async fn refresh_expiring_auth(
     endpoint_override: Option<(&str, &str)>,
     now: u64,
 ) -> Result<Option<ResolvedAuth>> {
-    refresh_auth_expiring_within(
+    let outcome = refresh_auth_expiring_within(
         client,
         auth_path,
         auth,
@@ -231,7 +288,8 @@ pub async fn refresh_expiring_auth(
         now,
         REFRESH_WINDOW_SECONDS,
     )
-    .await
+    .await?;
+    Ok(outcome.map(RefreshOutcome::into_auth))
 }
 
 /// [`refresh_expiring_auth`] for callers that need more remaining lifetime
@@ -246,12 +304,12 @@ pub async fn refresh_auth_expiring_within(
     endpoint_override: Option<(&str, &str)>,
     now: u64,
     window_seconds: u64,
-) -> Result<Option<ResolvedAuth>> {
+) -> Result<Option<RefreshOutcome>> {
     let Some(resolved) = auth_for_provider(auth, provider, account) else {
         return Ok(None);
     };
     if !expires_within(resolved.expires(), now, window_seconds) {
-        return Ok(Some(resolved));
+        return Ok(Some(RefreshOutcome::Fresh(resolved)));
     }
     let account = persisted_account_name(auth, provider, account);
     let lock = refresh_lock(provider, &account);
@@ -268,7 +326,8 @@ pub async fn refresh_auth_expiring_within(
         .and_then(|_| auth_for_provider(&stored, provider, Some(&account)))
         .unwrap_or(resolved);
     if !expires_within(resolved.expires(), now, window_seconds) {
-        return Ok(Some(resolved));
+        // Another refresh got there first.
+        return Ok(Some(RefreshOutcome::Fresh(resolved)));
     }
     if !needs_refresh(&resolved, now, window_seconds) {
         if is_expired(resolved.expires(), now) {
@@ -278,16 +337,24 @@ pub async fn refresh_auth_expiring_within(
                 "no refresh token is stored",
             ));
         }
-        return Ok(Some(resolved));
+        return Ok(Some(RefreshOutcome::Kept {
+            auth: resolved,
+            reason: "no refresh token is stored".to_owned(),
+        }));
     }
     let Some((token_url, client_id)) = endpoint_override.or_else(|| token_endpoint(provider))
     else {
-        return Ok(Some(resolved));
+        return Ok(Some(RefreshOutcome::Kept {
+            auth: resolved,
+            reason: format!("{provider} has no token endpoint"),
+        }));
     };
 
-    match execute_refresh(
+    let fallback_url = (token_url == CLAUDE_TOKEN_URL).then_some(CLAUDE_TOKEN_FALLBACK_URL);
+    match execute_refresh_with_fallback(
         client,
         token_url,
+        fallback_url,
         client_id,
         resolved.refresh_token().unwrap_or(""),
         now,
@@ -302,12 +369,17 @@ pub async fn refresh_auth_expiring_within(
                 &tokens,
                 account_id_of(&resolved),
             )?;
-            Ok(Some(tokens_to_auth(provider, &resolved, &tokens)))
+            Ok(Some(RefreshOutcome::Refreshed(tokens_to_auth(
+                &resolved, &tokens,
+            ))))
         }
         Err(error) if is_expired(resolved.expires(), now) => {
             Err(refresh_failure(&account, provider, &error.to_string()))
         }
-        Err(_) => Ok(Some(resolved)),
+        Err(error) => Ok(Some(RefreshOutcome::Kept {
+            auth: resolved,
+            reason: error.to_string(),
+        })),
     }
 }
 
@@ -544,6 +616,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transport_failure_retries_fallback_endpoint() {
+        let fallback = spawn_stub(
+            200,
+            r#"{"access_token":"fresh","refresh_token":"rotated","expires_in":3600}"#,
+        );
+        // The primary is refused at once; the timeout is the fallback's
+        // too, so it allows for a loaded machine.
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        // Unroutable primary: the request fails before reaching any server.
+        let dead_primary = "https://127.0.0.1:9/v1/oauth/token";
+
+        let tokens = execute_refresh_with_fallback(
+            &client,
+            dead_primary,
+            Some(&fallback.url),
+            CLAUDE_CLIENT_ID,
+            "stale",
+            1_000,
+        )
+        .await
+        .expect("fallback refresh succeeds");
+        assert_eq!(tokens.access_token, "fresh");
+        assert_eq!(tokens.refresh_token, "rotated");
+        assert_eq!(tokens.expires, 4_600);
+        let requests = fallback.requests.lock().expect("requests lock");
+        assert!(requests[0].contains("grant_type=refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn oauth_denial_does_not_retry_fallback_endpoint() {
+        let primary = spawn_stub(400, r#"{"error":"invalid_grant"}"#);
+        let fallback = spawn_stub(200, r#"{"access_token":"should-not-happen"}"#);
+        let client = reqwest::Client::new();
+
+        let error = execute_refresh_with_fallback(
+            &client,
+            &primary.url,
+            Some(&fallback.url),
+            CLAUDE_CLIENT_ID,
+            "revoked",
+            1_000,
+        )
+        .await
+        .expect_err("oauth denial surfaces");
+        assert!(error.to_string().contains("invalid_grant"), "{error}");
+        assert_eq!(fallback.hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn refresh_expiring_auth_refreshes_and_persists() {
         let root = test_dir("noel-cli-oauth-refresh");
         let auth_path = root.join("agent").join("auth.json");
@@ -723,7 +847,7 @@ mod tests {
 
         // The next request from the same snapshot reuses the saved tokens.
         let resolved = refresh(5_100).await.expect("resolve").expect("auth");
-        assert_eq!(resolved.expires(), 5_000 + 3600);
+        assert_eq!(resolved.expires(), Some(5_000 + 3600));
         assert_eq!(resolved.refresh_token(), Some("third-refresh"));
         assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
 
@@ -760,7 +884,7 @@ mod tests {
         .await
         .expect("resolve")
         .expect("auth");
-        assert_eq!(resolved.expires(), 4_000_000_000);
+        assert_eq!(resolved.expires(), Some(4_000_000_000));
         assert_eq!(stub.hits.load(Ordering::SeqCst), 0);
 
         let _ = std::fs::remove_dir_all(root);
@@ -800,7 +924,7 @@ mod tests {
         .await
         .expect("request path")
         .expect("auth");
-        assert_eq!(request_path.expires(), 1_600);
+        assert_eq!(request_path.expires(), Some(1_600));
         assert_eq!(stub.hits.load(Ordering::SeqCst), 0);
 
         let extended = refresh_auth_expiring_within(
@@ -816,7 +940,8 @@ mod tests {
         .await
         .expect("windowed refresh")
         .expect("auth");
-        assert_eq!(extended.expires(), 1_000 + 7200);
+        assert!(matches!(extended, RefreshOutcome::Refreshed(_)));
+        assert_eq!(extended.into_auth().expires(), Some(1_000 + 7200));
         assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
 
         let _ = std::fs::remove_dir_all(root);
@@ -893,6 +1018,27 @@ mod tests {
             }
         );
         assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
+
+        // #148: the outcome says the refresh failed and why, unlike a fresh
+        // or a refreshed token.
+        let outcome = refresh_auth_expiring_within(
+            &client,
+            &auth_path,
+            &auth,
+            "anthropic",
+            None,
+            Some((&stub.url, "test-client")),
+            1_000,
+            REFRESH_WINDOW_SECONDS,
+        )
+        .await
+        .expect("soft failure")
+        .expect("auth");
+        assert!(
+            matches!(&outcome, RefreshOutcome::Kept { reason, .. } if reason.contains("500")),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.into_auth(), resolved);
 
         let _ = std::fs::remove_dir_all(root);
     }

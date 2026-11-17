@@ -16,7 +16,7 @@
       "anthropic-version": "2023-06-01",
       "authorization": "Bearer <redacted>",
       "content-type": "application/json",
-      "user-agent": "claude-cli/2.1.322",
+      "user-agent": "claude-cli/2.1.280",
       "x-app": "cli",
       "x-stainless-arch": "x64",
       "x-stainless-lang": "js",
@@ -24,7 +24,7 @@
       "x-stainless-package-version": "0.129.0",
       "x-stainless-retry-count": "0",
       "x-stainless-runtime": "node",
-      "x-stainless-runtime-version": "v26.13.1",
+      "x-stainless-runtime-version": "v24.22.2",
       "x-stainless-timeout": "600"
     },
     "body": {

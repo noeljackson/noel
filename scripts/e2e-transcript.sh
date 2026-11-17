@@ -21,7 +21,7 @@ tmux new-session -d -s "${session}" -x 80 -y 20
 # Capture raw terminal transitions as well as pane content for teardown checks.
 tmux pipe-pane -t "${session}" -o "cat > '${work_dir}/terminal.raw'"
 tmux send-keys -t "${session}" \
-  "cd '${work_dir}' && printf 'shell-scrollback-before-owned\\n'; for _ in {1..40}; do printf '\\n'; done; printf 'shell-before-owned\\n' && env -u NOEL_TUI_E2E_DUMP NOEL_DIR='${work_dir}/agent' NOEL_FAUX_STREAM_DELAY_MS=2 NOEL_FAUX_STREAM_CHARS=1 '${noel_bin}' --session '${work_dir}/session.jsonl' --model faux/echo --offline; stty -a; printf 'shell-after-owned\\n'" Enter
+  "cd '${work_dir}' && printf 'shell-scrollback-before-owned\\n'; for _ in {1..40}; do printf '\\n'; done; printf 'shell-before-owned\\n' && env -u NOEL_TUI_E2E_DUMP NOEL_DIR='${work_dir}/agent' NOEL_FAUX_STREAM_DELAY_MS=2 NOEL_FAUX_STREAM_CHARS=1 '${noel_bin}' --session '${work_dir}/session.jsonl' --model faux/echo --offline --no-splash; stty -a; printf 'shell-after-owned\\n'" Enter
 capture() { tmux capture-pane -t "${session}" -p > "${work_dir}/pane.txt"; }
 fail() { cat "${work_dir}/pane.txt" >&2; echo "$* (artifacts: ${work_dir})" >&2; exit 1; }
 wait_for() {
@@ -188,7 +188,8 @@ restart_fixture "${work_dir}/direct.jsonl"
 wait_for completed-direct-read-marker
 absent 'resumed mid-turn'
 # Model-linked results resume automatically without a synthetic user prompt
-# or replaying saved/uncertain tools. Queued prompts follow the saved turn.
+# or replaying saved/uncertain tools. Queued prompts are placed first, as
+# Durable's continue places them, and the model answers once.
 cat > "${work_dir}/unfinished.jsonl" <<'JSONL'
 {"type":"started","session_id":"unfinished","cwd":"."}
 {"type":"message","message":{"role":"user","content":"inspect fixture","tool_calls":[],"media":[]}}
@@ -199,8 +200,8 @@ JSONL
 restart_fixture "${work_dir}/unfinished.jsonl"
 wait_for 'resumed mid-turn'
 wait_for 'continuing automatically'
-wait_for '[faux/echo] inspect fixture'
 wait_for_pair '[faux/echo] first-resumed-followup' 'second-resumed-followup'
+absent '[faux/echo] inspect fixture'
 [ "$(grep -Fc '"role":"user"' "${work_dir}/unfinished.jsonl")" = 2 ] || fail 'resume inserted a synthetic user prompt'
 grep -Fq '"type":"queued_messages_snapshot","messages":[]' "${work_dir}/unfinished.jsonl" || fail 'resume did not drain follow-ups'
 [ "$(grep -Fc '"role":"tool"' "${work_dir}/unfinished.jsonl")" = 1 ] || fail 'resume reran a saved tool result'
@@ -232,6 +233,8 @@ for route in command selector select-message; do
 done
 # Interrupted/quit resumed runs must not schedule themselves again. A pending
 # development rebuild must not turn an intentional stop into another resume.
+# The resume is Durable's continue, which placed the queued follow-up into the
+# run it stopped: it is answered by no reply and not queued again.
 long_resume="resume-interruption-$(printf 'x%.0s' $(seq 1 250))"
 for stop in interrupt quit; do
   printf '{"type":"started","session_id":"%s","cwd":"."}\n{"type":"message","message":{"role":"user","content":"%s","tool_calls":[],"media":[]}}\n{"type":"queued_messages_snapshot","messages":["retained-after-resume-stop"]}\n' "${stop}" "${long_resume}" > "${work_dir}/${stop}.jsonl"
@@ -244,16 +247,20 @@ for stop in interrupt quit; do
     wait_for interrupted
     touch "${work_dir}/watched-restart"
     sleep 2.5
-    wait_for '❯ retained-after-resume-stop'
     absent 'esc to interrupt'
+    absent '❯ retained-after-resume-stop'
     absent 'resume-fixture-shell'
     tmux send-keys -t "${session}" '/quit' Enter
   else
     tmux send-keys -t "${session}" '/quit' Enter
   fi
   wait_for resume-fixture-shell
-  [ "$(grep -Fc '"role":"user"' "${work_dir}/${stop}.jsonl")" = 1 ] || fail 'resumed stop drained a follow-up'
-  if grep -Fq '"role":"assistant"' "${work_dir}/${stop}.jsonl"; then fail 'resumed stop retried generation'; fi
+  [ "$(grep -Fc '"role":"user"' "${work_dir}/${stop}.jsonl")" = 2 ] || fail 'the resumed run did not place its follow-up once'
+  grep -Fq '"content":"retained-after-resume-stop"' "${work_dir}/${stop}.jsonl" || fail 'the follow-up was not placed'
+  grep -Fq '"type":"queued_messages_snapshot","messages":[]' "${work_dir}/${stop}.jsonl" || fail 'the placed follow-up is still queued'
+  # What the stopped reply had streamed is kept as an aborted reply; no
+  # reply may have completed.
+  if grep -F '"role":"assistant"' "${work_dir}/${stop}.jsonl" | grep -Fvq '"aborted":true'; then fail 'resumed stop retried generation'; fi
 done
 # Deterministic offline provider-construction failure: attempt once and stay
 # idle, preserving both the saved prompt and follow-ups (never a paid API).

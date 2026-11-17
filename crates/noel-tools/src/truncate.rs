@@ -156,6 +156,32 @@ pub fn format_size(bytes: usize) -> String {
     }
 }
 
+/// At most the first `max` UTF-16 units of `text` (as upstream counts),
+/// never splitting a character: upstream's `sliceHead` (9e870f6f).
+pub fn slice_head_utf16(text: &str, max: usize) -> &str {
+    let mut units = 0;
+    for (index, character) in text.char_indices() {
+        units += character.len_utf16();
+        if units > max {
+            return &text[..index];
+        }
+    }
+    text
+}
+
+/// At most the last `max` UTF-16 units of `text`, never splitting a
+/// character: upstream's `sliceTail` (9e870f6f).
+pub fn slice_tail_utf16(text: &str, max: usize) -> &str {
+    let mut units = 0;
+    for (index, character) in text.char_indices().rev() {
+        units += character.len_utf16();
+        if units > max {
+            return &text[index + character.len_utf8()..];
+        }
+    }
+    text
+}
+
 /// Cuts a grep line to [`GREP_MAX_LINE_LENGTH`] characters. Returns the text
 /// and whether it was cut.
 pub fn truncate_line(line: &str) -> (String, bool) {

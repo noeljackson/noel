@@ -14,6 +14,40 @@ generate parity fixtures.
 Reason: the product goal is a native Rust CLI/TUI, not a wrapper around the old
 runtime.
 
+#### Amendment: Optional Bun Host for TypeScript Extensions
+
+A `.ts` extension (a v2 manifest beside it, `protocolVersion: 2`) runs under
+an *external* `bun` process: noel spawns `bun <noel-bun-host.ts>
+<extension.ts>` where the shim is a file noel ships (installed beside the
+binary by `make install`, found via `NOEL_BUN_HOST`, or in the agent dir's
+`extension-hosts/`). noel itself stays JavaScript-free: it links no JS engine,
+ships no JS in the binary, and runs its own logic in Rust only. The extension
+code — user-installed, like an executable extension — runs in a separate OS
+process under a runtime the user installed (`bun` on PATH).
+
+Semantics the host keeps either way: the extension speaks protocol v2 over
+stdio (init handshake with registrations, `tool`/`command` requests,
+notifications answered with no response line); gate verdicts fail closed;
+registrations commit only if the factory completes. The shim maps upstream's
+`ExtensionAPI` surface (default-export factory, `registerTool`,
+`registerCommand`, `on("tool_call", …)` with `{block, reason}` results) onto
+that protocol, so upstream example extensions load verbatim (type-only
+imports are erased by bun itself).
+
+Reason: upstream's extension ecosystem is TypeScript; a subprocess host keeps
+parity with what extensions expect without embedding an engine (deno_core's
+stewardship window and V8's size make embedding the wrong trade), and keeps
+noel's binary and build free of any JS runtime. bun is optional: the TUI
+offers a one-time download when a TypeScript extension is loaded and no bun
+exists (before the TUI opens, on the plain terminal), `noel bun install`
+does it non-interactively (`-y`), and the binary lands in the agent dir's
+`bin/bun` — private to noel, outranking PATH so nothing shadows or is
+shadowed. `NOEL_BUN_BIN` (a path, or `path` to force PATH) overrides the
+resolution. Without bun and without consent, a `.ts` extension fails closed
+with a diagnostic, exactly like a missing executable. This is the same class
+of dependency as `rg`/`fd`: an external tool noel invokes deliberately,
+never a runtime noel depends on.
+
 ### No Web UI Product Path
 
 The old TypeScript web UI is not part of the active Rust product.
@@ -307,6 +341,24 @@ format, with credential syntax and offline mode, is a later piece of work; the
 model object already has upstream's field names so upstream's file can map
 onto it.
 
+### Provider Base-URL Variables
+
+`ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` point the `anthropic` and `openai`
+providers at another address:
+- every built-in model of the provider follows the variable;
+- a `models.json` entry with no `baseUrl` follows it too;
+- an entry that names its own `baseUrl` keeps that address.
+
+Each value follows its provider's own convention: Anthropic's has no `/v1`,
+and noel adds `/v1/messages`; OpenAI's includes `/v1`. Upstream reads neither
+variable and takes each model's address from its catalog or `models.json`.
+
+Reason: Claude Code and the OpenAI SDK read these variables, and environments
+that keep provider credentials out of the workload rely on them. A Codewire
+Sandbox sets them to its local credential proxy, together with a placeholder
+credential that the proxy replaces. noel ignoring them would send the
+placeholder straight to the provider.
+
 ### Model Scope, Picker, and Model Commands
 
 `--models` and `enabledModels` resolve as upstream's scope does (exact, fuzzy,
@@ -389,8 +441,11 @@ The `edit` tool follows upstream's rules (unique `oldText`, no overlapping
 edits, all edits applied at once, empty `newText`, `edits` as a JSON string,
 BOM and CRLF kept) but matches exactly: it does not fall back to upstream's
 fuzzy matching of smart quotes, Unicode dashes and spaces, and trailing
-whitespace. It also converts only the edited text to the file's line endings
-instead of normalizing a mixed-ending file.
+whitespace. As upstream since d448c51e2, lines the edit does not touch keep
+their endings and the new text takes the ending of the line its range starts
+on; but `oldText` is matched in the file's first-line ending, where upstream
+matches on LF-normalized text, so an `oldText` spanning lines of different
+endings matches upstream and not here.
 
 Reason: an exact match cannot edit the wrong region, and bytes outside the
 edits stay untouched.
@@ -400,7 +455,10 @@ edits stay untouched.
 The per-run provider round cap (`agent.maxToolRounds`, default 200, including
 steering rounds) is configurable in settings and reports a dedicated
 round-limit error that names the cap and the setting instead of masquerading
-as an invalid tool call.
+as an invalid tool call. A run that reaches it ends failed with Durable's
+reason `turn_limit` (`maxTurns`), saved with its end and shown as
+`pi.live.runFailure`; a continue goes on from there. Durable's `run.turns`
+is not in the view.
 
 Reason: the default is a runaway-loop bound, not a usage quota; long working
 sessions legitimately exceed it and the recovery path (continue or raise the
@@ -636,8 +694,11 @@ upstream merges them (`settings.json` fixture). These parts differ:
   `defaultTools` is gone after `/reload`.
 - `enabledTools` is a Rust-only setting: a persistent allowlist, like `--tools`
   with plain names.
-- Upstream's `defaultActive: false` extension tools (`codemode`,
-  `tool_search`) and its MCP rules for `--tools` do not exist in Rust; every
+- `codemode` is a built-in tool that is off unless selected by name
+  (`--tools`, `enabledTools`, or `defaultTools: ["+codemode"]`), as
+  upstream registers it inactive; a pattern such as `*` never selects it
+  (see Codemode). Upstream's other `defaultActive: false` tool,
+  `tool_search` (it loads `deferred` tools, which noel does not have), and its MCP rules for `--tools` do not exist in Rust; every
   extension tool is on unless an allowlist or `--exclude-tools` leaves it out.
 - Tool flags are not saved with the session. Earlier Rust versions saved them
   as the session's disabled tools; a saved list is cleared when the session is
@@ -651,6 +712,68 @@ Reason: Rust's reloadable systems are rebuilt from configuration, and durable
 session state is kept apart from them (see the reload rules in `AGENTS.md`).
 A selection computed from settings and flags needs no session record, and the
 flags mean the same on every run.
+
+### Codemode
+
+`codemode` (`crates/noel-codemode`, `crates/noel-core/src/codemode.rs`) runs
+upstream's script environment on the djs engine (`earendil-works/djs`,
+pinned by commit) instead of QuickJS in a worker thread. The prelude is
+upstream's, byte for byte (`docs/codemode-port.md`). These parts differ:
+
+- **Engine.** djs is always strict and `eval` is always indirect; one
+  upstream sandbox test depends on sloppy mode. Interrupts are polled every
+  10,000 units of fuel. Scripts are JavaScript only, as upstream's.
+- **Description.** Upstream's `createCodemodeDescription`,
+  `describeScriptCall` and `codemode.mode`/`codemode.inlineBudget`, on
+  upstream's declarations (`noel_codemode::declarations`, matched byte for
+  byte against every call of upstream's `declarations.test.ts`). Every noel
+  tool has `direct` exposure, so with `mode: "on"` codemode lists no tools
+  and each callable tool's description ends with upstream's `Codemode:`
+  line; with `"only"` codemode lists them all (budgeted, cheapest first) and
+  they are not declared, but the system prompt still lists them. There are
+  no namespaces or deferred tools, and no `models` line. In declarations,
+  object values of `const`, `enum` and `@default` render with sorted keys,
+  where upstream keeps insertion order. `bash` and `read` have upstream's
+  output schemas; other tools resolve to a string.
+- **Discovery globals.** `searchTools()`, `describeTool()`,
+  `describeNamespace()` and `ALL_TOOLS` samples as upstream's. Without
+  namespaces, a `namespace` filter matches nothing and `describeNamespace()`
+  returns `undefined`. The ranker (`noel_codemode::search`) matches
+  upstream's tokens, documents and BM25 scores on its tests, except that
+  text in Chinese, Japanese and Thai is split by Unicode word boundaries
+  (one word per ideograph, one per Thai run), not by ICU's dictionaries.
+- **Nested tools.** Scripts call the active built-in and extension tools
+  except `todo` (it changes the session; model-only here) and codemode
+  itself. Every call goes through the extension `toolCall` gate and runs in
+  parallel; extension v2 calls share one host lock, so they run one at a
+  time. A nested call resolves to its text output, except as upstream:
+  `bash` resolves to `{output, truncated, full_output_path?, exit_code,
+  wall_time_seconds}` (also on a non-zero exit) and `read` of an image to
+  `{type: "image", data, mimeType, note}`. These are their output schemas. Nested calls are reported as they change (`TurnEvent::NestedToolCalls`):
+  the TUI lists them as upstream's renderer does, above the result once the
+  call ends, and RPC sends upstream's `tool_execution_update` with
+  `details.calls`. They have no `tool_execution_*` events of their own, the
+  result message carries no `nestedCalls`, and the server's view shows them
+  only through the tool's result (no `nestedTools`).
+- **Result.** The text items are joined into the tool result's text and
+  images are attached after it, not interleaved. Spill and image files are
+  `noel-codemode-<random>.<ext>` in the temp directory.
+- **Store.** Saved as a `codemode_store` journal record holding the whole
+  store after each script that wrote to it, not as upstream's `codemode-store`
+  custom entries per branch.
+- **Abort and deadline.** No deadline unless `timeout_ms` is given, as
+  upstream. An abort ends the script, which saves upstream's `Script failed
+  ... Script aborted: <reason>` result with the calls it made, and then the
+  turn ends. The reason is "This operation was aborted" (Node's default
+  `AbortError` message; unverified against a pi abort).
+- **Slots.** At most 2 scripts run at once in the process
+  (`NOEL_CODEMODE_MAX_WORKERS` or `PI_CODEMODE_MAX_WORKERS`), with upstream's
+  60-second wait and failure texts; the number is read once per process,
+  where upstream reads it per call. Starts restore a VM image taken after
+  the prelude when the tools, store and limits are the same, as djs's
+  adapter does.
+- **Not present:** `models.*`, MCP exposure, durable replay,
+  grammar-constrained input.
 
 ### Built-in Tools Run In-Process
 
@@ -732,51 +855,97 @@ parts differ:
   of base64), the PNG-then-JPEG candidates, and the notes are the same.
 - `edit` matches exactly (see Exact-Match edit Tool) and, like `write`,
   returns no diff: tool results are text.
+- `read` loads the file into a byte buffer rather than streaming it as
+  upstream does since 3a7bb6f4; the output is the same, and Rust has no
+  string-length limit to avoid.
 
 Reason: the remaining differences are either invisible to the model or need a
 dependency (Unicode normalization) for a rare case.
 
-### Tool Result Images Depend on the Provider API
+### Provider Stream Endings
+
+A reply's stream ends as upstream ends it (#135). Anthropic needs
+`message_stop`, Responses a terminal event, chat completions a
+`finish_reason` and Gemini a finish reason. A stream that ends without one
+fails with upstream's message, which its retry patterns know.
+
+These parts differ:
+- **No opt-out.** Upstream's `compat.supportsFinishReason: false` lets a
+  model's chat stream end without a finish reason. noel has no per-model
+  compat flags, so such a server's replies fail.
+- **Raw stop reasons.** `StreamEvent::Stop` carries the provider's raw stop
+  reason, as upstream's `rawStopReason` does: `incomplete.max_output_tokens`
+  for an incomplete Responses reply, Gemini's `MAX_TOKENS`.
+  `is_output_limit_stop` reads them, instead of upstream mapping each to
+  its own stop reason.
+
+Reason: the raw reason is what noel's RPC mode reports as `rawStopReason`,
+and one string per event keeps the wire as upstream records it.
+
+### No Session Affinity or Prompt Cache Keys on OpenAI-Style Requests
+
+Upstream passes the session id to its providers: OpenAI Responses sends it as
+`session-id` and `x-client-request-id` (since c5d39783), OpenRouter as
+`x-session-id`, and OpenAI-style APIs as `prompt_cache_key` (also through
+compatible proxies since 0f4d5e96), unless `PI_CACHE_RETENTION` or the
+request's cache retention is `none`. noel builds its providers with no session
+id, so it sends none of these; only Cloudflare AI Gateway and Mistral requests
+built with one carry it.
+
+Reason: not ported yet. OpenAI's automatic prompt caching still applies to
+repeated prefixes without a key; the key only improves routing to the same
+cache.
+
+### Tool Result Images Depend on the Provider API and the Catalog
 
 Upstream sends the images of a tool result (`read` of an image file) to every
 model whose catalog entry lists image input, and replaces them with a note for
-other models. Rust's catalog records each model's `input` too, but nothing
-reads it yet, so Rust still decides by provider API:
+other models. Rust's catalog records each model's `input` too, and request
+builders now read it (`ModelTraits::accepts_images`):
 
 - Anthropic Messages, OpenAI Responses (OpenAI, Codex, Azure, GitHub Copilot),
   Google Gemini and Vertex, and Bedrock Converse: the image is sent in the tool
   result (for Gemini 2, in a user turn after it), to every model.
-- OpenAI chat completions and Mistral: the image is not sent. The tool result
-  text ends with `(tool image omitted: this provider API does not accept images
-  in tool results)`. Upstream sends it in a user message after the tool
-  results.
-- Upstream adds `[Current model does not support images. ...]` to the `read`
-  result for a model without image input. Rust never does.
+- OpenAI chat completions and Mistral: a tool message cannot hold an image, so
+  for a model whose catalog entry lists image input the images follow their
+  tool round in a user message of their own (upstream's shape); for any other
+  model the tool result text ends with `(tool image omitted: this provider API
+  does not accept images in tool results)` or, when the catalog says the model
+  takes no images, `(tool image omitted: the current model does not support
+  image input)`. A user message's pasted images get the same gate: sent where
+  the model accepts images, replaced by a note otherwise.
 - With `images.blockImages`, `read` returns `Image reading is disabled.` in
   place of the image. Upstream returns the image and removes it from each
   request, so turning the setting off later sends it; in Rust it is not saved.
 
-Reason: chat completions is the API of most text-only models, and a tool
-message there cannot hold an image. This rule predates the catalog; sending an
-image to a model that does not accept one risks an error on every later
-request of the session, because the image stays in the conversation. The four
-APIs that carry images in tool results serve models that almost all accept
-them. The catalog now says which models accept images; deciding by it is
-separate work.
+Reason: a tool message on the chat completions API cannot hold an image, so
+those images travel in a following user message, and only where the model's
+catalog entry lists image input: sending one to a model that refuses it breaks
+every later request of the session, because the image stays in the
+conversation. The four APIs that carry images in tool results serve models
+that almost all accept them; those paths still send to every model, as
+upstream does for the same reason.
 
-### No MCP Support
+### MCP: stdio slice only
 
-Rust has no Model Context Protocol client. Upstream's `pi mcp` command
-(`list`, `login`, `logout`, `add`, `remove`), the `/mcp` slash command, MCP
-tools, and `mcp.json` are not ported. `noel mcp` exits with an error instead of
-sending "mcp ..." to the model as a prompt, and `--no-mcp` is accepted as a
-documented no-op so upstream invocations keep working. The CLI contract test
-(`cli_contract_covers_upstream_ts_options_and_commands`) exempts exactly the
-`mcp` command and requires this entry.
+noel has an MCP client (`crates/noel-mcp`, ported from upstream's
+`packages/mcp`): the JSON-RPC protocol, the initialize handshake, paged
+tool listings, tool calls, and the stdio transport, with the server in
+its own process group and spec-ordered shutdown. `mcp.json` (agent dir
+and trusted project, the shared `mcpServers` shape) configures servers
+whose tools join the session as `mcp__<server>__<tool>`, `noel mcp list`
+names them, `/mcp` shows their live state, and `--no-mcp` keeps them
+from connecting.
 
-Reason: MCP is a large protocol surface (stdio and HTTP transports, OAuth,
-tool exposure modes, codemode) outside the native CLI/TUI scope today.
-Revisit if noel adds an MCP client.
+Not ported: the Client ID Metadata Document preference of registration
+(upstream's `oauth.clientRegistration`), resources and prompts, and the
+exposure modes (codemode/deferred/tool-search). `noel mcp` ships `list`, `add`, `remove`, `login` and `logout`. The
+streamable-HTTP transport and OAuth (discovery, dynamic registration,
+PKCE flow, loopback callback, token refresh) are ported. Tool-argument
+validation carries pi-schema's semantics for MCP tools (coercion, and
+upstream's error wording); built-in tools keep their hand validators.
+Reason: the rest covers upstream surfaces noel's tool surface does not
+use.
 
 ### Local `/bug` Reports for This Port
 
@@ -798,19 +967,22 @@ port's bugs belong in its own tracker. A local file that the user reviews and
 attaches keeps upstream's consent model without network calls or a zip
 dependency.
 
-### `--use-theme` Takes One Theme Name
+### `--use-theme` Pairs Pick From `COLORFGBG` Only
 
 `--use-theme <name>` selects the initial theme for one run without saving it,
-as Rust's `--theme` does. Upstream also accepts a `light/dark` pair and picks
-a half from the terminal's reported background. Rust has no terminal
-appearance detection, so it rejects pairs with an error, and a `light/dark`
-`theme` setting still falls back to the system theme with a diagnostic.
-`--use-theme` also conflicts with `--theme` and `--no-themes`: upstream
-combines them because its `--theme` loads theme files and `--no-themes` only
-skips discovery, while Rust's `--theme` selects the run's theme and
-`--no-themes` clears it, so one flag would silently override the other.
+as Rust's `--theme` does. Both accept upstream's `light/dark` pair and pick a
+half from the terminal's appearance. Print and JSON modes cannot query the
+terminal, so the half comes from `COLORFGBG` when a terminal set a usable
+background index, dark otherwise; the TUI's OSC 10/11 query reports the real
+colors once it opens. `--use-theme` still conflicts with `--theme` and
+`--no-themes`: upstream combines them because its `--theme` loads theme files
+and `--no-themes` only skips discovery, while Rust's `--theme` selects the
+run's theme and `--no-themes` clears it, so one flag would silently override
+the other.
 
-Reason: choosing a half without asking the terminal would silently guess.
+Reason: a reply cannot arrive before a terminal is open, so non-TTY modes
+classify from the environment, the way upstream classifies before its query
+replies.
 
 ### `noel auth` Named Accounts
 
@@ -841,6 +1013,35 @@ sign the user out of Claude Code or Codex. After noel refreshes such a login it
 keeps its own `claude-import`/`codex-import` account, which refreshes early
 like any stored account.
 
+### Run-End Rules (Durable 1.5)
+
+Durable's run-end rules, adopted by the owner on 2026-11-05 (spec §3.1, §4.1,
+§8.3): the `runFailure` reasons, the restart limit, a crash-interrupted
+request charged to retry, `continue` and `whenIdle: "reject"`. These parts
+differ:
+
+- **Unit.** Durable counts restarts per task (each tool call, compaction and
+  generation). noel has no tasks: it counts per run, and at the limit ends
+  the run, never a single tool call with a `restart_limit` result. The
+  count is cleared by any message the run saves, where Durable clears it on
+  a new checkpoint, wait or outcome.
+- **Close.** A close is a stop whose driver's inbox ended (a worker told to
+  shut down, RPC mode exiting with its run active); it saves `run_closed`.
+  Durable joins the invocations and writes the tasks back as `pending`.
+  Journals from before this change hold no close record, so their
+  interrupted runs count as crashed.
+- **Charging.** A crash counts as one during a request unless the journal's
+  last record about the reply is a `retry_wait` (a retry's backoff, or a
+  compaction after an overflow), saved before the retry is reported; Durable
+  knows the generation's phase. A crash after a tool round's results were
+  saved and before the request left is charged too. The attempt is the
+  cut-off partial's, or 1. RPC reports the charged attempt as upstream pi
+  reports a retry, so a resumed run may have more than one `agent_start`.
+- **Not ported:** `afterFailedRun` (noel keeps the queue: `keep`),
+  `Conversation.submit(tx, draft)`, `no_model`, `reset`, `faulted`,
+  `orphaned`; `continue` and `whenIdle` exist on `noel.chat` only, not in
+  RPC mode.
+
 ### Run Recovery
 
 noel retries a failed model request and answers a context overflow with one
@@ -856,12 +1057,14 @@ parts differ:
   HTTP library's and not the one the patterns expect. noel's own errors (no
   credential, an invalid header, its configuration, a faux script that ran
   out) are never retried, whatever their text contains.
-- A reply the run drops is not saved. Upstream saves the failed or cut-off
+- A reply the run drops is not kept. Upstream saves the failed or cut-off
   attempt and hides it from the model with a `context_edit` journal entry, so
-  its history and exports still show it. noel saves a reply only once it
-  stands: a retried or overflowed attempt leaves no record, and a noel killed
-  during a recovery resumes from the prompt, or from the compaction
-  checkpoint once that is written.
+  its history and exports still show it. noel keeps a reply in the
+  transcript only once it stands, or once it is cut off for good (see
+  `docs/spec.md` §4.2): what a retried or overflowed attempt streamed is
+  saved as it goes and superseded as the turn asks again, so it leaves
+  nothing in the transcript, and a noel killed during a recovery resumes
+  from the prompt, or from the compaction checkpoint once that is written.
 - A final reply cut off at the output limit stands when nothing replaces it:
   there is nothing to compact, compaction is off, or the compaction fails.
   Upstream hides the reply from the model in those cases too, so its next
@@ -898,6 +1101,45 @@ upstream's, so a run survives what upstream's survives and a client sees the
 same protocol. The differences follow from noel's journal, which saves what the
 model will see again and nothing else, and from its own HTTP stack.
 
+### Durable Partial Output
+
+A streaming reply's text and thinking, and a running tool call's output, are
+saved as they arrive, and recovered after a stop, as upstream Durable does
+(`docs/spec.md` §4.2, `durable/docs/spec.md:3735-3745, 3999-4006`): at most
+every `progress.partialIntervalMs` and `progress.outputIntervalMs` (default
+100), a committed partial becomes an aborted reply that later requests leave
+out, and a call that does not run again gets an interrupted result holding
+its saved output. These parts differ:
+
+- Upstream overwrites a live document; noel's journal only grows. So a
+  reply's records append what streamed since the last one, and a tool's
+  output is appended while it grows. Once the output passes its result's
+  limits the kept end moves and each record rewrites it, at intervals that
+  double from one rewrite to the next; upstream waits the interval and the
+  rewrite's size at 100 KiB/s. A crash then loses the output since the last
+  rewrite, which can be more than one interval.
+- A reply's first change after a quiet interval is saved at once; upstream
+  saves a reply's first partial one interval after it arrives.
+- The saved partial holds the reply's text and thinking, not the tool calls
+  it was streaming or its usage. An abort saves everything the reply
+  streamed, including what the last interval had not saved yet; upstream's
+  abort converts what was committed.
+- What a stop left is recovered when the session is next opened for
+  writing, before anything else happens to it; upstream converts it when the
+  request is sent again, or when the run is settled otherwise.
+- A failure that ends the run keeps what the reply streamed as an aborted
+  reply. Upstream keeps the failed reply as an error reply, with its error
+  text and usage.
+- The interrupted result is one text: the saved output, a blank line, and
+  upstream's `<harness>` block. Its truncation line has no line and byte
+  counts (`[warn] Output truncated to its end`), which noel does not save.
+- An abort's result for a tool call is published pi's `Operation aborted`
+  after what the call printed, not Durable's `aborted` diagnostic.
+
+Reason: an append-only journal must not grow with every save of a long reply
+or a chatty command. The rest keeps RPC mode's records published pi's, and
+saves what noel's journal can say.
+
 ### RPC Mode
 
 `noel --mode rpc` speaks upstream's RPC protocol, with four additions listed in
@@ -919,8 +1161,8 @@ Differences in the golden records:
   `message_end` and kept in `agent_end` and `get_messages`. noel reports none:
   it sends its system prompt with every request and keeps it out of the
   transcript.
-- `messageCount` counts the messages noel keeps: not upstream's system message,
-  and not an aborted reply (see below).
+- `messageCount` counts the messages noel keeps: not upstream's system
+  message.
 - Queue modes: noel delivers everything queued at once (see Batched Queue and
   Steering Dispatch). `steeringMode` and `followUpMode` are always `all`, and
   setting `one-at-a-time` fails.
@@ -956,11 +1198,10 @@ Other differences:
   `compact`, `new_session`, `switch_session`, and `set_session_name` are
   refused. Upstream takes `set_auto_retry` at any time and saves it in
   `settings.json`; noel's lasts for the process.
-- An aborted reply, and the `Operation aborted` result of a tool call the
-  abort interrupted, are reported but not saved, so `get_messages` and later
-  model requests leave them out. Upstream keeps the aborted reply in the
-  session but also leaves it out of model requests. The same goes for a reply
-  a run drops to ask again (see Run Recovery).
+- A tool call an abort stops keeps what it printed before its result's
+  `Operation aborted`, and the calls after it that the abort kept from
+  starting get `Operation aborted` alone. Upstream's bash ends its output with
+  `Command aborted`.
 - Closing stdin during a run stops it where it is, kills its tool processes,
   and exits without `agent_end` or `agent_settled`; what the run saved stays
   in the session, and the run stays interrupted for `resume_run`. A signal
@@ -972,7 +1213,8 @@ Other differences:
 - A resumed run reports the turn it finishes: the saved reply again, as
   `get_messages` shows it (no model, usage, or timings), then the replay-safe
   calls it runs again, then `turn_end`. Calls that are not replay-safe get no
-  `tool_execution_*` records; the model is told they were interrupted.
+  `tool_execution_*` records: their result, saved unreported, is the output
+  they had saved and says they were interrupted (`docs/spec.md` §4.2).
 - `abort` with no run active ends an interrupted run as `aborted`; upstream's
   does nothing. A new `prompt` ends an interrupted run the same way.
 - The queue is saved with the session: an enqueue is saved before it is
@@ -1029,6 +1271,34 @@ became of the run it started, and have it finished when that is safe: a
 prompt is applied once, a call that is not replay-safe runs at most once, a
 replay-safe one at least once, and a model request cut off by a stop is sent
 (and billed) again.
+
+### Submissions and the Session Controller
+
+One session controller (`crates/noel-core/src/controller.rs`, `docs/spec.md`
+§3 and §9) takes a session's submissions, as Durable's harness does
+(`durable/docs/spec.md:2329-2360`): a `requestId` on a prompt, steer or
+follow-up, `whenBusy`, an id per queued submission, `withdraw`, and an abort
+that keeps or withdraws the queue as the caller chooses. These parts differ:
+
+- The kinds a `requestId` names are the client's verbs: prompt, steer and
+  follow-up. Durable's are its two submission types, input and write; noel has
+  no writes.
+- A submission that starts a run is named by the run's id, and how it ended is
+  the run's end. Durable keeps a submission record of its own, with an answer
+  entry or a reason.
+- While no run is active, a prompt starts a run even with submissions queued,
+  and they join it: steering in its first round, follow-ups when it would
+  answer. Durable queues the new input behind them and places all of them at
+  one boundary.
+- A queued submission without a `requestId` keeps its id only while the
+  process that queued it runs. RPC mode reads no `requestId` but a prompt's
+  and reports no submission ids, so its journal records are the ones it wrote
+  before.
+
+Reason: the controller extends noel's run engine and journal rather than
+replacing them, so RPC mode keeps its records and journals (its goldens are
+unchanged), and Mode 2 gets Durable's exactly-once submissions without a
+second record of what the journal already says.
 
 ### Named noel, With Its State in `~/.noel`
 
@@ -1098,3 +1368,502 @@ Reason: repositories written for pi, this one and upstream's included, track
 `.pi/`, and their extensions, packages, skills, and scripts use pi's names.
 noel loads upstream-format skills, so a skill that reads `PI_SESSION_FILE`
 has to find it.
+
+### Chord Delta, Canonical JSON and Contracts
+
+`crates/noel-chord` matches upstream Chord's delta ops, wire codec and
+`canonicalJson` at `main` (`chord-delta.json`); its v1 `hash64`, contract
+fingerprints, `coverage` and `fits` have had no upstream counterpart since
+Chord v1 was removed, and Chord v2's contracts are checked against
+`chord-v2-contracts.json`. These parts differ:
+
+- noel's strings are Unicode text, so they cannot hold a lone surrogate. A `t`
+  op that would cut a surrogate pair in half fails with `SplitSurrogate`
+  instead of leaving half of the pair, and JSON carrying a lone surrogate
+  escape does not parse. Upstream's own diff never cuts a pair.
+- A numeric path segment of 2^64 or more is refused as an unsafe segment.
+  Upstream accepts any non-negative integer and, on an object, writes the key
+  JavaScript prints for it.
+- Where upstream's `fits` throws on a malformed schema (a `required` that is
+  neither a list nor a string, a `parameters` that is not a list, an invalid
+  `patternProperties` pattern), noel answers "does not fit", so `coverage`
+  reports a difference where upstream throws.
+- `patternProperties` patterns are compiled by Rust's `regex` crate, not as
+  JavaScript `u` regexes. A pattern using lookaround or backreferences does
+  not fit, and `\d`, `\w`, `\b` and `.` can match differently on names with
+  non-ASCII characters or `\r`.
+- noel parses JSON numbers with `serde_json`'s default float parser, which can
+  round a number with more than 15 significant digits, or a large exponent,
+  one unit differently from `JSON.parse`. Such a number received as text can
+  then differ in its last bit, and so in canonical JSON and `hash64`. Contract
+  descriptions hold no such numbers. `serde_json`'s `float_roundtrip` feature
+  would close this, for every crate in the workspace at once.
+
+Reason: Rust strings and integers cannot represent the first two. Matching
+the regex differences would need a JavaScript regex engine, and the float
+parser is a choice for the whole workspace, not for this crate.
+
+### Chord v2
+
+`noel_chord::v2` is ported from upstream at `CHORD2_REFERENCE_REF`; noel's
+server, workers and clients speak it, and `make chord2-interop` runs it
+against upstream. (The v1 implementation, link protocol 4, is deleted.)
+Where it differs:
+
+- **Synchronous inflate.** A deflated part is inflated with flate2 when its
+  owner opens it. Upstream hosts without a synchronous compressor inflate
+  ahead of the owner and hold later messages meanwhile; noel's channel has
+  nothing to hold.
+- **Sans-IO channel.** `v2::Channel` takes received bytes and the time and
+  gives the bytes to send; its owner moves them and runs the timer. Upstream's
+  `Channel` owns its link's listeners.
+- **Process links** are noel's framed byte streams (`[u32 BE length][tag]
+  [payload]`, tag 0 a Chord message, tag 1 a JSON control message), not
+  Node IPC.
+- **No telemetry.** noel records no spans or metrics (`chord.link.bytes`,
+  `chord.link.checks`). A `hold`'s or `call`'s trace carrier is decoded,
+  checked and forwarded by relays as it came (none on a re-hold), and noel's
+  own holds and calls send none.
+- **No reload.** noel's providers never unbind or rebind a bound hold, so
+  `loading` on a bound hold, a call's `old` flag and the reasons `version`
+  and `reload_cycle` arise only from upstream peers: noel decodes them,
+  relays `old` only from a trusted link, and ignores it when serving.
+- **The heartbeat** measures silence on tokio's monotonic clock, which does
+  not advance while the machine sleeps, instead of upstream's late-tick
+  allowance (9f7d909f); a stalled host task still counts as silence.
+- **No text codec yet.** Only the binary codec, upstream's default. The text
+  codec is for debugging and both ends must agree on it.
+- **Error messages of protocol errors** carry the decode error after the
+  handshake message; protocol errors are only reported, never sent.
+- **Objects are cells and methods.** A factory returns a variant, its state
+  members as cells and its methods; the object is live at once and shared by
+  the holds of the same type, params and principal. There are no documents,
+  derives, resources, routines, reload, `accepts` adapters or older contract
+  versions, so a live object never fails, unbinds or swaps: `failed` is sent
+  only for refused holds (not served, another contract, invalid params, a
+  wrong address, a factory error) and `retry` only restarts those.
+- **Pending ops are concatenated**, not folded: a batch that starts with a
+  replacement drops what was pending, and more than 10,000 ops are replaced
+  by the member's value (subscribed afresh). The consumer's value is the
+  same; the ops on the wire can be more.
+- **A batch** is what the host's task drained at once, not a commit of
+  upstream's batch: a cell change made in one step may share a `state`
+  message with others made at the same time.
+- **No byte segments.** noel's contracts have no `bytes()` leaves; results
+  and arguments carry none.
+- **References** go over the route of their address's kind or the parent
+  link; a reference to this host's own address is refused (noel has no
+  in-host references). A call on a loading reference waits until it is
+  live.
+- **Routes** resolve an address again at once when its link drops while it
+  has holders, with no backoff; there is no `suspend` or route `retry`
+  handle. A reference's `retry` on a route failure asks the provider, as
+  for any failed hold.
+- **Relayed calls** are not counted against the downstream call window, and
+  their arguments are not checked against the part limit before they are
+  forwarded (the provider that parses them checks them).
+- **noel's refusals are plugin errors** whose code is the old reason
+  (`busy`, `session`, `cwd`, ...): v2's error table is closed. A session
+  without a journal fails a route's resolve as `unavailable` with
+  `details.missing: "session"`.
+- **Objects are keyed by canonical principal JSON**, not by a principal key
+  that ignores fields such as a guest's name.
+- **Revocation** follows upstream's `host.revoke` with a `revoked_by`
+  function, except that noel has no host principal of its own to exempt and
+  no references of its own acting for a principal.
+
+### Mode 2 Server, Worker and Client
+
+`noel server`, `noel worker` and `noel client` (`crates/noel-cli/src/server`,
+`docs/spec.md` §5–§8) follow the roles of Chord's guide (`chord/docs/guide.md`
+"Hosts and links") and take their submissions and view from Durable. Upstream
+publishes no server or client to match (its application on Chord is
+private), so the objects and processes are noel's, and these parts differ:
+
+- **Objects.** `noel.sessions`, `noel.chat`, `noel.models`, `noel.accounts`
+  and `noel.settings` are noel's
+  contracts (version 1, `crates/noel-cli/src/server/contracts/`). Upstream's
+  guide shows a `Chat` with `viewer` and `participant` variants and a
+  `Sessions` at `server` only as examples.
+- **The view** has Durable's shape `{conversation, entries, docs}`
+  (`durable/docs/spec.md` §9.3) with what noel's journal holds:
+  - `entries` are a window over the session's history in Durable's
+    `EntryRecord` shape (`{id, kind, model?, data?, head?, timestamp?}`,
+    newest 50, at most 100, `before`, paged back with `noel.chat`'s
+    `entries` method). Ids are numbers counting the session's entries, not
+    Durable's minted ids; each `model` is upstream pi's `Message` JSON, as
+    RPC mode's `get_messages` reports it (no usage). Markers are
+    `pi.compaction` (`data: {reason, summary, omittedMessages,
+    retainedMessages}`) and `pi.reset` (`data: {messages}`, an undo), each
+    with `head` at itself; a window can start at any entry, and the window
+    is not chosen by the subscriber (no `ConversationWindow` argument).
+    `noel-client`'s `Transcript` merges windows and pages; it loads what is
+    before the window when a client attaches, not gaps a long disconnect
+    leaves later;
+  - `docs["pi.agent"]` is `{model, thinkingLevel, cwd}`; Durable's stores
+    the chosen extensions, tools and instructions;
+  - `docs["pi.live"]` is a subset of Durable's v3: `run` (`runId`,
+    `requestId`, `inputs`, `turns`, where Durable names a task), `generation`
+    (`attempt`, `message`, `retry`; no deferred polls), `tools` (`callId`,
+    `name`, `status`, `output`, `truncated`, `entry`; no task ids, details,
+    diagnostics or dropped counts), `compactions` (`[{trigger}]`, one at a
+    time; no task ids, blocking, attempt or retry), `compactionFailure`
+    (`{trigger, error}`) and `runFailure` (`{reason, detail?, inputs}`, with
+    reasons `model_error` and `aborted` only), and no nested tools. A tool
+    slot can also be `interrupted`: a resumed run's call that gets its
+    interrupted result. The partial `message` is `{role, content}` only;
+  - `docs["pi.inbox"]` items are `{id, mode, content, requestId?}` with the
+    text as `content`; there are no writes;
+  - `docs["pi.usage"]` is `{total: {input, output, requests}}`: noel counts
+    a session's usage, not per model or tool. There is no `pi.provider`;
+  - `lastRun` is added: RPC mode's `get_state.lastRun`.
+- **Only committed progress.** A partial reply, a tool's output and the
+  history's entries come from the journal's own records once saved, as
+  Durable's view shows only committed state.
+- **Ops.** The worker makes ops per change: a splice at the end of
+  `entries` (and one at the start when the window moves), appends to a
+  streaming text, and diffs of the documents. Durable derives view ops from
+  document ops, folds a watch's pending commits into one call and replaces
+  the value past 10,000 pending operations; noel relies on Chord's
+  four-window reset.
+- **Submissions.** `submit`'s `whenBusy` names the submission's kind
+  (`reject` a prompt, `steer`, `followUp`). A refusal is `invalid` with a
+  reason (`busy`, Durable's `ConversationBusy`; `request_id_reused`;
+  `queued_prompt`; `refused`), never `unavailable`, so a client retries only
+  what may not have happened. A repeat answers `disposition: "repeated"` with
+  the first submission's `status`. `abort` answers once the run settled, with
+  the run and how many queued submissions it withdrew. `compact` takes no
+  `requestId` and answers counts, since noel's compaction is not a run;
+  `configure` answers the model and level in effect; `fork` takes no
+  `atMessage`.
+- **Sessions named by request.** `create` and `fork` name the new session
+  `s-` and 24 hex digits of a SHA-256 of their `requestId`, so a repeat finds
+  it after any restart without a table of requests.
+- **Processes.** A worker is a separate `noel worker` that the server dials
+  on `workers/<id>.sock` and speaks NDJSON to, where upstream's host manager
+  forks a Node child on an IPC channel and kills its process group when the
+  manager exits. A worker outlives its server, and a new server adopts the
+  workers of its build. The worker's kernel lock is its journal's lock
+  (spec §2), not a lock named for Chord. Control messages: `ready` carries
+  `pid`, `build`, `session` and `generation`; `status` carries `viewers`,
+  `running`, `queued` and `runId` (no `activeCalls` or `durableTasks`);
+  `fatal` has reason `locked` for a held journal; `shutdown` is also sent by
+  a worker as it exits.
+- **Resume.** The server resumes a session's interrupted last run whenever it
+  starts its worker (after a crash, or for the first hold after a machine
+  stopped), at most three times per run. The count lives in the server, so a
+  new server counts again.
+- **Access.** The owner's processes, by the socket's peer uid, with no token
+  (`via: "device"`), and the owner on another machine through `ssh <host> noel
+  bridge` (`via: "tunnel"`). Chord computes a principal from the upgrade
+  request; noel's comes from the peer uid plus a `Noel-Via: tunnel` header
+  that only the bridge sets for the other machine. Upstream has no ssh
+  transport: its v1.1.0 reached other machines through a hosted relay. No
+  relay, pairing or guests yet (spec §6); a guest principal would get its
+  variant, but nothing stamps one.
+- **The runtime directory** can be named by `NOEL_RUNTIME_DIR`, for tests and
+  scratch servers.
+- **`noel.models`** is the models that can run when the server starts; it is
+  not refreshed while it runs.
+
+Reason: upstream's application on Chord is private, so noel's objects carry
+what its journal and run engine hold, in Durable's shape where it can. The
+process model keeps one writer per session (the journal lock) and lets a run
+finish while no server is attached.
+
+### The TUI Is a Client of a Local Server
+
+Interactive `noel` (`crates/noel-cli/src/attach.rs`, `docs/spec.md` §7.4)
+attaches to its session through `noel server` and the session's worker, and
+`noel --attach <session-id>` is the same TUI. Upstream pi's TUI runs the
+session in its own process. noel's follows upstream p2, whose TUI is always
+a client of its server (`docs/p2-audit.md`). It keeps pi's terminal, editor,
+keys, commands and transcript, and differs here:
+
+- **Startup starts a server** when none runs, so reaching the first prompt
+  box takes longer. In a debug build with the faux provider it is about
+  185 ms instead of 70 ms; a turn's latency is unchanged
+  (`docs/client-tui-plan.md`).
+- **The runtime directory** is keyed by `NOEL_DIR`, `NOEL_SESSION_DIR`, and a
+  `HOME` other than the user's own: each set of them has its own server.
+  The defaults keep the plain path.
+- **Flags and environment.** A session's worker starts with the flags,
+  environment and cwd of the `noel` that opened it. A second `noel` with
+  other flags on a session whose worker runs keeps that worker's, and the
+  TUI says so.
+- **The queue is the session's.** Every client of a session shows the same
+  queue (`pi.inbox`), and Up on an empty draft withdraws the last queued
+  submission, whichever client queued it. `--attach`'s abort also keeps the
+  queue, as `noel`'s does; only `noel client abort` withdraws it (Mode 2's
+  rule, spec §3.3).
+- **Input is expanded by the worker,** with the session's configuration.
+  Another client's prompts show as the session saved them.
+- **`!` commands run in the worker,** without the user's terminal, so an
+  interactive program there gets no input. Ending the only client with a
+  signal stops the worker and its commands.
+- **Live output is what was saved:** a reply's partial and a tool's output
+  appear as the worker commits them (spec §4.2, at most every 100 ms), not
+  each streamed piece.
+- **Quitting.** `/quit` ends the worker only when no other client holds the
+  session. `--attach` only detaches.
+- **A run interrupted by a crash** is resumed by the server at once (spec
+  §8.3), not when `noel` next opens the session.
+- **A login through `--attach` to another machine** runs there
+  (`noel.accounts`): the TUI shows the device code or the sign-in URL, and
+  no browser opens on either machine.
+
+Reason: one code path for a session on this machine and on another, which
+only the connection tells apart (owner's decision, 2026-11-05).
+
+### Workspaces
+
+`crates/noel-env`'s `ExecutionEnv` has upstream Durable's methods, results
+and error codes, and `LocalEnv` makes the same observations as
+`NodeExecutionEnv` in every case of upstream's env conformance suite that it
+runs (`local-env.json`, at upstream `main`). These parts differ:
+
+- **No watching yet.** `LocalEnv::watch` fails with `not_supported`, so the
+  suite's nine watch cases are not run against it; the fixture records them
+  by outcome only, since their change reports vary from run to run.
+  `list_files` fails with `not_supported` too, as `NodeExecutionEnv` has no
+  `listFiles`.
+- **Id.** `LocalEnv`'s id is `local`; `NodeExecutionEnv`'s is `node:local`.
+  Ids only say which environments share files.
+- **Rust types.** Offsets, lengths, sizes and counts are unsigned integers and
+  timeouts are durations, so the negative and fractional values upstream
+  rejects at run time with `invalid` cannot be passed. The conformance port
+  passes the nearest values that are not safe integers either (above 2^53 -
+  1), which `LocalEnv` rejects with `invalid` as upstream rejects any value
+  that is not a non-negative safe integer. A zero timeout is rejected with
+  `timeout`, as upstream rejects a timeout that is not above zero.
+- **Callbacks.** An output callback fails a command by returning `Err`
+  (upstream: by throwing), which kills it and settles it with
+  `callback_error`.
+- **Additions to `exec`.** An `env` entry with no value removes an inherited
+  variable (noel's bash calls drop stale `NOEL_*` and `PI_*` values); with
+  `merge_stderr` both streams share one pipe, so output keeps its order and
+  every chunk is stdout (the bash tool uses this, as before: see Shell Tool
+  Differences); and each chunk also carries its raw bytes, so the bash tool
+  saves the exact output. A chunk whose bytes end inside a character has
+  empty text.
+- **Shell lookup.** Without a configured shell, `/bin/bash`, then `bash`
+  found on `PATH`, then `sh`; upstream runs `which bash` for the middle step.
+- **One `cleanup`.** Upstream's `FileSystem` and `Shell` each declare
+  `cleanup`, which TypeScript merges; Rust declares it once, on `Shell`.
+- **Unix only.** Upstream's Windows rules (drive-relative paths, Git Bash,
+  `taskkill`) are not ported.
+
+The tools now reach files and commands through the workspace. Their limits,
+results and error texts are unchanged, except in these corners:
+
+- `ls` lists through the workspace, which describes files, directories and
+  links only, so sockets, FIFOs and devices inside the directory are left out
+  of the listing (one named as the path is still `Not a directory`). A
+  directory that can be read but not searched (`r` without `x`) fails with
+  `Cannot read directory` instead of listing nothing.
+- `file://` paths resolve as Node's `fileURLToPath` resolves them: a query or
+  fragment is dropped, and a URL with a host other than `localhost`, an
+  encoded `/`, or an escape that is not UTF-8 is an ordinary relative path.
+- `grep` and `find` search with ripgrep's crates. In a workspace on another
+  machine they list and read through the workspace, with the differences in
+  "Remote Workspaces".
+- `edit` and `write` of one file run one at a time within noel, keyed by the
+  workspace id and the canonical path (upstream's file mutation queue). Where
+  the canonical path cannot be found for another reason than a missing file,
+  noel keys by the absolute path and lets the edit or write report the
+  failure; upstream fails the call with the lookup's error.
+
+Reason: the interface is upstream's so that the remote workspace (pi-env
+protocol 1) can follow without changing the tools. Watching waits for the
+features that need it. The additions keep the bash tool's output exactly as
+it was, and the rest are Rust's type system and noel being Unix-only.
+
+### noel-env Daemon
+
+`noel-env serve` (`crates/noel-env-daemon`) is a port of upstream's pi-env
+daemon (`packages/env/daemon`) at upstream `main` and speaks pi-env
+protocol 1 unchanged, so upstream's client and noel's can use either daemon.
+It answers upstream's client as upstream's daemon does in every recorded
+scenario of `pi-env.json`, and passes the same 78 upstream client tests
+(`make env-interop`). These parts differ:
+
+- **Name and version.** The binary is `noel-env`: `noel-env --version` prints
+  `noel-env <version>` and the usage text names `noel-env`. `hello.version`
+  is noel's version (`0.3.0`), not the npm package version upstream's daemon
+  ships with. The `PI-ENV <token>` sync line, the frames and every other
+  `hello` field are upstream's.
+- **Linux and macOS only.** Upstream's Windows paths (job objects, libuv's
+  program search, the `=C:` drive working directories, legacy WSL `bash.exe`
+  reading the command on stdin, `pty` failing with `ENOTSUP`) and its Android
+  (Termux) paths (`$PREFIX/tmp` as the temporary directory, Android's
+  unreliable file systems for watching, process names) are not ported.
+  `hello.driveCwds` is always `{}` and `hello.separator` is `/`.
+- **UTF-8 decoding.** Command output and line scans decode with noel-env's
+  `StreamDecoder` and `LineScanner` (Rust's lossy rule, which replaces
+  maximal subparts as WHATWG does) instead of `encoding_rs`, with the same
+  results. A `scanLines` range whose line numbers are above 2^53 - 1 fails
+  with `EINVAL`, as noel-env's `LineScanner` rejects them; upstream scans
+  such a range, which a JavaScript client cannot send exactly.
+- **No `process` operation.** Upstream's daemon runs long-lived programs
+  with plain pipes (`process`, `processWrite`, `processCloseStdin`, since
+  9c9ce854, and kills what such a program leaves running, 032656b6) and lists
+  `process` in `hello.features`. noel's daemon has no such operation and
+  lists only `listFiles`; its goldens leave `process` out of upstream's
+  features, and `make env-interop` does not run upstream's process suite.
+- **Build profile.** Upstream's release profile (LTO, one codegen unit,
+  stripped) is `profile.env-daemon` (`make env-daemon`), so the noel CLI's
+  release build is unchanged.
+
+The goldens compare what does not depend on the machine or on timing:
+`hello`'s description of the machine, process ids, device and inode numbers,
+modification times and the size of a directory are placeholders; `readdir`
+entries are compared by name, not in the file system's order; a request's
+`output` events are compared merged per stream, and `change` events by the
+paths they report, since how they are split depends on timing.
+
+Reason: noel ships its own daemon, versioned with noel; noel runs on Linux
+and macOS; upstream's `process` operation serves MCP servers over pi-env, and
+noel starts MCP servers on its own machine, not over noel-env (see MCP: stdio slice only); and reusing noel-env's decoder and line scanner keeps one
+implementation of each, checked against the same goldens, and one dependency
+fewer.
+
+### noel-env Client
+
+`crates/noel-env`'s `Connection`, `RemoteEnv` and `ssh` module port upstream's
+pi-env client (`packages/env/src`) at upstream `main`. Over `noel-env serve`
+`RemoteEnv` makes the observations `NodeExecutionEnv` makes in every case of
+`local-env.json` and passes upstream's watch and `listFiles` cases; it sends
+exactly the frames upstream's client sent in `pi-env.json`; its `ssh`
+invocations equal upstream's in `pi-env-ssh.json` except for the names below;
+and its tests pass against upstream's `pi-env` too (`make env-interop`). These
+parts differ:
+
+- **Connection status.** `Connection::status()` (idle, connecting,
+  connected, lost with why, closed), for the TUI's footer, is noel's;
+  upstream's connection reports nothing between requests.
+- **No terminals.** `openTerminal` and `RemoteTerminal` (`terminal.ts`) are
+  not ported, since noel's `ExecutionEnv` has no terminals; the daemon still
+  serves `pty`. Upstream's `LocalExecutionEnv` (`NodeExecutionEnv` with
+  `listFiles` through a daemon on the same machine) and `localDaemon()` are
+  not ported either: `LocalEnv::list_files` stays `not_supported`, and
+  `list_files_over` lists through any connection.
+- **noel's additions to `exec`** do not travel in protocol 1. Chunks carry no
+  raw bytes (the daemon sends decoded text; the bash tool keeps the text's
+  bytes). `merge_stderr` cannot share a pipe, so both streams arrive in
+  arrival order, each labelled with its own stream, as `ExecOptions`
+  documents. An `env` entry without a value removes only what the client
+  itself adds (`shell_env`), as upstream skips `undefined` values; a variable
+  the daemon inherited stays. Over `ssh` the daemon inherits the remote
+  login's environment (no `SendEnv`), but a daemon started on this machine
+  inherits noel's.
+- **Dropping a call.** Dropping an unsettled `exec`, `scanLines`,
+  `listFiles` or `watch` future sends `cancel`, as dropping a `LocalEnv` call
+  stops it, and dropping the last `Connection` stops the daemon as `close`
+  does; upstream has no dropped promises.
+- **POSIX remotes only.** Paths resolve with POSIX rules, and a daemon that
+  reports Windows is refused with `not_supported`; upstream applies Windows'
+  path rules and drive working directories.
+- **Rust types.** `list_files` takes a `Duration` timeout, so only whole
+  milliseconds are a valid `timeoutMs` (upstream rejects 1.5 as not a safe
+  integer); counts and lengths above 2^53 - 1 are `invalid`, as elsewhere.
+- **Oversized requests** (a frame above 16 MiB, such as a huge argv) fail
+  alone with `unknown`; upstream sends them and the daemon ends the
+  connection.
+- **JSON key order.** Requests carry the same fields, serialized in sorted
+  order rather than upstream's insertion order (`op` last); the daemon reads
+  fields by name, and the goldens compare objects by field.
+- **Text decoding.** Whole-file text reads decode once at the end with
+  Rust's lossy rule rather than with Node's `StringDecoder` chunk by chunk,
+  with the same text; the requests are upstream's.
+- **SSH: Linux and macOS only.** Upstream's PowerShell detection, upload and
+  launch for Windows are not ported: a Git Bash, MSYS or Cygwin shell is
+  refused, and a failed POSIX probe is reported as is (upstream tries
+  PowerShell next). Android (Termux) is refused rather than deployed to with
+  warnings.
+- **SSH: names.** The daemons to upload are `noel-env-<platform>-<arch>`
+  files in a directory (an option, else `NOEL_ENV_DAEMON_DIR`, else beside
+  the running executable), where upstream ships
+  `bin/pi-env-<platform>-<arch>/pi-env` in its package. On the remote machine
+  the daemon is `~/.cache/noel-env/noel-env-<SHA-256 prefix>`, not
+  `~/.pi/mobile/tools/pi-env-<SHA-256 prefix>`; its temporary file is
+  `.noel-env.XXXXXX`, and the corrupt-upload message names `noel-env`. The
+  probe (with its `PI-ENV-PROBE` marker), the hash function and every other
+  part of the commands are upstream's, byte for byte.
+- **Known hosts.** Changes to known-hosts files wait for each other across
+  all files, not per file.
+
+The conformance comparison over `RemoteEnv` does not count the windowed exec
+case's skip checks: that case asserts once per skip, the recording's
+`NodeExecutionEnv` never skips, and the daemon skips as timing allows; each
+check must pass. The SSH goldens are made through a stand-in for `ssh`, not a
+server: upstream's `ssh.test.ts` starts a disposable `sshd`.
+
+Reason: noel's `ExecutionEnv` has no terminals and noel runs on Linux and
+macOS, so the client covers what noel's interface has and the systems it
+runs on. The protocol is upstream's unchanged, so noel's additions to `exec`
+stay local. The daemon lives outside `~/.noel` because noel imports pi's
+state only where `~/.noel` does not exist, so a deployment must not create it
+on a machine that has `~/.pi/agent`; a cache directory fits a
+content-addressed file that is put back whenever it is missing or changed.
+
+### Remote Workspaces
+
+A session can run its tools in a directory on another machine over `ssh`
+(`--workspace ssh://…`, `noel.sessions.create`'s `workspace`; `docs/spec.md`
+§10). Upstream's harness has the hook (Durable's `env(target)`) and its
+container example keeps a conversation's workspace with the conversation, but
+no coding-agent command line chooses a remote workspace, so the selection,
+trust and tool behaviour are noel's. They differ from upstream, and from a
+local workspace, in these parts:
+
+- **Selection is per session, by URL.** One adapter, `ssh`; the URL is saved
+  in the journal as a `workspace` record and cannot change for a session.
+  Older noel versions ignore the record and would run such a session's tools
+  on the local machine.
+- **The id is the machine.** `ssh://host[:port]`, without user or path, so
+  two sessions on one machine wait for each other's `edit` and `write` of the
+  same file; another name for the same machine (an alias, an address) is
+  another id.
+- **Trust is noel's own.** Keys live in `~/.noel/workspaces/known_hosts`
+  under `noel-env-<host>` (`noel-env-[<host>]:<port>` with a port), added
+  only by `noel workspace trust` after a fingerprint check, never on first
+  use; `ssh` still reads `~/.ssh/config`, keys and the agent to log in.
+- **`grep` and `find` list with the daemon.** Its `listFiles` walks with the
+  `ignore` crate like noel's local walk, but never lists `.git` (local `grep`
+  searches `.git/` like any hidden directory), reads only git's ignore rules
+  and only inside a git work tree (local `grep` also reads `.ignore` and
+  `.rgignore`; local `find` reads `.ignore` and `.fdignore`, and `.gitignore`
+  outside a repository too), and stops at 50 000 entries, 4 MiB or 10 s, which
+  the result then says. A `glob` filters the listing, so it cannot bring back
+  a file git ignores, as `rg --glob` can. `grep` reads every listed file
+  through the workspace, 16 at a time, whole, as the local one does.
+- **`bash`'s output** arrives per stream in arrival order (protocol 1 has no
+  merged pipe; see "noel-env Client"), and its complete output, past the
+  limits, is kept in the workspace's temporary directory, as Durable's bash
+  tool keeps it, rather than on this machine.
+- **A lost connection fails the call in flight** with `pi-env connection
+  lost`; for `bash`, `edit` and `write` the outcome is then unknown. The next
+  call starts a new daemon. The `shellPath` setting, a path on this machine,
+  does not apply: the daemon picks its shell.
+- **The system prompt** states the workspace's directory, and lists the
+  project's context files read from it (from the directory up to `/`, once
+  per process, again after `/reload`) after the user's own from the agent
+  dir. The local rule that a linked worktree's file replaces its main
+  checkout's is not applied there. Skills are not listed, since the model's
+  `read` cannot reach their files on this machine; `/skill:<name>` still
+  expands here.
+- **This machine's, not the workspace's:** settings and `.noel/`,
+  extensions (an extension tool runs here, in the session's local
+  directory), skills, prompt templates and themes, `@file` references, path
+  completion, images given with `--image`, and `/diff`, whose `git` runs here
+  and so shows no changes for files edited there.
+- **The footer** shows the workspace's URL and connection state in place of
+  the directory. The TUI attached to a server session and `noel client watch`
+  show neither; `noel client ls` shows the URL.
+- **Daemons.** Linux x86-64 and arm64 (`make env-daemons`); a macOS remote
+  fails its tool calls until a Mac-built daemon is put beside `noel`.
+
+Reason: a remote workspace changes only where tools run. Anything that would
+configure or execute noel itself stays on the machine noel runs on, so a
+remote directory can never make noel load code; and trust is an explicit,
+checked step because the agent will run commands there.

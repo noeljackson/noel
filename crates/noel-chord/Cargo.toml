@@ -1,0 +1,25 @@
+[package]
+name = "noel-chord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chord v2 for noel: contracts, messages and the binary codec, channels, hosts with routes and relays, transports, the Delta op codec and canonical JSON"
+
+[dependencies]
+tracing.workspace = true
+flate2 = "=1.1.9"
+getrandom.workspace = true
+futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "io-util"] }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+regex = "=1.12.3"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+libc = "=0.2.186"
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "test-util"] }
+
+[lints]
+workspace = true

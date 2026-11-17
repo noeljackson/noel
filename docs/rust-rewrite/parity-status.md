@@ -31,6 +31,36 @@ The committed TypeScript parity fixtures are:
 - `bedrock-claude-opus-4.6.json`: Bedrock Claude Converse payload shape.
 - `bedrock-tools.json`: Bedrock Claude Converse payload shape with
   model-callable tools.
+- `chord-delta.json`: upstream Chord's delta ops, recorded from
+  `packages/chord` at `main`. Streams of op batches through one `encoder()`
+  and `decoder()`, with the exact wire tuples, the decoded ops and each value
+  after `applyImmutable`; wire batches the decoder rejects; `applyImmutable`
+  results and errors; `diffRevisions` cases, by their result only; vectors of
+  `canonicalJson` with non-ASCII and astral text, `-0`, large and small
+  numbers and control characters. (Chord v1's `hash64` and contract sections
+  went with v1: noel speaks Chord v2, whose contracts `chord-v2-contracts.json`
+  covers.)
+- `codemode-declarations.json`: every call upstream's
+  `packages/codemode/test/declarations.test.ts` makes to `schemaToType`,
+  `renderToolSignature`, `renderToolSample` and `renderDeclarations`, plus
+  noel's own cases. `noel-codemode`'s `declarations` matches each byte for
+  byte (`crates/noel-codemode/src/declarations.rs`).
+- `tool-search.json`: upstream's tool-search `tokenize`, search documents
+  and BM25 rankings on the cases of its `tool-search.test.ts`.
+  `noel-codemode`'s `search` matches them, except dictionary-segmented
+  scripts (`crates/noel-codemode/src/search.rs`).
+- `chord-v2-contracts.json`: Chord v2's `hash64` and the fingerprints of
+  contracts as upstream's `remote()` declares them at `CHORD2_REFERENCE_REF`
+  (noel's three v2 contracts, upstream's pinned `notes`, normal-form edge
+  cases). `noel-chord`'s `v2::contract` matches every fingerprint
+  (`crates/noel-chord/tests/chord_v2_contracts.rs`).
+- `chord-v2-messages.json`: every Chord v2 message kind in upstream's JSON
+  form and binary encoding at `CHORD2_REFERENCE_REF`, plus decode errors.
+  `noel-chord`'s `v2::message` and `v2::binary` round-trip each message
+  byte for byte (`crates/noel-chord/tests/chord_v2_messages.rs`). Its
+  `checks` hold upstream's `checkMessage` verdicts on decoded messages, and
+  its `envelopes` what `chordErrorFromJson` makes of ChordError envelopes;
+  `v2::check` and `v2::error` give the same.
 - `cli-contract.json`: upstream CLI option and command contract.
 - `cloudflare-ai-gateway-kimi.json`: Cloudflare AI Gateway OpenAI-compatible
   request shape.
@@ -39,11 +69,21 @@ The committed TypeScript parity fixtures are:
   `isContextOverflow`, and both verdicts for 124 error messages (HTTP
   statuses and bodies as noel words them, the overflow errors of each provider,
   transport failures, and quota and billing limits).
-- `github-copilot-gpt-5.4.json`: GitHub Copilot Responses request shape.
+- `github-copilot-gpt-6.1-sol.json`: GitHub Copilot Responses request shape.
 - `google-gemini-2.5-pro.json`: Gemini request shape and thinking config.
 - `google-tool-image-routing.json`: Gemini 2 versus Gemini 3 tool-result
   image routing.
 - `google-tools.json`: Gemini request shape with model-callable tools.
+- `local-env.json`: upstream Durable's env conformance cases
+  (`packages/durable/src/testing/env-conformance.ts`) run against
+  `NodeExecutionEnv`, recorded from the same pinned commit as Chord's goldens:
+  every assertion each case makes, in order, with its actual and expected
+  values (byte ranges and line scans of a binary reader, directory pages,
+  exec output per stream, exit codes, and the error codes of refused calls),
+  the case's directory and modification times as placeholders. Watch cases
+  record only their outcome, since their change reports vary from run to run.
+  `crates/noel-env/tests/local_env_conformance.rs` runs the same cases against
+  `LocalEnv` and compares every assertion.
 - `local-tools.json`: built-in local tool inventory (names, labels, prompt
   snippets, parameter names). Rust checks only that every upstream tool is
   present; `tool-behavior.json` covers what the tools do.
@@ -85,6 +125,28 @@ The committed TypeScript parity fixtures are:
 - `openai-responses-tools.json`: OpenAI Responses request shape with function
   tools.
 - `openrouter-kimi.json`: OpenRouter OpenAI-compatible request shape.
+- `pi-env.json`: upstream pi-env's client (`Connection`, `RemoteExecutionEnv`,
+  `openTerminal`) driving upstream's own daemon, both from the same pinned
+  commit as Chord's goldens, through a tap that records the frames both ways:
+  `hello`, file operations and handles, `listFiles`, `exec` with output,
+  cancel, kill and timeout, `pty`, `watch`, pings, and the errors of refused
+  calls. Machine fields, process ids, file identities and times are
+  placeholders; output is merged per stream.
+  `crates/noel-env-daemon/tests/pi_env_golden.rs` sends the client's frames to
+  `noel-env serve` and compares its answers;
+  `crates/noel-env-daemon/tests/pi_env_client_golden.rs` runs the scenarios
+  (all but `pty`) with noel's `RemoteEnv` and compares the frames it sends.
+  `make env-interop` runs upstream's client tests against `noel-env serve`,
+  and noel's client tests against upstream's `pi-env`.
+- `pi-env-ssh.json`: upstream pi-env's SSH deployment (`ssh.ts`) through a
+  stand-in for `ssh` (`scripts/ts-parity/fake-ssh.sh`) that runs the remote
+  commands in a scratch home: `sshArguments` for two targets, and every
+  `ssh` invocation of scanning a host key, `connectSsh` deploying and
+  finding the daemon, starting it plainly and through the login shell, and
+  `sshConnection`'s first request. The scratch directory, the daemon's
+  SHA-256 and the token are placeholders.
+  `crates/noel-env-daemon/tests/ssh_deploy.rs` drives noel's port through the
+  same stand-in; the invocations differ only by the daemon's names.
 - `rpc-protocol.json`: upstream `pi --mode rpc` stdout records, in order, for
   scripted runs against a local OpenAI-compatible stub: a text prompt, a tool
   round, steer, follow_up, abort (also with queued messages), prompts while
@@ -228,8 +290,9 @@ pass an explicit prompt, and the RPC goldens record messages without it.
   `steer`, and `follow_up` with a skill given by `--skill`
   (`skills_and_templates_expand_in_prompt_steer_and_follow_up`), print mode
   (`print_mode_expands_skills_and_templates_and_honors_the_resource_flags`),
-  and the TUI (`typed_prompts_expand_skills_and_templates`,
-  `streaming_input_expands_templates_into_the_queues`). Another RPC test has
+  and the TUI, whose input the session's worker expands
+  (`typed_prompts_expand_skills_and_templates`,
+  `the_worker_expands_templates_in_prompts_and_queued_follow_ups`). Another RPC test has
   the model `read` the listed file of a skill given from outside the working
   directory (`the_model_reads_a_skill_from_outside_the_working_directory`).
 
@@ -251,6 +314,8 @@ cargo test -p noel-core --lib tool_parity_tests
 cargo test -p noel-config --lib _ts
 cargo test -p noel-core --lib input_expansion_matches_ts_session
 cargo test -p noel-cli --test rpc_parity
+cargo test -p noel-chord
+cargo test -p noel-env
 make check
 make ts-parity-drift
 ```

@@ -1,0 +1,21 @@
+# XcodeGen: `xcodegen` makes Noel.xcodeproj (run by `make ios`).
+name: Noel
+options:
+  bundleIdPrefix: com.noeljackson
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  NoelKit:
+    path: .
+targets:
+  Noel:
+    type: application
+    platform: iOS
+    sources: [App]
+    dependencies:
+      - package: NoelKit
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: noel
+        UILaunchScreen: {}

@@ -27,14 +27,14 @@
       "id": "zai-anthropic",
       "name": "Z.AI Anthropic API",
       "models": [
-        {"id":"glm-5.1","name":"GLM 5.1 Anthropic API","api":"anthropic-messages","provider":"zai-anthropic","baseUrl":"https://api.z.ai/api/anthropic","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":202752,"maxTokens":16384}
+        {"id":"glm-5.1","name":"GLM 5.1 Anthropic API","api":"anthropic-messages","provider":"zai-anthropic","baseUrl":"https://api.z.ai/api/anthropic","reasoning":false,"input":["text","image"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":202752,"maxTokens":16384}
       ]
     },
     {
       "id": "kimi-coding-openai",
       "name": "Kimi For Coding (OpenAI API)",
       "models": [
-        {"id":"kimi-for-coding","name":"Kimi For Coding (OpenAI API)","api":"openai-completions","provider":"kimi-coding-openai","baseUrl":"https://api.kimi.com/coding/v1","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":262144,"maxTokens":32768}
+        {"id":"kimi-for-coding","name":"Kimi For Coding (OpenAI API)","api":"openai-completions","provider":"kimi-coding-openai","baseUrl":"https://api.kimi.com/coding/v1","reasoning":false,"input":["text","image"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":262144,"maxTokens":32768}
       ]
     }
   ]

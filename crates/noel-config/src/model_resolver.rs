@@ -4,6 +4,7 @@
 //! credentials; `model-resolution.json` holds upstream's answers.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use noel_ai::catalog::{default_models, thinking_level};
 use noel_ai::ModelRef;
@@ -26,17 +27,86 @@ pub struct ModelScope {
     pub diagnostics: Vec<String>,
 }
 
-/// What `--model` (with `--provider` and `--thinking`) resolves to.
+/// What `--model` (with `--provider` and `--thinking`) resolves to (#155:
+/// one case, not fields whose combinations only construction kept apart).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CliModel {
-    /// The model, when there is no `error`. With `custom` it is not one of
-    /// the known models: its id was built onto the provider's default model.
-    pub model: Option<ModelDefinition>,
-    pub custom: bool,
-    /// The level a `:<thinking>` suffix named.
-    pub thinking_level: Option<&'static str>,
-    pub warning: Option<String>,
-    pub error: Option<String>,
+pub enum CliModel {
+    /// No `--model`.
+    #[default]
+    Empty,
+    /// One of the known models; `thinking_level` is the level a
+    /// `:<thinking>` suffix named.
+    Found {
+        model: ModelDefinition,
+        thinking_level: Option<&'static str>,
+        warning: Option<String>,
+    },
+    /// Not one of the known models: its id was built onto the provider's
+    /// default model, which the warning says.
+    Custom {
+        model: ModelDefinition,
+        thinking_level: Option<&'static str>,
+        warning: String,
+    },
+    /// Nothing it names; upstream prints a pattern's warning before the
+    /// error.
+    Error {
+        message: String,
+        warning: Option<String>,
+    },
+}
+
+impl CliModel {
+    fn found(model: &ModelDefinition) -> Self {
+        Self::Found {
+            model: model.clone(),
+            thinking_level: None,
+            warning: None,
+        }
+    }
+
+    fn failed(message: String) -> Self {
+        Self::Error {
+            message,
+            warning: None,
+        }
+    }
+
+    /// The model, found or custom.
+    pub fn model(&self) -> Option<&ModelDefinition> {
+        match self {
+            Self::Found { model, .. } | Self::Custom { model, .. } => Some(model),
+            Self::Empty | Self::Error { .. } => None,
+        }
+    }
+
+    pub fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom { .. })
+    }
+
+    pub fn thinking_level(&self) -> Option<&'static str> {
+        match self {
+            Self::Found { thinking_level, .. } | Self::Custom { thinking_level, .. } => {
+                *thinking_level
+            }
+            Self::Empty | Self::Error { .. } => None,
+        }
+    }
+
+    pub fn warning(&self) -> Option<&str> {
+        match self {
+            Self::Found { warning, .. } | Self::Error { warning, .. } => warning.as_deref(),
+            Self::Custom { warning, .. } => Some(warning),
+            Self::Empty => None,
+        }
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            Self::Error { message, .. } => Some(message),
+            _ => None,
+        }
+    }
 }
 
 /// Upstream `isAlias`: an id without a `-YYYYMMDD` date suffix, or one
@@ -111,12 +181,13 @@ pub fn find_exact_model_reference_match<'a>(
 fn try_match_model<'a>(
     pattern: &str,
     models: &[&'a ModelDefinition],
+    usable: &dyn Fn(&str) -> bool,
 ) -> Option<&'a ModelDefinition> {
     if let Some(exact) = find_exact_model_reference_match(pattern, models) {
         return Some(exact);
     }
     let needle = pattern.to_lowercase();
-    let matches = models
+    let mut matches = models
         .iter()
         .copied()
         .filter(|model| {
@@ -127,6 +198,24 @@ fn try_match_model<'a>(
                     .is_some_and(|name| name.to_lowercase().contains(&needle))
         })
         .collect::<Vec<_>>();
+    // Upstream `selectFuzzy`: when the fuzzy matches span several
+    // providers, only the usable (authenticated) ones compete, so a
+    // credential picks the provider and never leaves the choice to
+    // catalog order.
+    let providers = matches
+        .iter()
+        .map(|model| model.provider.as_str())
+        .collect::<BTreeSet<_>>();
+    if providers.len() > 1 {
+        let usable_matches = matches
+            .iter()
+            .copied()
+            .filter(|model| usable(&model.provider))
+            .collect::<Vec<_>>();
+        if !usable_matches.is_empty() {
+            matches = usable_matches;
+        }
+    }
     // The id that sorts last; of ids that sort alike, the first in catalog
     // order (upstream's sort is stable).
     let highest = |alias: bool| {
@@ -151,6 +240,21 @@ struct ParsedModel<'a> {
     warning: Option<String>,
 }
 
+/// `pattern` without its `:<thinking>` suffix, when it has one.
+fn without_thinking_suffix(pattern: &str) -> &str {
+    match pattern.rsplit_once(':') {
+        Some((base, suffix)) if thinking_level(suffix).is_some() => base,
+        _ => pattern,
+    }
+}
+
+/// The `:<thinking>` suffix of `pattern`, when it has one.
+fn thinking_level_of(pattern: &str) -> Option<&'static str> {
+    pattern
+        .rsplit_once(':')
+        .and_then(|(_, suffix)| thinking_level(suffix))
+}
+
 /// Upstream `parseModelPattern`: the pattern as a model, else with its
 /// last `:suffix` taken as a thinking level. Model ids may contain colons,
 /// so the whole pattern is tried first. With `lenient`, a suffix that is
@@ -160,13 +264,14 @@ fn parse_model_pattern<'a>(
     pattern: &str,
     models: &[&'a ModelDefinition],
     lenient: bool,
+    usable: &dyn Fn(&str) -> bool,
 ) -> ParsedModel<'a> {
     let unmatched = || ParsedModel {
         model: None,
         thinking_level: None,
         warning: None,
     };
-    if let Some(model) = try_match_model(pattern, models) {
+    if let Some(model) = try_match_model(pattern, models, usable) {
         return ParsedModel {
             model: Some(model),
             thinking_level: None,
@@ -177,7 +282,7 @@ fn parse_model_pattern<'a>(
         return unmatched();
     };
     if let Some(level) = thinking_level(suffix) {
-        let parsed = parse_model_pattern(prefix, models, lenient);
+        let parsed = parse_model_pattern(prefix, models, lenient, usable);
         // The level counts only if nothing further in was dropped.
         let thinking_level = (parsed.model.is_some() && parsed.warning.is_none()).then_some(level);
         return ParsedModel {
@@ -188,7 +293,7 @@ fn parse_model_pattern<'a>(
     if !lenient {
         return unmatched();
     }
-    let parsed = parse_model_pattern(prefix, models, lenient);
+    let parsed = parse_model_pattern(prefix, models, lenient, usable);
     if parsed.model.is_none() {
         return parsed;
     }
@@ -243,7 +348,39 @@ pub fn resolve_model_scope(patterns: &[String], available: &[&ModelDefinition]) 
             }
             continue;
         }
-        let parsed = parse_model_pattern(pattern, available, true);
+        // Scope resolution counts every model usable (upstream passes
+        // `() => true`): credentials cannot choose between providers
+        // offering the same id. An exact id several providers have adds
+        // them all, with a warning to pick one with `provider/id`
+        // (upstream's `selectReference` ambiguous branch); a fuzzy match
+        // keeps upstream's own tie rule.
+        let base = without_thinking_suffix(pattern);
+        let exact = available
+            .iter()
+            .copied()
+            .filter(|model| {
+                let lower = base.to_lowercase();
+                model.id.to_lowercase() == lower
+                    || format!("{}/{}", model.provider, model.id).to_lowercase() == lower
+            })
+            .collect::<Vec<_>>();
+        let providers = exact
+            .iter()
+            .map(|model| model.provider.as_str())
+            .collect::<BTreeSet<_>>();
+        if exact.len() > 1 && providers.len() > 1 {
+            let mut names = providers.into_iter().collect::<Vec<_>>();
+            names.sort_by(|left, right| locale_compare(left, right));
+            scope.diagnostics.push(format!(
+                "Pattern \"{pattern}\" matches several providers: {}. Use provider/id to choose one.",
+                names.join(", ")
+            ));
+            for model in exact {
+                add(&mut scope, model, thinking_level_of(pattern));
+            }
+            continue;
+        }
+        let parsed = parse_model_pattern(pattern, available, true, &|_| true);
         scope.diagnostics.extend(parsed.warning);
         match parsed.model {
             Some(model) => add(&mut scope, model, parsed.thinking_level),
@@ -274,6 +411,24 @@ pub fn custom_model(
     })
 }
 
+/// Where the provider of `--model` came from: `--provider`, a known
+/// provider's `name/` prefix, or nowhere.
+#[derive(Clone, Copy)]
+enum ProviderHint<'a> {
+    None,
+    Explicit(&'a str),
+    Inferred(&'a str),
+}
+
+impl<'a> ProviderHint<'a> {
+    fn provider(self) -> Option<&'a str> {
+        match self {
+            Self::Explicit(provider) | Self::Inferred(provider) => Some(provider),
+            Self::None => None,
+        }
+    }
+}
+
 /// Upstream `resolveCliModel`: the model `--model` names, among all models
 /// (not only those with credentials, so `--api-key` works on first use).
 ///
@@ -290,16 +445,10 @@ pub fn resolve_cli_model(
     has_auth: &dyn Fn(&str) -> bool,
 ) -> CliModel {
     if cli_model.is_empty() {
-        return CliModel::default();
+        return CliModel::Empty;
     }
-    let error = |error: String| CliModel {
-        error: Some(error),
-        ..CliModel::default()
-    };
-    let found = |model: &ModelDefinition| CliModel {
-        model: Some(model.clone()),
-        ..CliModel::default()
-    };
+    let error = CliModel::failed;
+    let found = CliModel::found;
     if models.is_empty() {
         return error(
             "No models available. Check your installation or add models to models.json."
@@ -322,31 +471,32 @@ pub fn resolve_cli_model(
             || format!("{}/{}", model.provider, model.id).to_lowercase() == lower
     };
 
-    let mut provider = match cli_provider {
+    let mut pattern = cli_model;
+    let hint = match cli_provider {
         Some(name) => match canonical_provider(name) {
-            Some(provider) => Some(provider),
+            Some(provider) => ProviderHint::Explicit(provider),
             None => {
                 return error(format!(
                 "Unknown provider \"{name}\". Use --list-models to see available providers/models."
             ))
             }
         },
-        None => None,
+        None => match cli_model.split_once('/') {
+            Some((prefix, rest)) => match canonical_provider(prefix) {
+                Some(provider) => {
+                    pattern = rest;
+                    ProviderHint::Inferred(provider)
+                }
+                None => ProviderHint::None,
+            },
+            None => ProviderHint::None,
+        },
     };
-    let mut pattern = cli_model;
-    let mut inferred_provider = false;
-    if provider.is_none() {
-        if let Some((prefix, rest)) = cli_model.split_once('/') {
-            if let Some(canonical) = canonical_provider(prefix) {
-                provider = Some(canonical);
-                pattern = rest;
-                inferred_provider = true;
-            }
-        }
-    }
+    let provider = hint.provider();
+    let inferred_provider = matches!(hint, ProviderHint::Inferred(_));
     // No provider: an exact id or `provider/id`. Several providers may have
     // the id; only credentials can choose between them.
-    if provider.is_none() {
+    if let ProviderHint::None = hint {
         let exact = all.iter().copied().filter(is_exact).collect::<Vec<_>>();
         if let [model] = exact[..] {
             return found(model);
@@ -376,7 +526,7 @@ pub fn resolve_cli_model(
             ));
         }
     }
-    if let (Some(_), Some(provider)) = (cli_provider, provider) {
+    if let ProviderHint::Explicit(provider) = hint {
         // `--provider p --model p/pattern` is tolerated.
         let prefix = format!("{provider}/");
         if cli_model
@@ -392,7 +542,7 @@ pub fn resolve_cli_model(
         .copied()
         .filter(|model| provider.is_none_or(|provider| model.provider == provider))
         .collect::<Vec<_>>();
-    let parsed = parse_model_pattern(pattern, &candidates, false);
+    let parsed = parse_model_pattern(pattern, &candidates, false, has_auth);
     if let Some(model) = parsed.model {
         // The provider reading matched a provider without credentials: an
         // id that literally starts with that provider's name, at the one
@@ -409,12 +559,10 @@ pub fn resolve_cli_model(
                 return found(other);
             }
         }
-        return CliModel {
-            model: Some(model.clone()),
-            custom: false,
+        return CliModel::Found {
+            model: model.clone(),
             thinking_level: parsed.thinking_level,
             warning: parsed.warning,
-            error: None,
         };
     }
     // Nothing under the inferred provider: the whole text may be an id
@@ -423,14 +571,12 @@ pub fn resolve_cli_model(
         if let Some(model) = all.iter().copied().find(is_exact) {
             return found(model);
         }
-        let fallback = parse_model_pattern(cli_model, &all, false);
+        let fallback = parse_model_pattern(cli_model, &all, false, has_auth);
         if let Some(model) = fallback.model {
-            return CliModel {
-                model: Some(model.clone()),
-                custom: false,
+            return CliModel::Found {
+                model: model.clone(),
                 thinking_level: fallback.thinking_level,
                 warning: fallback.warning,
-                error: None,
             };
         }
     }
@@ -453,15 +599,13 @@ pub fn resolve_cli_model(
             let not_found = format!(
                 "Model \"{id}\" not found for provider \"{provider}\". Using custom model id."
             );
-            return CliModel {
-                model: Some(model),
-                custom: true,
+            return CliModel::Custom {
+                model,
                 thinking_level: suffix_level,
-                warning: Some(match parsed.warning {
+                warning: match parsed.warning {
                     Some(warning) => format!("{warning} {not_found}"),
                     None => not_found,
-                }),
-                error: None,
+                },
             };
         }
     }
@@ -469,11 +613,11 @@ pub fn resolve_cli_model(
         Some(provider) => format!("{provider}/{pattern}"),
         None => cli_model.to_string(),
     };
-    CliModel {
-        warning: parsed.warning,
-        ..error(format!(
+    CliModel::Error {
+        message: format!(
             "Model \"{display}\" not found. Use --list-models to see available models."
-        ))
+        ),
+        warning: parsed.warning,
     }
 }
 
@@ -809,13 +953,13 @@ mod tests {
                 &|provider| authenticated.iter().any(|name| name == provider),
             );
             let mut actual = json!({
-                "model": model_ref(resolved.model.as_ref()),
-                "thinkingLevel": resolved.thinking_level,
-                "warning": resolved.warning,
-                "error": resolved.error,
+                "model": model_ref(resolved.model()),
+                "thinkingLevel": resolved.thinking_level(),
+                "warning": resolved.warning(),
+                "error": resolved.error(),
             });
-            if resolved.custom {
-                actual["custom"] = model_fields(resolved.model.as_ref().expect("custom model"));
+            if resolved.is_custom() {
+                actual["custom"] = model_fields(resolved.model().expect("custom model"));
             }
             assert_eq!(actual, case["expected"], "{input}");
         }

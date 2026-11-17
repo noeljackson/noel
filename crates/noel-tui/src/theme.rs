@@ -17,6 +17,40 @@ pub struct ThemePalette {
     pub success: Color,
     pub warning: Color,
     pub error: Color,
+    /// The extended roles, from upstream's ~60-token set (#212):
+    /// `Color::Reset` means "fall back to the base role" everywhere,
+    /// so a palette that sets none of them renders exactly as before.
+    /// The thinking gradient, `thinking_off` (faintest) to
+    /// `thinking_max` (hottest), colors the thinking entries' label by
+    /// the session's level.
+    pub thinking_off: Color,
+    pub thinking_minimal: Color,
+    pub thinking_low: Color,
+    pub thinking_medium: Color,
+    pub thinking_high: Color,
+    pub thinking_xhigh: Color,
+    pub thinking_max: Color,
+    /// The tool rows' status tints (upstream toolPendingBg/Success/Error).
+    pub tool_pending_bg: Color,
+    pub tool_success_bg: Color,
+    pub tool_error_bg: Color,
+    /// Diff lines (upstream toolDiffAdded/Removed/Context).
+    pub diff_added: Color,
+    pub diff_removed: Color,
+    pub diff_context: Color,
+    /// Markdown emphasis (upstream mdHeading/mdLink/mdCode/mdQuote).
+    pub md_heading: Color,
+    pub md_link: Color,
+    pub md_code: Color,
+    pub md_quote: Color,
+}
+
+/// A tool row's phase, for its status tint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPhase {
+    Pending,
+    Success,
+    Error,
 }
 
 impl Default for ThemePalette {
@@ -31,11 +65,126 @@ impl Default for ThemePalette {
             success: Color::Green,
             warning: Color::Yellow,
             error: Color::Red,
+            thinking_off: Color::Reset,
+            thinking_minimal: Color::Reset,
+            thinking_low: Color::Reset,
+            thinking_medium: Color::Reset,
+            thinking_high: Color::Reset,
+            thinking_xhigh: Color::Reset,
+            thinking_max: Color::Reset,
+            tool_pending_bg: Color::Reset,
+            tool_success_bg: Color::Reset,
+            tool_error_bg: Color::Reset,
+            diff_added: Color::Reset,
+            diff_removed: Color::Reset,
+            diff_context: Color::Reset,
+            md_heading: Color::Reset,
+            md_link: Color::Reset,
+            md_code: Color::Reset,
+            md_quote: Color::Reset,
         }
     }
 }
 
 impl ThemePalette {
+    /// The mutable slot for a role name: every palette role, extended
+    /// ones included, so theme JSON can override any of them.
+    pub fn role_mut(&mut self, role: &str) -> Option<&mut Color> {
+        Some(match role {
+            "foreground" => &mut self.foreground,
+            "background" => &mut self.background,
+            "surface" => &mut self.surface,
+            "muted" => &mut self.muted,
+            "border" => &mut self.border,
+            "accent" => &mut self.accent,
+            "success" => &mut self.success,
+            "warning" => &mut self.warning,
+            "error" => &mut self.error,
+            "thinkingOff" => &mut self.thinking_off,
+            "thinkingMinimal" => &mut self.thinking_minimal,
+            "thinkingLow" => &mut self.thinking_low,
+            "thinkingMedium" => &mut self.thinking_medium,
+            "thinkingHigh" => &mut self.thinking_high,
+            "thinkingXhigh" => &mut self.thinking_xhigh,
+            "thinkingMax" => &mut self.thinking_max,
+            "toolPendingBg" => &mut self.tool_pending_bg,
+            "toolSuccessBg" => &mut self.tool_success_bg,
+            "toolErrorBg" => &mut self.tool_error_bg,
+            "diffAdded" => &mut self.diff_added,
+            "diffRemoved" => &mut self.diff_removed,
+            "diffContext" => &mut self.diff_context,
+            "mdHeading" => &mut self.md_heading,
+            "mdLink" => &mut self.md_link,
+            "mdCode" => &mut self.md_code,
+            "mdQuote" => &mut self.md_quote,
+            _ => return None,
+        })
+    }
+
+    /// A color, or `fallback` when the role is unset.
+    fn or(self, color: Color, fallback: Color) -> Color {
+        if color != Color::Reset {
+            color
+        } else {
+            fallback
+        }
+    }
+
+    /// The thinking label's color at a level name, upstream's
+    /// thinkingOff..Max gradient falling back to `muted`.
+    pub fn thinking(self, level: &str) -> Color {
+        let gradient = match level.to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" => self.thinking_off,
+            "minimal" | "min" => self.thinking_minimal,
+            "low" => self.thinking_low,
+            "medium" | "med" => self.thinking_medium,
+            "high" => self.thinking_high,
+            "xhigh" | "extra-high" => self.thinking_xhigh,
+            "max" => self.thinking_max,
+            _ => Color::Reset,
+        };
+        self.or(gradient, self.muted)
+    }
+
+    /// The tool status tint for a phase, falling back to transparent
+    /// (the terminal background): pending is muted, success and error
+    /// reuse their base roles only as text colors elsewhere.
+    pub fn tool_bg(self, phase: ToolPhase) -> Color {
+        match phase {
+            ToolPhase::Pending => self.or(self.tool_pending_bg, Color::Reset),
+            ToolPhase::Success => self.or(self.tool_success_bg, Color::Reset),
+            ToolPhase::Error => self.or(self.tool_error_bg, Color::Reset),
+        }
+    }
+
+    pub fn diff_added(self) -> Color {
+        self.or(self.diff_added, self.success)
+    }
+
+    pub fn diff_removed(self) -> Color {
+        self.or(self.diff_removed, self.error)
+    }
+
+    pub fn diff_context(self) -> Color {
+        self.or(self.diff_context, self.muted)
+    }
+
+    pub fn md_heading(self) -> Color {
+        self.or(self.md_heading, self.accent)
+    }
+
+    pub fn md_link(self) -> Color {
+        self.or(self.md_link, self.accent)
+    }
+
+    pub fn md_code(self) -> Color {
+        self.or(self.md_code, self.accent)
+    }
+
+    pub fn md_quote(self) -> Color {
+        self.or(self.md_quote, self.muted)
+    }
+
     pub fn base(self) -> Style {
         Style::default().fg(self.foreground).bg(self.background)
     }
@@ -74,31 +223,74 @@ impl TerminalTheme {
         let name = if name == "default" { "system" } else { name };
         let palette = match name {
             "system" => ThemePalette::default(),
+            // Upstream pi's dark.json/light.json, authored in okhsl and
+            // converted to sRGB: violet accents, blue borders, muted grays
+            // with a slight hue. Roles without an upstream token keep the
+            // nearest one: surface is upstream's selectedBg panel tint.
             "light" | "kimi" => ThemePalette {
-                foreground: Color::Rgb(0x24, 0x29, 0x32),
-                background: Color::Rgb(0xFA, 0xFA, 0xF9),
-                surface: Color::Rgb(0xF0, 0xF1, 0xF3),
-                muted: Color::Rgb(0x60, 0x67, 0x73),
-                border: Color::Rgb(0x80, 0x87, 0x92),
+                foreground: Color::Rgb(0x3B, 0x3F, 0x41),
+                background: Color::Reset,
+                // A touch lighter than upstream's selectedBg (okhsl 235 19% 91%)
+                // to keep every role at WCAG AA on the surface.
+                surface: Color::Rgb(0xF4, 0xF6, 0xF8),
+                muted: Color::Rgb(0x67, 0x71, 0x76),
+                border: Color::Rgb(0x3D, 0x8E, 0xB3),
                 accent: if name == "kimi" {
                     Color::Rgb(0x25, 0x63, 0xEB)
                 } else {
-                    Color::Rgb(0x00, 0x69, 0x80)
+                    Color::Rgb(0x74, 0x59, 0xB4)
                 },
-                success: Color::Rgb(0x16, 0x70, 0x3A),
-                warning: Color::Rgb(0x91, 0x5A, 0x00),
-                error: Color::Rgb(0xBE, 0x25, 0x35),
+                success: Color::Rgb(0x33, 0x7E, 0x58),
+                warning: Color::Rgb(0x8F, 0x68, 0x02),
+                error: Color::Rgb(0xC8, 0x25, 0x3D),
+                // Upstream's token values, converted from okhsl.
+                thinking_off: Color::Rgb(0xC2, 0xC8, 0xCA),
+                thinking_minimal: Color::Rgb(0xB5, 0xC4, 0xCB),
+                thinking_low: Color::Rgb(0x9F, 0xC2, 0xD5),
+                thinking_medium: Color::Rgb(0xA2, 0xB7, 0xE0),
+                thinking_high: Color::Rgb(0xB5, 0xA5, 0xE8),
+                thinking_xhigh: Color::Rgb(0xE5, 0x85, 0xCD),
+                thinking_max: Color::Rgb(0xFE, 0x74, 0x79),
+                tool_pending_bg: Color::Rgb(0xE4, 0xE5, 0xE6),
+                tool_success_bg: Color::Rgb(0xDE, 0xE9, 0xE1),
+                tool_error_bg: Color::Rgb(0xEE, 0xE2, 0xE1),
+                diff_added: Color::Rgb(0x33, 0x7E, 0x58),
+                diff_removed: Color::Rgb(0xC8, 0x25, 0x3D),
+                md_heading: Color::Rgb(0x8F, 0x68, 0x02),
+                md_link: Color::Rgb(0x2F, 0x78, 0x99),
+                md_code: Color::Rgb(0x74, 0x59, 0xB4),
+                ..ThemePalette::default()
             },
             "dark" => ThemePalette {
-                foreground: Color::Rgb(0xE4, 0xE7, 0xEC),
-                background: Color::Rgb(0x18, 0x1B, 0x22),
-                surface: Color::Rgb(0x25, 0x29, 0x33),
-                muted: Color::Rgb(0xA2, 0xAA, 0xB8),
-                border: Color::Rgb(0x78, 0x83, 0x96),
-                accent: Color::Rgb(0x79, 0xBC, 0xFF),
-                success: Color::Rgb(0x7A, 0xD6, 0x9B),
-                warning: Color::Rgb(0xED, 0xC3, 0x72),
-                error: Color::Rgb(0xFF, 0x8A, 0x94),
+                foreground: Color::Rgb(0xDE, 0xE0, 0xE1),
+                background: Color::Reset,
+                // A touch darker than upstream's selectedBg (okhsl 233 41% 24%)
+                // to keep every role at WCAG AA on the surface.
+                surface: Color::Rgb(0x1E, 0x36, 0x43),
+                muted: Color::Rgb(0x9D, 0xA5, 0xA9),
+                border: Color::Rgb(0x5F, 0xA8, 0xCC),
+                accent: Color::Rgb(0xA7, 0x98, 0xD7),
+                success: Color::Rgb(0x68, 0xB7, 0x8D),
+                warning: Color::Rgb(0xCD, 0x9A, 0x22),
+                error: Color::Rgb(0xEA, 0x7F, 0x81),
+                // Upstream's token values, converted from okhsl: the
+                // thinking gradient, tool status tints, diffs, markdown.
+                thinking_off: Color::Rgb(0x6C, 0x76, 0x7B),
+                thinking_minimal: Color::Rgb(0x68, 0x80, 0x8D),
+                thinking_low: Color::Rgb(0x54, 0x89, 0xA4),
+                thinking_medium: Color::Rgb(0x61, 0x85, 0xCC),
+                thinking_high: Color::Rgb(0x97, 0x76, 0xE5),
+                thinking_xhigh: Color::Rgb(0xDE, 0x54, 0xC1),
+                thinking_max: Color::Rgb(0xFE, 0x54, 0x62),
+                tool_pending_bg: Color::Rgb(0x34, 0x38, 0x3A),
+                tool_success_bg: Color::Rgb(0x25, 0x41, 0x31),
+                tool_error_bg: Color::Rgb(0x5B, 0x28, 0x2A),
+                diff_added: Color::Rgb(0x68, 0xB7, 0x8D),
+                diff_removed: Color::Rgb(0xEA, 0x7F, 0x81),
+                md_heading: Color::Rgb(0xCD, 0x9A, 0x22),
+                md_link: Color::Rgb(0x69, 0xAD, 0xD0),
+                md_code: Color::Rgb(0xA7, 0x98, 0xD7),
+                ..ThemePalette::default()
             },
             _ => return None,
         };
@@ -128,17 +320,10 @@ impl TerminalTheme {
         for (role, value) in definition.colors {
             let color = parse_theme_color(&value)
                 .map_err(|error| format!("theme {name}, {role}: {error}"))?;
-            let target = match role.as_str() {
-                "foreground" => &mut theme.palette.foreground,
-                "background" => &mut theme.palette.background,
-                "surface" => &mut theme.palette.surface,
-                "muted" => &mut theme.palette.muted,
-                "border" => &mut theme.palette.border,
-                "accent" => &mut theme.palette.accent,
-                "success" => &mut theme.palette.success,
-                "warning" => &mut theme.palette.warning,
-                "error" => &mut theme.palette.error,
-                _ => return Err(format!("theme {name}: unknown color role {role}")),
+            let target = theme.palette.role_mut(&role);
+            let target = match target {
+                Some(target) => target,
+                None => return Err(format!("theme {name}: unknown color role {role}")),
             };
             *target = color;
         }
@@ -231,6 +416,9 @@ mod tests {
         }
         for name in ["light", "dark", "kimi"] {
             let palette = TerminalTheme::builtin(name).unwrap().palette;
+            // Presets paint on the terminal's own background; only the
+            // surface tint is theirs, like upstream's selectedBg panels.
+            assert_eq!(palette.background, Color::Reset);
             for foreground in [
                 palette.foreground,
                 palette.muted,
@@ -239,13 +427,11 @@ mod tests {
                 palette.warning,
                 palette.error,
             ] {
-                for background in [palette.background, palette.surface] {
-                    let foreground = luminance(foreground);
-                    let background = luminance(background);
-                    let ratio =
-                        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05);
-                    assert!(ratio >= 4.5, "{name} text contrast: {ratio}");
-                }
+                let foreground = luminance(foreground);
+                let background = luminance(palette.surface);
+                let ratio =
+                    (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05);
+                assert!(ratio >= 4.5, "{name} text contrast: {ratio}");
             }
         }
     }

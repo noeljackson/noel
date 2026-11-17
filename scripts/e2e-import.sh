@@ -21,7 +21,7 @@ mkdir -p "${home}/.pi/agent" "${work_dir}/project"
 printf '{"modelRefresh":{"enabled":false}}\n' > "${home}/.pi/agent/settings.json"
 # A session in pi's format, written while noel used pi's directory.
 (cd "${work_dir}/project" && env HOME="${home}" NOEL_DIR="${home}/.pi/agent" \
-  "${noel_bin}" -p --offline --model faux/echo 'topic-from-pi' > /dev/null)
+  "${noel_bin}" -p --offline --model faux/echo 'topic-from-pi' < /dev/null > /dev/null)
 journals=("${home}/.pi/agent/sessions/"*.jsonl)
 imported_session="$(basename "${journals[0]}" .jsonl)"
 

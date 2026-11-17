@@ -334,6 +334,35 @@ fn scenario(name: &str) -> Value {
 /// Where upstream's stub held a response while a command arrived, `script`
 /// holds it with [`held_until`] that command's index: the release is written
 /// once the command's response arrived.
+/// Appends the stub's final usage (10/5 tokens) to every script response
+/// that does not already carry one, as upstream's stub does for every reply
+/// it finishes.
+fn stub_usage(script: Value) -> Value {
+    match script {
+        Value::Array(responses) => Value::Array(
+            responses
+                .into_iter()
+                .map(|response| match response {
+                    Value::Array(steps)
+                        if !steps.iter().any(|step| step.get("usage").is_some()) =>
+                    {
+                        Value::Array(
+                            steps
+                                .into_iter()
+                                .chain(std::iter::once(json!({
+                                    "usage": {"input": 10, "output": 5}
+                                })))
+                                .collect(),
+                        )
+                    }
+                    other => other,
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn golden(name: &str, script: Value) {
     let requests = golden_records(name, script);
     assert_eq!(
@@ -362,6 +391,11 @@ fn golden_records(name: &str, script: Value) -> Vec<Value> {
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     // The scenario's settings are noel's too: `retry` and `compaction`.
     let settings = scenario.get("settings").cloned().unwrap_or(json!({}));
+    // Upstream's stub sends its usage with the final chunk of every reply
+    // it finishes (10/5 tokens); a reply held or dropped mid-stream never
+    // gets one. The faux script mirrors that: a response without its own
+    // usage step gains one, which a hold or drop before it leaves unsent.
+    let script = stub_usage(script);
     let mut noel = Noel::spawn(root, script, &args, settings);
 
     for (index, command) in scenario["commands"].as_array().unwrap().iter().enumerate() {
@@ -421,7 +455,7 @@ fn golden_records(name: &str, script: Value) -> Vec<Value> {
     for request in noel.logged_requests() {
         let prompt = request["system_prompt"].as_str().unwrap_or_default();
         assert!(
-            prompt.starts_with("You are an expert coding assistant") && prompt.contains("<cwd>")
+            prompt.starts_with("You are a coding assistant") && prompt.contains("<cwd>")
                 || prompt.starts_with("Create a concise continuation checkpoint"),
             "{name}: system prompt {prompt:?}"
         );
@@ -444,7 +478,7 @@ fn stub_failure(name: &str) -> Value {
 }
 
 /// A failed request in noel's words. Upstream reports `<status>: <body>`,
-/// and `terminated` for the connection its stub dropped, which the faux
+/// and Node's `terminated: ...` for the connection its stub dropped, which the faux
 /// script fails like any request without a status: as an HTTP 503.
 fn noel_error(upstream: &str) -> String {
     let (status, body) = match upstream.split_once(": ") {
@@ -516,7 +550,7 @@ fn normalize(records: &[Value]) -> Vec<Value> {
 /// `docs/rust-rewrite/non-parity-register.md` under "RPC Mode":
 ///
 /// - Messages noel does not keep: `messageCount` leaves out upstream's
-///   system message and aborted replies.
+///   system message.
 /// - Queue modes: noel delivers queued messages together (`all`).
 /// - Model object: `faux/script` has no `baseUrl`, and accepts and caps
 ///   what upstream's faux provider does rather than what the stub model
@@ -536,9 +570,7 @@ fn expected(upstream: &[Value]) -> Vec<Value> {
         .map(|record| {
             let mut record = record.clone();
             let message = &record["message"];
-            if record["type"] == "message_end"
-                && (message["role"] == "system" || message["stopReason"] == "aborted")
-            {
+            if record["type"] == "message_end" && message["role"] == "system" {
                 unkept += 1;
             }
             visit(&mut record, &mut |object| {
@@ -595,10 +627,10 @@ fn expected(upstream: &[Value]) -> Vec<Value> {
                     result.remove("structuredContent");
                     result.remove("details");
                 }
-                if kind == "compaction_end" {
-                    if let Some(result) = object.get_mut("result") {
-                        *result = json!({ "summary": result["summary"] });
-                    }
+                if kind == "compaction_end"
+                    && let Some(result) = object.get_mut("result")
+                {
+                    *result = json!({ "summary": result["summary"] });
                 }
             });
             if record["command"] == "get_state" {
@@ -660,10 +692,10 @@ fn without_own(mut record: Value) -> Value {
             object.remove(key);
         }
     });
-    if record["type"] == "compaction_end" {
-        if let Some(Value::Object(result)) = record.get_mut("result") {
-            result.remove("details");
-        }
+    if record["type"] == "compaction_end"
+        && let Some(Value::Object(result)) = record.get_mut("result")
+    {
+        result.remove("details");
     }
     record
 }
@@ -887,7 +919,9 @@ fn golden_mid_stream_drop() {
     golden(
         "mid-stream-drop",
         json!([
-            [text("Hel"), {"error": "terminated"}],
+            // Node's words for the dropped connection, with its cause since
+            // upstream 4c992154.
+            [text("Hel"), {"error": "terminated: other side closed (UND_ERR_SOCKET)"}],
             [text("Hello again.")]
         ]),
     );
@@ -1436,6 +1470,12 @@ fn retry_commands_answer_whether_or_not_a_retry_is_waiting() {
     assert!(noel.close().success());
 }
 
+/// Retries after a millisecond: a request a crash cut off is a failed
+/// attempt, sent again only while the retry policy allows another.
+fn retrying() -> Value {
+    json!({"retry": {"baseDelayMs": 1}})
+}
+
 /// The golden overflow scenario's settings, with retries off.
 fn compacting() -> Value {
     json!({"retry": {"enabled": false}, "compaction": {"keepRecentTokens": 8}})
@@ -1631,7 +1671,9 @@ fn a_crash_after_an_overflow_compaction_resumes_with_the_compacted_context() {
         [held()],
         [text("Third answer.")]
     ]);
-    let mut noel = Noel::session_with("crash-after-compaction", script, None, compacting());
+    let mut settings = compacting();
+    settings["retry"] = json!({"baseDelayMs": 1});
+    let mut noel = Noel::session_with("crash-after-compaction", script, None, settings);
     two_turns(&mut noel);
     noel.command(json!({"id": "third", "type": "prompt", "message": "third", "requestId": "m-3"}));
     let run_id = noel.response("third")["data"]["runId"].clone();
@@ -1797,9 +1839,12 @@ fn run_1(status: &str, more: Value) -> Value {
     run
 }
 
-/// The placeholder result the model gets for a call that did not finish.
+/// The result the model gets for a call a stop cut off that printed
+/// nothing: upstream Durable's interrupted result.
 fn interrupted(id: &str, tool: &str) -> Value {
-    let text = format!("tool call {tool} did not complete before the session continued");
+    let text = format!(
+        "<harness>\n[error] Tool {tool} was interrupted and may have partially run\n</harness>"
+    );
     json!({"role": "tool", "text": text, "toolCallId": id})
 }
 
@@ -1901,7 +1946,12 @@ fn an_interrupted_run_says_where_it_stopped_and_resumes_under_its_run_id() {
             journal.push(saved_reply("", &calls));
         }
         let script = json!([[text("done")]]);
-        let mut noel = Noel::session(&format!("resume-{name}"), script, Some(&journal));
+        let mut noel = Noel::session_with(
+            &format!("resume-{name}"),
+            script,
+            Some(&journal),
+            retrying(),
+        );
         fs::write(noel.root.join("cwd/notes.txt"), "alpha\n").unwrap();
         assert_eq!(
             noel.last_run("before"),
@@ -1920,9 +1970,11 @@ fn an_interrupted_run_says_where_it_stopped_and_resumes_under_its_run_id() {
         );
         assert!(noel.close().success());
 
+        // A request the crash cut off is retried, which RPC reports as a
+        // new agent_start; every one is the same run's.
         let starts = of_type(&noel.records, "agent_start").collect::<Vec<_>>();
-        assert_eq!(starts.len(), 1);
-        assert_eq!(starts[0]["runId"], "run-1");
+        assert!(!starts.is_empty());
+        assert!(starts.iter().all(|start| start["runId"] == "run-1"));
         assert_eq!(settled(&noel.records)[0]["runId"], "run-1");
         let ran = of_type(&noel.records, "tool_execution_start")
             .map(|record| record["toolName"].as_str().unwrap())
@@ -2082,7 +2134,14 @@ fn a_journal_from_before_runs_has_no_last_run() {
 
 #[test]
 fn a_model_request_cut_off_by_a_crash_is_sent_again_on_resume() {
-    let mut noel = Noel::session("crash-model", json!([[held()], [text("done")]]), None);
+    // A crash cut the request off: it is a failed attempt, which the retry
+    // policy allows to be sent again (Durable).
+    let mut noel = Noel::session_with(
+        "crash-model",
+        json!([[held()], [text("done")]]),
+        None,
+        retrying(),
+    );
     noel.command(json!({"id": "run", "type": "prompt", "message": "work", "requestId": "m-1"}));
     let run_id = noel.response("run")["data"]["runId"].clone();
     wait_for_lines(&noel.root.join("requests.jsonl"), 1);
@@ -2167,6 +2226,181 @@ fn a_read_cut_off_by_a_crash_runs_again() {
         noel.model_requests()[1][2],
         json!({"role": "tool", "text": "alpha\n", "toolCallId": "r1"})
     );
+}
+
+/// Waits until the session's journal holds a record `done` accepts.
+fn wait_for_record(noel: &Noel, what: &str, done: impl Fn(&Value) -> bool) {
+    let deadline = Instant::now() + TIMEOUT;
+    while !noel.journal().iter().any(&done) {
+        assert!(Instant::now() < deadline, "no {what} in the journal");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// What a reply streamed and saved before a crash is kept in the transcript
+/// as an aborted reply, which `get_messages` reports as upstream reports an
+/// aborted reply; the request is sent again without it.
+#[test]
+fn a_reply_cut_off_by_a_crash_is_kept_aborted_and_asked_for_again() {
+    let streaming = json!([
+        {"thinking": "plot"},
+        text("Once"),
+        {"delay_ms": 150},
+        text(" upon"),
+        {"delay_ms": 150},
+        text(" a time"),
+        held()
+    ]);
+    let script = json!([streaming, [text("The end.")]]);
+    let mut noel = Noel::session_with("crash-reply", script, None, retrying());
+    noel.command(json!({"id": "run", "type": "prompt", "message": "story", "requestId": "m-1"}));
+    let run_id = noel.response("run")["data"]["runId"].clone();
+    wait_for_record(&noel, "partial", |record| {
+        record["type"] == "partial"
+            && record["text"]
+                .as_str()
+                .is_some_and(|text| text.ends_with("a time"))
+    });
+    // Saving the partial wrote nothing to stdout.
+    noel.wait_for("message_update", 6);
+    let streamed = kinds(&noel.records)
+        .into_iter()
+        .filter(|kind| *kind != "message_update")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        streamed,
+        [
+            "response",
+            "agent_start",
+            "turn_start",
+            "message_start",
+            "message_end",
+            "message_start"
+        ]
+    );
+    noel.restart();
+
+    // Opening the session saved the reply as aborted; the run still wants
+    // its reply.
+    let stopped =
+        json!({"runId": run_id, "requestId": "m-1", "status": "interrupted", "phase": "model"});
+    assert_eq!(noel.last_run("state"), stopped);
+    noel.command(json!({"id": "messages", "type": "get_messages"}));
+    let messages = noel.response("messages")["data"]["messages"].clone();
+    assert_eq!(
+        messages,
+        json!([
+            {"role": "user", "content": [{"type": "text", "text": "story"}]},
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "plot"}, {"type": "text", "text": "Once upon a time"}],
+                "stopReason": "aborted",
+                "errorMessage": "Request was aborted"
+            }
+        ])
+    );
+    assert_eq!(resume(&mut noel, &run_id)["success"], true);
+    noel.wait_for("agent_settled", 1);
+    assert_eq!(noel.last_run("after")["status"], "completed");
+    noel.command(json!({"id": "count", "type": "get_state"}));
+    assert_eq!(noel.response("count")["data"]["messageCount"], 3);
+    assert!(noel.close().success());
+    // The request is sent again, as it was: the aborted reply is not in it.
+    let requests = noel.model_requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1], requests[0]);
+    assert_eq!(requests[1], json!([{"role": "user", "text": "story"}]));
+    // The aborted reply superseded the partial records.
+    let journal = noel.journal();
+    let aborted = of_type(&journal, "message")
+        .filter(|record| record["message"]["aborted"] == true)
+        .count();
+    assert_eq!(aborted, 1);
+}
+
+/// A command a crash cut off never runs again: its result is the output it
+/// had saved, and says it was interrupted.
+#[test]
+fn a_command_cut_off_by_a_crash_keeps_its_output_in_its_result() {
+    let command = "for i in 1 2 3; do echo line $i; done; echo $$ > ../sleeper.pid; exec sleep 600";
+    let call =
+        json!({"tool_call": {"id": "b1", "name": "bash", "arguments": {"command": command}}});
+    let mut noel = Noel::session("crash-output", json!([[call], [text("done")]]), None);
+    noel.command(json!({"id": "run", "type": "prompt", "message": "count", "requestId": "m-1"}));
+    let run_id = noel.response("run")["data"]["runId"].clone();
+    let sleeper = wait_for_pid(&noel.root.join("sleeper.pid"));
+    // The first line can be saved on its own and the rest one interval
+    // later, so wait for all three to be saved.
+    let saved = || {
+        noel.journal()
+            .into_iter()
+            .filter(|record| record["type"] == "tool_output" && record["call_id"] == "b1")
+            .map(|record| record["output"].as_str().unwrap().to_owned())
+            .collect::<String>()
+    };
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while saved() != "line 1\nline 2\nline 3\n" && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(saved(), "line 1\nline 2\nline 3\n");
+    noel.restart();
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(sleeper),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+
+    assert_eq!(noel.last_run("state")["phase"], "tools");
+    assert_eq!(resume(&mut noel, &run_id)["success"], true);
+    noel.wait_for("agent_settled", 1);
+    noel.command(json!({"id": "messages", "type": "get_messages"}));
+    let messages = noel.response("messages")["data"]["messages"].clone();
+    assert!(noel.close().success());
+    let result = "line 1\nline 2\nline 3\n\n\n<harness>\n[error] Tool bash was interrupted and may have partially run\n</harness>";
+    assert_eq!(
+        messages[2],
+        json!({"role": "toolResult", "toolCallId": "b1", "toolName": "bash", "content": [{"type": "text", "text": result}], "isError": true})
+    );
+    assert_eq!(of_type(&noel.records, "tool_execution_start").count(), 0);
+    assert_eq!(
+        noel.model_requests()[1][2],
+        json!({"role": "tool", "text": result, "toolCallId": "b1"})
+    );
+}
+
+/// An aborted reply stays in the session, as upstream's does: in
+/// `get_messages` and `messageCount`, and out of later requests.
+#[test]
+fn an_aborted_reply_is_kept_in_the_session_and_left_out_of_requests() {
+    let script = json!([[text("Once"), held()], [text("Shorter.")]]);
+    let mut noel = Noel::session("aborted-reply", script, None);
+    noel.command(json!({"id": "1", "type": "prompt", "message": "tell a long story"}));
+    noel.wait_for("message_update", 2);
+    noel.command(json!({"id": "abort", "type": "abort"}));
+    noel.response("abort");
+    noel.command(json!({"id": "messages", "type": "get_messages"}));
+    let messages = noel.response("messages")["data"]["messages"].clone();
+    assert_eq!(
+        messages[1],
+        json!({"role": "assistant", "content": [{"type": "text", "text": "Once"}], "stopReason": "aborted", "errorMessage": "Request was aborted"})
+    );
+    noel.command(json!({"id": "2", "type": "prompt", "message": "shorter please"}));
+    noel.wait_for("agent_settled", 2);
+    noel.command(json!({"id": "state", "type": "get_state"}));
+    assert_eq!(noel.response("state")["data"]["messageCount"], 4);
+    assert!(noel.close().success());
+    assert_eq!(
+        noel.model_requests()[1],
+        json!([
+            {"role": "user", "text": "tell a long story"},
+            {"role": "user", "text": "shorter please"}
+        ])
+    );
+    // It outlives the process.
+    noel.restart();
+    noel.command(json!({"id": "again", "type": "get_messages"}));
+    let messages = noel.response("again")["data"]["messages"].clone();
+    assert_eq!(messages[1]["stopReason"], "aborted");
+    assert!(noel.close().success());
 }
 
 #[test]
@@ -2474,7 +2708,7 @@ fn skills_and_templates_expand_in_prompt_steer_and_follow_up() {
     let system_prompt = noel.logged_requests()[0]["system_prompt"].clone();
     let system_prompt = system_prompt.as_str().unwrap();
     let listing = format!(
-        "<available_skills>\n  <skill>\n    <name>review</name>\n    <description>Review code for bugs.</description>\n    <location>{}</location>\n  </skill>\n</available_skills>\n</skills>\n\n<cwd>",
+        "<available_skills>\n  <skill>\n    <name>review</name>\n    <description>Review code for bugs.</description>\n    <location>{}</location>\n  </skill>\n</available_skills>\n</skills>\n\n<sessions>",
         skill_file.display()
     );
     assert!(system_prompt.contains("\n\n<skills>\nThe following skills provide"));
@@ -2693,4 +2927,48 @@ fn a_prompt_that_names_no_command_goes_to_the_model() {
         requests[1].as_array().unwrap().last().unwrap(),
         &json!({"role": "user", "text": "/home/user/main.rs is broken"})
     );
+}
+
+#[test]
+fn a_model_request_cut_off_by_a_crash_ends_the_run_interrupted_without_retries() {
+    let mut noel = Noel::session("crash-model-no-retry", json!([[held()]]), None);
+    noel.command(json!({"id": "run", "type": "prompt", "message": "work", "requestId": "m-1"}));
+    let run_id = noel.response("run")["data"]["runId"].clone();
+    wait_for_lines(&noel.root.join("requests.jsonl"), 1);
+    noel.restart();
+    assert_eq!(resume(&mut noel, &run_id)["success"], true);
+    noel.wait_for("agent_settled", 1);
+    let last = noel.last_run("after");
+    assert_eq!(last["status"], "failed", "{last}");
+    let said = noel.records.iter().any(|record| {
+        record
+            .to_string()
+            .contains("The host stopped while the model was answering, on attempt 1")
+    });
+    assert!(said, "{:?}", noel.records);
+    assert!(noel.close().success());
+    // Nothing was sent again.
+    let log = fs::read_to_string(noel.root.join("requests.jsonl")).unwrap();
+    assert_eq!(log.lines().count(), 1);
+}
+
+#[test]
+fn a_run_whose_tool_rounds_reach_the_cap_ends_turn_limit() {
+    let ls = |id: &str| {
+        json!([
+            {"tool_call": {"id": id, "name": "ls", "arguments": {}}},
+            {"stop": "tool_calls"}
+        ])
+    };
+    let script = json!([ls("l1"), ls("l2"), [text("done")]]);
+    let settings = json!({"retry": {"enabled": false}, "agent": {"maxToolRounds": 1}});
+    let mut noel = Noel::session_with("turn-limit", script, None, settings);
+    noel.command(json!({"id": "run", "type": "prompt", "message": "list"}));
+    noel.response("run");
+    noel.wait_for("agent_settled", 1);
+    assert_eq!(noel.last_run("after")["status"], "failed");
+    assert!(noel.close().success());
+    let runs = noel.journal();
+    let finished = of_type(&runs, "run_finished").last().unwrap();
+    assert_eq!(finished["failure"]["reason"], "turn_limit", "{finished}");
 }
