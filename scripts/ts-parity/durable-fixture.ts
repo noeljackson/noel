@@ -1,0 +1,237 @@
+// Goldens for noel-durable (docs/durable-sdk-2026-11.md, slice 1): the
+// scenarios of upstream Durable's examples 13 (chat), 17 (print), 19
+// (inbox) and 33 (turn limit and continue), recorded from upstream's own
+// Harness at TS_REFERENCE_REF, on the faux provider, and written as JSON
+// a Rust test replays against noel-durable.
+//
+// Durable is read from /ts-reference like every other fixture; the
+// scenarios are the examples' own, run through the public API the SDK
+// models (Harness.open, Conversation.submit, Submission.wait).
+import { execFileSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+
+
+
+
+// The reference checkout: DURABLE_REFERENCE_DIR (the Makefile's default
+// is the local pi checkout), /ts-reference in the fixture image.
+const REFERENCE = process.env.DURABLE_REFERENCE_DIR ?? "/home/noel/src/noeljackson/pi";
+
+const { BACKGROUND_CONTEXT } = await import(`${REFERENCE}/node_modules/@earendil-works/chord/src/context/index.ts`);
+const { createModels } = await import(`${REFERENCE}/packages/ai/src/models`);
+const { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } = await import(
+	`${REFERENCE}/packages/ai/src/providers/faux`
+);
+const {
+	ConversationBusy,
+	createRegistry,
+	defineExtension,
+	defineTool,
+	Harness,
+	InboxDoc,
+	LiveDoc,
+	MemoryStorage,
+} = await import(`${REFERENCE}/packages/durable/src/index.ts`);
+
+const git = (...args: string[]): string =>
+	execFileSync("git", ["-C", REFERENCE, ...args], { encoding: "utf8" }).trim();
+
+type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
+
+/** 13-chat: one prompt answered; the transcript it leaves. */
+async function chat(): Promise<Json> {
+	const faux = fauxProvider();
+	faux.setResponses([fauxAssistantMessage([fauxText("Paris.")])]);
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const harness = await Harness.open(new MemoryStorage(), { models, registry: createRegistry() }, BACKGROUND_CONTEXT);
+	const root = await harness.root(BACKGROUND_CONTEXT, {
+		agent: { model: { provider: "faux", modelId: "faux-1" } },
+	});
+	const submission = await root.submit({ type: "input", content: "Capital of France?" }, BACKGROUND_CONTEXT);
+	const settled = await submission.wait(BACKGROUND_CONTEXT);
+	const transcript = await root.entries({}, 10, undefined, BACKGROUND_CONTEXT);
+	const kinds = [...transcript.items].reverse().map((entry) => entry.kind);
+	const answer = answerOf(transcript);
+	await harness.close(BACKGROUND_CONTEXT);
+	return { status: settled.status, answer, transcript: kinds };
+}
+
+/** The text of the transcript's last assistant entry, as 13-chat prints it. */
+function answerOf(transcript: { items: { model?: unknown[] }[] }): string {
+	for (const entry of [...transcript.items].reverse()) {
+		const message = entry.model?.[0] as
+			| { role?: string; content?: { type: string; text?: string }[] }
+			| undefined;
+		if (message?.role === "assistant" && Array.isArray(message.content)) {
+			return message.content
+				.filter((part): part is { type: "text"; text: string } => part.type === "text")
+				.map((part) => part.text)
+				.join("");
+		}
+	}
+	return "";
+}
+
+/** 17-print, faux variant: a tool call round, then the answer. */
+async function printMode(): Promise<Json> {
+	const step = defineTool({
+		name: "step",
+		description: "Do one step of the work",
+		parameters: { type: "object", properties: { n: { type: "number" } }, required: ["n"] } as never,
+		execute: async (args: { n: number }) => ({
+			output: [{ type: "text", text: `step ${args.n} done` }],
+		}),
+	});
+	const faux = fauxProvider();
+	faux.setResponses([
+		fauxAssistantMessage([fauxToolCall("step", { n: 1 }, { id: "call-1" })], { stopReason: "toolUse" }),
+		fauxAssistantMessage([fauxText("This directory holds the durable package sources, tests, and docs.")]),
+	]);
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const registry = createRegistry();
+	registry.install(defineExtension({ name: "steps", tools: [step] }));
+	const harness = await Harness.open(new MemoryStorage(), { models, registry }, BACKGROUND_CONTEXT);
+	const root = await harness.root(BACKGROUND_CONTEXT, {
+		agent: { model: { provider: "faux", modelId: "faux-1" } },
+	});
+	const submission = await root.submit({ type: "input", content: "What is here?" }, BACKGROUND_CONTEXT);
+	const settled = await submission.wait(BACKGROUND_CONTEXT);
+	const transcript = await root.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT);
+	const roles = transcript.items
+		.map((entry) => entry.model?.[0]?.role)
+		.filter((role) => role !== undefined);
+	const answer = answerOf(transcript);
+	await harness.close(BACKGROUND_CONTEXT);
+	return { status: settled.status, answer, turns: roles };
+}
+
+/** 19-inbox: what happens to submissions while busy. */
+async function inbox(): Promise<Json> {
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const slow = async () => {
+		await held;
+		return fauxAssistantMessage("Answer to the first question.");
+	};
+	const faux = fauxProvider();
+	faux.setResponses([slow, fauxAssistantMessage("Answer to the follow-up.")]);
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const harness = await Harness.open(
+		new MemoryStorage(),
+		{ models, registry: createRegistry(), settings: { followUpMode: "all" } },
+		BACKGROUND_CONTEXT,
+	);
+	const root = await harness.root(BACKGROUND_CONTEXT, {
+		agent: { model: { provider: "faux", modelId: "faux-1" } },
+	});
+	const first = await root.submit({ type: "input", content: "First question" }, BACKGROUND_CONTEXT);
+	const followUp = await root.submit({ type: "input", content: "A follow-up" }, BACKGROUND_CONTEXT);
+	const steer = await root.submit({ type: "input", content: "A steer", whenBusy: "steer" }, BACKGROUND_CONTEXT);
+	const withdrawn = await root.submit({ type: "input", content: "Never mind" }, BACKGROUND_CONTEXT);
+	let rejected: string | null = null;
+	await root
+		.submit({ type: "input", content: "Now or never", whenBusy: "reject" }, BACKGROUND_CONTEXT)
+		.catch((error: Error) => {
+			rejected = error instanceof ConversationBusy ? "ConversationBusy" : error.message;
+		});
+	const withdraw = await withdrawn.abort(BACKGROUND_CONTEXT);
+	const inbox = await harness.snapshot(InboxDoc, root.id, BACKGROUND_CONTEXT);
+	const queued = (inbox?.items ?? []).map((item) => item.mode);
+	release();
+	const record = async (submission: Awaited<ReturnType<typeof root.submit>>) => {
+		const settled = await submission.wait(BACKGROUND_CONTEXT);
+		return {
+			status: settled.status,
+			reason: settled.status === "unanswered" ? settled.reason : null,
+		};
+	};
+	const outcomes = {
+		first: await record(first),
+		followUp: await record(followUp),
+		steer: await record(steer),
+		withdrawn: await record(withdrawn),
+	};
+	await harness.close(BACKGROUND_CONTEXT);
+	return { rejected, withdraw, queued, outcomes };
+}
+
+/** 33-turn-limit-and-continue: the limit stops a run; a continue resumes. */
+async function turnLimit(): Promise<Json> {
+	const call = (n: number) => fauxAssistantMessage(fauxToolCall("step", { n }), { stopReason: "toolUse" });
+	const step = defineTool({
+		name: "step",
+		description: "Do one step of the work",
+		parameters: { type: "object", properties: { n: { type: "number" } }, required: ["n"] } as never,
+		execute: async (args: { n: number }) => ({
+			output: [{ type: "text", text: `step ${args.n} done` }],
+		}),
+	});
+	const faux = fauxProvider();
+	faux.setResponses([call(1), call(2), call(3), call(4), fauxAssistantMessage("All four steps are done.")]);
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const registry = createRegistry();
+	registry.install(defineExtension({ name: "steps", tools: [step] }));
+	const harness = await Harness.open(new MemoryStorage(), { models, registry }, BACKGROUND_CONTEXT);
+	const root = await harness.root(BACKGROUND_CONTEXT, {
+		agent: { model: { provider: "faux", modelId: "faux-1" }, maxTurns: 2 },
+	});
+	const first = await (await root.submit({ type: "input", content: "Do the four steps." }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+	const failure = (await harness.snapshot(LiveDoc, root.id, BACKGROUND_CONTEXT))?.runFailure;
+	const resumed = await root.submit({ type: "continue" }, BACKGROUND_CONTEXT);
+	// A second continue while that run works is refused, never queued.
+	let busyWhileRunning: string | null = null;
+	try {
+		await root.submit({ type: "continue" }, BACKGROUND_CONTEXT);
+	} catch (error) {
+		busyWhileRunning = error instanceof ConversationBusy ? "ConversationBusy" : String(error);
+	}
+	const second = await resumed.wait(BACKGROUND_CONTEXT);
+	const live = await harness.snapshot(LiveDoc, root.id, BACKGROUND_CONTEXT);
+	const after = await (await root.submit({ type: "continue" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+	await harness.close(BACKGROUND_CONTEXT);
+	return {
+		first: { status: first.status, reason: (first as { reason?: string }).reason ?? null },
+		runFailure: failure ? { reason: failure.reason, detail: failure.detail ?? null } : null,
+		second: { status: second.status, reason: (second as { reason?: string }).reason ?? null },
+		runFailureCleared: live?.runFailure === undefined,
+		afterAnswer: { status: after.status, reason: (after as { reason?: string }).reason ?? null },
+		steps: 4,
+		busyWhileRunning,
+	};
+}
+
+const scenarios: Record<string, () => Promise<Json>> = {
+	chat,
+	print: printMode,
+	inbox,
+	turnLimit,
+};
+
+const outDir = process.argv[2];
+if (outDir === undefined) throw new Error("usage: durable-fixture.ts <fixtures-dir>");
+
+const source = {
+	repository: "https://github.com/earendil-works/pi",
+	ref: process.env.TS_REFERENCE_REF ?? "main",
+	commit: git("rev-parse", "HEAD"),
+	package: "packages/durable",
+	script: "/ts-parity/durable-fixture.ts",
+};
+
+for (const [name, run] of Object.entries(scenarios)) {
+	const outcome = await run();
+	await writeFile(
+		join(outDir, `durable-${name}.json`),
+		`${JSON.stringify({ source, scenario: name, outcome }, null, "\t")}\n`,
+	);
+}

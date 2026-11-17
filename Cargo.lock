@@ -1886,6 +1886,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "noel-durable"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "noel-agent",
+ "noel-ai",
+ "noel-config",
+ "noel-core",
+ "noel-env",
+ "noel-parity",
+ "noel-providers",
+ "noel-session",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "noel-env"
 version = "0.3.0"
 dependencies = [
