@@ -881,6 +881,40 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "off": "none",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": null,
+        "max": "max"
+      },
+      "examples": [
+        "cloudflare-workers-ai/@cf/thinkingmachines/inkling-2-small",
+        "huggingface/thinkingmachines/Inkling-2-Small"
+      ],
+      "supported": [
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
         "minimal": null,
         "low": "low",
         "medium": null,
@@ -1286,6 +1320,40 @@
         "medium": "medium",
         "high": "high",
         "xhigh": "xhigh",
+        "max": "max"
+      },
+      "examples": [
+        "meta/muse-ember-1.0",
+        "meta/muse-spark-1.3"
+      ],
+      "supported": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "clamp": {
+        "off": "minimal",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+        "invalid": "minimal"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": null,
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
         "max": null
       },
       "examples": [
@@ -1307,40 +1375,6 @@
         "high": "high",
         "xhigh": "xhigh",
         "max": "xhigh",
-        "invalid": "minimal"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": null,
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "xhigh",
-        "max": "max"
-      },
-      "examples": [
-        "meta/muse-spark-1.3",
-        "meta/muse-wonder-1.0"
-      ],
-      "supported": [
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ],
-      "clamp": {
-        "off": "minimal",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "xhigh",
-        "max": "max",
         "invalid": "minimal"
       }
     },
@@ -1623,6 +1657,35 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "off": null,
+        "minimal": null,
+        "low": null,
+        "medium": "medium",
+        "high": "high",
+        "xhigh": null,
+        "max": null
+      },
+      "examples": [
+        "openrouter/nex-agi/nex-n2.6"
+      ],
+      "supported": [
+        "medium",
+        "high"
+      ],
+      "clamp": {
+        "off": "medium",
+        "minimal": "medium",
+        "low": "medium",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "high",
+        "max": "high",
+        "invalid": "medium"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
         "off": "none",
         "minimal": null,
         "low": "low",
@@ -1705,6 +1768,37 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "off": "none",
+        "minimal": null,
+        "low": "low",
+        "medium": null,
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": null
+      },
+      "examples": [
+        "openrouter/qwen/qwen4-max"
+      ],
+      "supported": [
+        "off",
+        "low",
+        "high",
+        "xhigh"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "low",
+        "low": "low",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "xhigh",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
         "off": null,
         "minimal": null,
         "low": null,
@@ -1736,7 +1830,7 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
-        "off": "none",
+        "off": null,
         "minimal": "minimal",
         "low": "low",
         "medium": "medium",
@@ -1745,11 +1839,10 @@
         "max": "max"
       },
       "examples": [
-        "openrouter/thinkingmachines/inkling",
-        "openrouter/thinkingmachines/inkling-small"
+        "openrouter/thinkingmachines/inkling-2-small",
+        "openrouter/thinkingmachines/inkling-2-small:free"
       ],
       "supported": [
-        "off",
         "minimal",
         "low",
         "medium",
@@ -1757,14 +1850,14 @@
         "max"
       ],
       "clamp": {
-        "off": "off",
+        "off": "minimal",
         "minimal": "minimal",
         "low": "low",
         "medium": "medium",
         "high": "high",
         "xhigh": "max",
         "max": "max",
-        "invalid": "off"
+        "invalid": "minimal"
       }
     },
     {

@@ -157,7 +157,7 @@ pub(crate) fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
 /// this with the latest published Claude Code version whenever it can reach
 /// the npm registry. Matches the `claudeCodeVersion` upstream pins in
 /// `packages/ai/src/api/anthropic-messages.ts`.
-pub const DEFAULT_CLAUDE_CODE_VERSION: &str = "2.1.280";
+pub const DEFAULT_CLAUDE_CODE_VERSION: &str = "2.1.322";
 pub const CLAUDE_CODE_VERSION_ENV: &str = "NOEL_CLAUDE_CODE_VERSION";
 
 pub(crate) static CLAUDE_CODE_VERSION_OVERRIDE: std::sync::RwLock<Option<String>> =

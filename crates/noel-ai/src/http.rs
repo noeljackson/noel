@@ -130,10 +130,10 @@ pub(crate) fn pi_user_agent() -> &'static str {
 
 /// The `@earendil-works/pi-ai` version of the TS parity reference, which
 /// upstream embeds in the detailed `User-Agent`.
-pub(crate) const REFERENCE_PI_AI_VERSION: &str = "1.5.0";
+pub(crate) const REFERENCE_PI_AI_VERSION: &str = "1.5.2";
 /// The Node version of the TS parity reference image, which upstream
 /// embeds as the runtime in the detailed `User-Agent`.
-pub(crate) const REFERENCE_NODE_VERSION: &str = "v24.22.2";
+pub(crate) const REFERENCE_NODE_VERSION: &str = "v26.13.1";
 
 pub(crate) fn format_pi_user_agent(platform: &str, arch: &str) -> String {
     format!("pi/{REFERENCE_PI_AI_VERSION} ({platform}; node/{REFERENCE_NODE_VERSION}; {arch})")
