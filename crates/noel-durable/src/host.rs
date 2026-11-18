@@ -19,6 +19,8 @@ pub(super) struct SdkHost {
     /// Waiters for the active run's settle: what a busy submit's reply
     /// resolves on when the run ends.
     pub(super) waiters: Mutex<Vec<tokio::sync::oneshot::Sender<Settled>>>,
+    /// The durable task definitions (slice 3).
+    pub(super) tasks: crate::tasks::TaskRegistry,
 }
 
 impl ControllerHost for SdkHost {

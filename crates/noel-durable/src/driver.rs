@@ -45,6 +45,21 @@ enum Request {
     Events {
         reply: oneshot::Sender<Vec<OwnedEvent>>,
     },
+    /// The SDK's task surface (slice 3): create, run, read, abort.
+    TaskCreate {
+        kind: String,
+        input: serde_json::Value,
+        background: bool,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    TaskWait {
+        task_id: String,
+        reply: oneshot::Sender<crate::tasks::TaskRecord>,
+    },
+    TaskAbort {
+        task_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Close {
         reply: oneshot::Sender<()>,
     },
@@ -116,6 +131,56 @@ impl Handle {
         done.await.unwrap_or_default()
     }
 
+    /// Creates a durable task of `kind` with `input`, returning its id.
+    pub(crate) async fn task_create(
+        &self,
+        kind: &str,
+        input: serde_json::Value,
+        background: bool,
+    ) -> Result<String, String> {
+        let (reply, done) = oneshot::channel();
+        self.requests
+            .send(Request::TaskCreate {
+                kind: kind.to_owned(),
+                input,
+                background,
+                reply,
+            })
+            .map_err(|_| "the harness is closed".to_string())?;
+        done.await
+            .map_err(|_| "the harness is closed".to_string())?
+    }
+
+    /// Waits for a task's terminal record (running it if it is runnable).
+    pub(crate) async fn task_wait(&self, task_id: &str) -> crate::tasks::TaskRecord {
+        let (reply, done) = oneshot::channel();
+        if self
+            .requests
+            .send(Request::TaskWait {
+                task_id: task_id.to_owned(),
+                reply,
+            })
+            .is_err()
+        {
+            return crate::tasks::TaskRecord::orphaned(task_id);
+        }
+        done.await
+            .unwrap_or_else(|_| crate::tasks::TaskRecord::orphaned(task_id))
+    }
+
+    /// Marks a task aborted; its abort handler decides the outcome.
+    pub(crate) async fn task_abort(&self, task_id: &str) -> Result<(), String> {
+        let (reply, done) = oneshot::channel();
+        self.requests
+            .send(Request::TaskAbort {
+                task_id: task_id.to_owned(),
+                reply,
+            })
+            .map_err(|_| "the harness is closed".to_string())?;
+        done.await
+            .map_err(|_| "the harness is closed".to_string())?
+    }
+
     pub fn subscribe(&self) -> Subscription {
         self.events.subscribe()
     }
@@ -145,6 +210,7 @@ pub(super) async fn spawn(
         tools: Mutex::new(options.tools),
         events: events.clone(),
         waiters: Mutex::new(Vec::new()),
+        tasks: options.tasks.clone(),
     };
     // The program's environment hook, if it gave one.
     if let Some(env) = options.env {
@@ -171,6 +237,10 @@ pub(super) async fn spawn(
     {
         resume = Some(start);
     }
+    // Durable tasks recover at open (slice 3): those left running by a
+    // stop that was not a close count a restart and go back to pending,
+    // and one at the limit ends restart_limit.
+    crate::driver_tasks::recover(&mut controller, options.task_settings.restart_limit);
     tokio::spawn(driver(controller, inbox, resume));
     Ok(Handle { requests, events })
 }
@@ -216,6 +286,26 @@ async fn driver(
             }
             Request::Events { reply } => {
                 let _ = reply.send(controller.host().events.take());
+            }
+            Request::TaskCreate {
+                kind,
+                input,
+                background,
+                reply,
+            } => {
+                let _ = reply.send(crate::driver_tasks::create(
+                    &mut controller,
+                    &kind,
+                    input,
+                    background,
+                ));
+            }
+            Request::TaskWait { task_id, reply } => {
+                let record = crate::driver_tasks::run_to_terminal(&mut controller, &task_id).await;
+                let _ = reply.send(record);
+            }
+            Request::TaskAbort { task_id, reply } => {
+                let _ = reply.send(crate::driver_tasks::abort(&mut controller, &task_id).await);
             }
             Request::Close { reply } => {
                 let _ = reply.send(());
@@ -358,6 +448,19 @@ fn busy_request(request: Request, run: &mut Busy<'_, SdkHost>) {
         }
         Request::Events { reply } => {
             let _ = reply.send(run.host().events.take());
+        }
+        // Tasks run while no run is active (slice 3); a conversation's
+        // owned tasks during a run are slice 7's.
+        Request::TaskCreate { reply, .. } => {
+            let _ = reply.send(Err("a run is active; tasks run between runs".to_string()));
+        }
+        Request::TaskWait { task_id, reply } => {
+            let _ = reply.send(crate::tasks::TaskRecord::orphaned(&task_id));
+        }
+        Request::TaskAbort { task_id, reply } => {
+            let _ = reply.send(Err(format!(
+                "a run is active; task {task_id} cannot be aborted through it"
+            )));
         }
         Request::Close { reply } => {
             let _ = reply.send(());
