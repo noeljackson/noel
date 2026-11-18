@@ -549,3 +549,252 @@ mod sleep {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// Slice 5: signals (upstream harness-signals).
+mod signals {
+    use super::*;
+    use noel_durable::{define_signal, SignalResult, SignalState, SignalToken, TaskState as State};
+
+    #[derive(serde::Serialize, serde::Deserialize, Clone)]
+    struct Answer {
+        text: String,
+    }
+
+    const ANSWER: SignalToken<Answer> = define_signal("test.answer", 1);
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct AskState {
+        #[serde(default)]
+        phase: Option<String>,
+    }
+
+    /// The ask task: waits on `keys` (and `until`), then completes with
+    /// its wake and every key's state, as upstream's test does.
+    fn ask_definition() -> noel_durable::TaskDefinition<AskInput, AskState> {
+        noel_durable::TaskDefinition::new("test.ask", 1, |_: &AskInput| AskState {
+            phase: Some("ask".into()),
+        })
+        .phase(
+            "ask",
+            phase(
+                |mut ctx: noel_durable::TaskContext<AskInput, AskState>| async move {
+                    let keys = ctx.input.keys.clone();
+                    let until = ctx.input.until;
+                    let signals = keys
+                        .iter()
+                        .map(|key| ANSWER.key(key.clone()))
+                        .collect::<Vec<_>>();
+                    ctx.wait_for(&signals, until, json!({ "phase": "answered" }))
+                        .await;
+                },
+            ),
+        )
+        .phase(
+            "answered",
+            phase(
+                |mut ctx: noel_durable::TaskContext<AskInput, AskState>| async move {
+                    let keys = ctx.input.keys.clone();
+                    let mut states = Vec::new();
+                    for key in &keys {
+                        states.push(match ctx.read_signal(&ANSWER, key).await {
+                            Some(SignalState::Value(answer)) => json!({ "value": answer }),
+                            Some(SignalState::Expired) => json!({ "expired": true }),
+                            None => Value::Null,
+                        });
+                    }
+                    let wake = ctx.wake().cloned();
+                    ctx.commit(TaskCommit::Completed(
+                        json!({ "wake": wake, "states": states }),
+                    ))
+                    .await;
+                },
+            ),
+        )
+        .abort(phase(
+            |mut ctx: noel_durable::TaskContext<AskInput, AskState>| async move {
+                let _ = &ctx.input;
+                ctx.commit(TaskCommit::Aborted).await;
+            },
+        ))
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, Clone)]
+    struct AskInput {
+        keys: Vec<String>,
+        #[serde(default)]
+        until: Option<u64>,
+    }
+
+    fn options(clock: u64) -> (HarnessOptions, Arc<std::sync::Mutex<u64>>) {
+        let clock = Arc::new(std::sync::Mutex::new(clock));
+        let mut options = options_with(Scripted::default().into(), Default::default());
+        options.tasks = TaskRegistry::new().register(ask_definition());
+        let reading = clock.clone();
+        options.clock = noel_durable::Clock::injected(move || *reading.lock().expect("clock"));
+        (options, clock)
+    }
+
+    /// harness-signals delivery: not_found, delivered, duplicate; the
+    /// woken task reads its value (golden durable-taskSignals.json).
+    #[tokio::test]
+    async fn delivery_answers_not_found_delivered_duplicate() {
+        let golden = load_fixture("durable-taskSignals.json");
+        assert_eq!(
+            golden["outcome"]["delivery"]["results"],
+            json!(["not_found", "delivered", "duplicate"]),
+            "upstream's delivery results, in order"
+        );
+        assert_eq!(
+            golden["outcome"]["delivery"]["outcome"]["wake"],
+            json!({"reason": "signal", "signal": "test.answer", "key": "a"})
+        );
+        let (opts, _clock) = options(1_000);
+        let harness = Harness::in_memory(opts).await.expect("open");
+        let mut conversation = harness.conversation();
+        let task = conversation
+            .create_task("test.ask", json!({ "keys": ["a"] }))
+            .await
+            .expect("create");
+        assert_eq!(
+            conversation
+                .signal("no-such-task", &ANSWER, "a", &Answer { text: "x".into() })
+                .await,
+            SignalResult::NotFound
+        );
+        assert_eq!(
+            conversation
+                .signal(&task, &ANSWER, "a", &Answer { text: "yes".into() })
+                .await,
+            SignalResult::Delivered
+        );
+        assert_eq!(
+            conversation
+                .signal(
+                    &task,
+                    &ANSWER,
+                    "a",
+                    &Answer {
+                        text: "again".into()
+                    }
+                )
+                .await,
+            SignalResult::Duplicate
+        );
+        let settled = conversation.wait_task(&task).await;
+        let State::Terminal {
+            outcome: TaskOutcome::Completed { result },
+        } = &settled.state
+        else {
+            panic!("the ask completes: {:?}", settled.state)
+        };
+        assert_eq!(
+            result["wake"],
+            json!({"reason": "signal", "signal": "test.answer", "key": "a"}),
+            "the early delivery wakes it"
+        );
+        assert_eq!(
+            result["states"],
+            json!([{ "value": { "text": "yes" } }]),
+            "the value was kept"
+        );
+        harness.close().await.expect("close");
+    }
+
+    /// A wait wakes on the first listed key holding a value; an unheld
+    /// key reads None.
+    #[tokio::test]
+    async fn a_wait_wakes_on_the_first_key_holding_a_value() {
+        let golden = load_fixture("durable-taskSignals.json");
+        assert_eq!(
+            golden["outcome"]["firstKey"]["wake"]["key"],
+            json!("b"),
+            "upstream wakes on b"
+        );
+        assert_eq!(
+            golden["outcome"]["firstKey"]["states"][0],
+            json!(null),
+            "a holds nothing"
+        );
+        let (opts, _clock) = options(1_000);
+        let harness = Harness::in_memory(opts).await.expect("open");
+        let mut conversation = harness.conversation();
+        let task = conversation
+            .create_task("test.ask", json!({ "keys": ["a", "b"] }))
+            .await
+            .expect("create");
+        // Park it first: an unanswered wait answers its waiting record.
+        let parked = conversation.wait_task(&task).await;
+        assert!(matches!(parked.state, State::WaitingOnSignals { .. }));
+        assert_eq!(
+            conversation
+                .signal(&task, &ANSWER, "b", &Answer { text: "bee".into() })
+                .await,
+            SignalResult::Delivered
+        );
+        let settled = conversation.wait_task(&task).await;
+        let State::Terminal {
+            outcome: TaskOutcome::Completed { result },
+        } = &settled.state
+        else {
+            panic!("it wakes on b: {:?}", settled.state)
+        };
+        assert_eq!(result["wake"]["key"], json!("b"));
+        assert_eq!(result["states"][0], json!(null));
+        assert_eq!(result["states"][1], json!({ "value": { "text": "bee" } }));
+        harness.close().await.expect("close");
+    }
+
+    /// A deadline expires its keys: the wake is `expired`, the key reads
+    /// expired, and a late delivery is closed.
+    #[tokio::test]
+    async fn a_deadline_expires_its_keys() {
+        let golden = load_fixture("durable-taskSignals.json");
+        assert_eq!(
+            golden["outcome"]["expire"]["late"],
+            json!("closed"),
+            "upstream closes a late delivery"
+        );
+        assert_eq!(
+            golden["outcome"]["expire"]["outcome"]["wake"],
+            json!({"reason": "expired"})
+        );
+        assert_eq!(
+            golden["outcome"]["expire"]["outcome"]["states"],
+            json!([{ "expired": true }])
+        );
+        let (opts, clock) = options(1_000);
+        let harness = Harness::in_memory(opts).await.expect("open");
+        let mut conversation = harness.conversation();
+        let task = conversation
+            .create_task("test.ask", json!({ "keys": ["a"], "until": 2_000 }))
+            .await
+            .expect("create");
+        let parked = conversation.wait_task(&task).await;
+        assert!(matches!(parked.state, State::WaitingOnSignals { .. }));
+        // Past the deadline: a delivery is closed and expires the key.
+        *clock.lock().expect("clock") = 2_500;
+        assert_eq!(
+            conversation
+                .signal(
+                    &task,
+                    &ANSWER,
+                    "a",
+                    &Answer {
+                        text: "late".into()
+                    }
+                )
+                .await,
+            SignalResult::Closed
+        );
+        let settled = conversation.wait_task(&task).await;
+        let State::Terminal {
+            outcome: TaskOutcome::Completed { result },
+        } = &settled.state
+        else {
+            panic!("it wakes expired: {:?}", settled.state)
+        };
+        assert_eq!(result["wake"], json!({"reason": "expired"}));
+        assert_eq!(result["states"], json!([{ "expired": true }]));
+        harness.close().await.expect("close");
+    }
+}

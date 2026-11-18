@@ -44,6 +44,8 @@ pub struct TaskContext<I, S> {
     pub input: Arc<I>,
     /// The checkpoint this invocation runs at.
     pub checkpoint: Arc<S>,
+    /// The wake this invocation resumed at, if any.
+    wake: Option<WakeReason>,
     /// First-writer-wins values kept while the task can run.
     memos: BTreeMap<String, Value>,
     runtime: TaskRuntime,
@@ -73,12 +75,14 @@ impl<I, S> TaskContext<I, S> {
     pub(crate) fn new(
         input: Arc<I>,
         checkpoint: Arc<S>,
+        wake: Option<WakeReason>,
         memos: BTreeMap<String, Value>,
         runtime: TaskRuntime,
     ) -> Self {
         TaskContext {
             input,
             checkpoint,
+            wake,
             memos,
             runtime,
         }
@@ -99,6 +103,49 @@ impl<I, S> TaskContext<I, S> {
     /// `checkpoint` to resume at (upstream `runtime.sleepUntil`).
     pub async fn sleep_until(&mut self, until: u64, checkpoint: Value) {
         self.commit(TaskCommit::Sleep { until, checkpoint }).await;
+    }
+
+    /// Waits for a signal: parks until one of `signals` holds a value no
+    /// wake used, or `until` passes, resuming at `checkpoint` with the
+    /// wake as its reason (upstream sleeps with `signals`).
+    pub async fn wait_for<T>(
+        &mut self,
+        signals: &[SignalKey<T>],
+        until: Option<u64>,
+        checkpoint: Value,
+    ) {
+        self.commit(TaskCommit::Wait {
+            until,
+            signals: signals
+                .iter()
+                .map(|key| (key.signal.to_owned(), key.key.clone()))
+                .collect(),
+            checkpoint,
+        })
+        .await;
+    }
+
+    /// The wake this invocation resumed at, if any (upstream
+    /// `task.state.wake`): a phase reads it to know why it runs.
+    pub fn wake(&self) -> Option<&WakeReason> {
+        self.wake.as_ref()
+    }
+
+    /// A signal key's committed state (upstream `runtime.readSignal`):
+    /// the value delivered under it, `Expired` if its deadline passed
+    /// first, or `None` while nothing holds it.
+    pub async fn read_signal<T: serde::de::DeserializeOwned>(
+        &mut self,
+        token: &SignalToken<T>,
+        key: &str,
+    ) -> Option<SignalState<T>> {
+        let name = token.memo_name(key);
+        let state = self.memos.get(&name).cloned()?;
+        if state.get("expired") == Some(&Value::Bool(true)) {
+            return Some(SignalState::Expired);
+        }
+        let value = state.get("value")?.clone();
+        serde_json::from_value(value).ok().map(SignalState::Value)
     }
 
     /// The first value written under `name`, writing `value` if none:
@@ -131,6 +178,15 @@ pub enum TaskCommit {
     /// meanwhile, and a harness opened later continues it once its time
     /// has come.
     Sleep { until: u64, checkpoint: Value },
+    /// Wait for a signal: park until one of `signals` holds a value no
+    /// wake used, or `until` passes, whichever comes first, resuming at
+    /// `checkpoint` with the wake as its reason (upstream sleeps with
+    /// `signals`). Needs a deadline or at least one key.
+    Wait {
+        until: Option<u64>,
+        signals: Vec<(String, String)>,
+        checkpoint: Value,
+    },
     /// The task is done, with its result.
     Completed(Value),
     /// The task failed, with its error.
@@ -245,15 +301,129 @@ fn is_zero(value: &u32) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub enum TaskState {
-    /// Eligible for scheduling, at its checkpoint.
-    Pending { checkpoint: Value },
+    /// Eligible for scheduling, at its checkpoint; `wake` is why it last
+    /// resumed.
+    Pending {
+        checkpoint: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake: Option<WakeReason>,
+    },
     /// Reserved by one in-memory invocation.
-    Running { checkpoint: Value },
+    Running {
+        checkpoint: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake: Option<WakeReason>,
+    },
     /// Parked without an invocation until the harness clock reaches
     /// `until`, then resuming at `checkpoint` (upstream `sleeping`).
     Sleeping { checkpoint: Value, until: u64 },
+    /// Parked without an invocation until a signal key holds a value no
+    /// wake used or `until` passes, then resuming at `checkpoint` with
+    /// the wake as its reason (upstream `sleeping` with signals).
+    WaitingOnSignals {
+        checkpoint: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        signals: Vec<Value>,
+    },
     /// Settled, with its outcome.
     Terminal { outcome: TaskOutcome },
+}
+
+/// A signal kind (upstream `defineSignal`): JSON values delivered under
+/// keys to a task, kept in its memos until a wake uses them. `T` is the
+/// value's Rust type, for the callers; the wire is JSON.
+pub struct SignalToken<T> {
+    /// The signal's name, unique like a task kind; no `/`.
+    pub name: &'static str,
+    pub version: u32,
+    #[doc(hidden)]
+    pub _marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Copy for SignalToken<T> {}
+
+impl<T> Clone for SignalToken<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+/// Defines a signal kind (upstream `defineSignal`): values of `T` (any
+/// JSON shape) delivered under keys.
+pub const fn define_signal<T>(name: &'static str, version: u32) -> SignalToken<T> {
+    SignalToken {
+        name,
+        version,
+        _marker: std::marker::PhantomData,
+    }
+}
+
+impl<T> SignalToken<T> {
+    /// The key of one wait for this signal (upstream `token.key`).
+    pub fn key(&self, key: impl Into<String>) -> SignalKey<T> {
+        SignalKey {
+            signal: self.name,
+            key: key.into(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// The memo a key's state lives in.
+    pub(crate) fn memo_name(&self, key: &str) -> String {
+        format!("pi.signal.{}/{}", self.name, key)
+    }
+}
+
+/// The key of one wait (upstream `SignalKey`).
+pub struct SignalKey<T> {
+    pub signal: &'static str,
+    pub key: String,
+    #[doc(hidden)]
+    pub _marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for SignalKey<T> {
+    fn clone(&self) -> Self {
+        SignalKey {
+            signal: self.signal,
+            key: self.key.clone(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+/// A key's state: the value delivered under it, or expired because its
+/// sleep's deadline came first (upstream `SignalState`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SignalState<T> {
+    Value(T),
+    Expired,
+}
+
+/// What a delivery did (upstream `SignalResult`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalResult {
+    /// Durably accepted, not necessarily consumed.
+    Delivered,
+    /// The key already holds a value.
+    Duplicate,
+    /// The task ended, is abort-marked, or the key expired.
+    Closed,
+    /// No such task.
+    NotFound,
+}
+
+/// Why a wait woke (upstream `WakeReason`): `expired`, or `signal`
+/// naming the key that held a value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "reason")]
+pub enum WakeReason {
+    /// The deadline passed.
+    Expired,
+    /// A signal key held a value no wake used.
+    Signal { signal: String, key: String },
 }
 
 /// A task's terminal outcome (upstream `TaskOutcome`).
@@ -381,9 +551,11 @@ where
             let Some(handler) = handler else {
                 return;
             };
+            let wake = record_wake(&record);
             let context = TaskContext::new(
                 Arc::new(input),
                 Arc::new(checkpoint),
+                wake,
                 record.memos.clone(),
                 runtime,
             );
@@ -391,6 +563,18 @@ where
         })
     })
 }
+
+/// The wake a record's state holds, as the resumed phase reads it.
+pub(crate) fn record_wake(record: &DurableRecordCore) -> Option<WakeReason> {
+    record
+        .state
+        .get("wake")
+        .and_then(|wake| serde_json::from_value(wake.clone()).ok())
+}
+
+/// The core a wake is read from (the noel-core record, as the erased
+/// handlers hold it).
+pub(crate) type DurableRecordCore = noel_core::DurableTaskRecord;
 
 fn erased_abort<I, S>(definition: Arc<TaskDefinition<I, S>>) -> Invoke
 where
@@ -406,9 +590,11 @@ where
             let Some(handler) = definition.abort.clone() else {
                 return;
             };
+            let wake = record_wake(&record);
             let context = TaskContext::new(
                 Arc::new(input),
                 Arc::new(checkpoint),
+                wake,
                 record.memos.clone(),
                 runtime,
             );

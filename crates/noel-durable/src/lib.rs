@@ -32,8 +32,9 @@ pub use provider::{ProviderOptions, ProviderResolver, ProviderSource};
 pub use sqlite::SqliteJournal;
 pub use submission::{Settled, Submission, SubmissionState};
 pub use tasks::{
-    phase, TaskCommit, TaskContext, TaskDefinition, TaskOutcome, TaskRecord, TaskRegistry,
-    TaskSettings, TaskState,
+    define_signal, phase, SignalKey, SignalResult, SignalState, SignalToken, TaskCommit,
+    TaskContext, TaskDefinition, TaskOutcome, TaskRecord, TaskRegistry, TaskSettings, TaskState,
+    WakeReason,
 };
 pub use tools::{Tool, ToolContext, ToolRegistry, ToolResult};
 
@@ -424,6 +425,23 @@ impl Conversation<'_> {
     /// arms its own wakeup with it.
     pub async fn wake(&self) -> Option<u64> {
         self.harness.driver.wake().await
+    }
+
+    /// Delivers a signal value under a key (upstream `harness.signal`):
+    /// the value waits in the task until a wake uses it. A task that
+    /// ended, is abort-marked, or whose key expired answers `Closed`.
+    pub async fn signal<T: serde::Serialize>(
+        &mut self,
+        task_id: &str,
+        token: &SignalToken<T>,
+        key: &str,
+        value: &T,
+    ) -> SignalResult {
+        let value = serde_json::to_value(value).unwrap_or(serde_json::Value::Null);
+        self.harness
+            .driver
+            .task_signal(task_id, token.name, key, value)
+            .await
     }
 }
 

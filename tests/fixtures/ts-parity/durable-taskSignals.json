@@ -1,0 +1,76 @@
+{
+	"source": {
+		"repository": "https://github.com/earendil-works/pi",
+		"ref": "main",
+		"commit": "841dc6050b5f0014733ee40436f8ad7cf80c93fe",
+		"package": "packages/durable",
+		"script": "/ts-parity/durable-fixture.ts"
+	},
+	"scenario": "taskSignals",
+	"outcome": {
+		"delivery": {
+			"results": [
+				"not_found",
+				"delivered",
+				"duplicate"
+			],
+			"outcome": {
+				"wake": {
+					"reason": "signal",
+					"signal": "test.answer",
+					"key": "a"
+				},
+				"states": [
+					{
+						"value": {
+							"text": "yes"
+						}
+					}
+				]
+			},
+			"lateIsClosed": null
+		},
+		"early": {
+			"wake": {
+				"reason": "signal",
+				"signal": "test.answer",
+				"key": "a"
+			},
+			"states": [
+				{
+					"value": {
+						"text": "early"
+					}
+				}
+			]
+		},
+		"firstKey": {
+			"wake": {
+				"reason": "signal",
+				"signal": "test.answer",
+				"key": "b"
+			},
+			"states": [
+				null,
+				{
+					"value": {
+						"text": "bee"
+					}
+				}
+			]
+		},
+		"expire": {
+			"late": "closed",
+			"outcome": {
+				"wake": {
+					"reason": "expired"
+				},
+				"states": [
+					{
+						"expired": true
+					}
+				]
+			}
+		}
+	}
+}
