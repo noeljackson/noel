@@ -26,6 +26,8 @@ mod rewind;
 mod rewind_tests;
 mod session_export;
 mod session_lock;
+
+pub use session_lock::{acquire as acquire_session_lock, SessionLock};
 pub mod storage;
 #[cfg(test)]
 mod subagent_tests;
@@ -56,8 +58,6 @@ use progress::{ReplyProgress, ToolProgress};
 pub use rewind::Undone;
 #[allow(unused_imports)]
 pub use session_export::*;
-#[cfg(test)]
-use session_lock::SessionLock;
 pub use subagents::{run_task_tool, SubagentEvent, TaskToolArgs};
 pub use system_prompt::PRODUCT_NAME;
 use system_prompt::{PromptTool, SystemPromptInput};
@@ -2459,6 +2459,32 @@ impl SessionStore {
 
     /// Replaces the journal with the full state in one atomic rename, so a
     /// crash leaves either the previous journal or the complete new one.
+    /// [`SessionStore::fork_with_id`] into a caller's storage (the SDK's
+    /// multi-conversation harness forks into the journal it manages): the
+    /// source's state written whole as a new session named `session_id`,
+    /// runs and unfinished work left with the source.
+    pub fn fork_into_storage(
+        storage: storage::Storage,
+        source: &SessionState,
+        session_id: impl Into<String>,
+    ) -> Result<(Self, SessionState), SessionError> {
+        let store = Self::on(storage);
+        let session_id = session_id.into();
+        let mut state = source.clone();
+        state.session_id = session_id.clone();
+        state.runs.clear();
+        state.partial = None;
+        state.tool_outputs.clear();
+        state.parent_session_id = Some(source.session_id.clone());
+        state.branch_summaries.push(BranchSummary {
+            from_session_id: source.session_id.clone(),
+            to_session_id: session_id,
+            summary: summarize_branch(source),
+        });
+        store.write_full_state(&state)?;
+        Ok((store, state))
+    }
+
     fn write_full_state(&self, state: &SessionState) -> Result<(), SessionError> {
         let mut records = vec![SessionRecord::Started {
             session_id: state.session_id.clone(),

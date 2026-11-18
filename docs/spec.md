@@ -44,6 +44,20 @@ the TUI, print mode, RPC mode and the server alike.
 streaming reply and a running tool call have produced so far, and an aborted
 reply stays in the transcript.
 
+**Built** (the Durable SDK, `docs/durable-sdk-2026-11.md`): a harness of many
+conversations. Each conversation is its own session with its own journal
+under one directory — `<dir>/<conversation-id>.jsonl` (the journal above) or
+`<dir>/<conversation-id>.sqlite` (`noel-durable`'s `SqliteJournal`, the same
+records in a SQLite table, one row per record in append order) — its own
+session lock, and its own crash domain: a corrupted or locked journal strands
+one conversation, never the harness. Upstream Durable keeps every
+conversation in one storage; noel keeps one journal per session, so the
+harness is a manager over per-conversation stores (recorded as a deliberate
+difference in the plan). A fork is a new conversation whose journal starts as
+the source's saved state (`SessionStore::fork_into_storage`); upstream's
+fork-at-an-entry becomes fork-at-saved-state here — the rewind surface
+chooses the point first.
+
 ## 3. Submissions, the queue and abort
 
 ### 3.1 Submissions
