@@ -24,6 +24,19 @@ pub trait PluginToolHost: Send + Sync {
         tool: &str,
         args: Value,
     ) -> Pin<Box<dyn Future<Output = PluginToolOutput> + Send>>;
+
+    /// [`Self::call`] with the tool call's id (the Durable SDK's parked
+    /// tools key their parks by it). Default: as `call`.
+    fn call_with_id(
+        &self,
+        plugin: &str,
+        tool: &str,
+        call_id: &str,
+        args: Value,
+    ) -> Pin<Box<dyn Future<Output = PluginToolOutput> + Send>> {
+        let _ = call_id;
+        self.call(plugin, tool, args)
+    }
 }
 
 /// A tool a plugin contributes.

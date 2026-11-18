@@ -36,7 +36,7 @@ pub use tasks::{
     TaskContext, TaskDefinition, TaskOutcome, TaskRecord, TaskRegistry, TaskSettings, TaskState,
     WakeReason,
 };
-pub use tools::{Tool, ToolContext, ToolRegistry, ToolResult};
+pub use tools::{Tool, ToolContext, ToolOutcome, ToolRegistry, ToolResult};
 
 use std::path::PathBuf;
 use std::sync::Arc;

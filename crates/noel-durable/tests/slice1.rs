@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use common::{options_with, Scripted, ScriptedReply};
 use noel_ai::StreamEvent;
-use noel_durable::{Harness, Input, InputId, Settled, Tool, ToolContext, ToolRegistry, ToolResult};
+use noel_durable::{
+    Harness, Input, InputId, Settled, Tool, ToolContext, ToolOutcome, ToolRegistry, ToolResult,
+};
 use noel_parity::load_fixture;
 use serde_json::{json, Value};
 
@@ -37,10 +39,10 @@ impl Tool for StepTool {
     fn execute<'a>(
         &'a self,
         context: ToolContext<'a>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolOutcome> + Send + 'a>> {
         Box::pin(async move {
             let n = context.arguments.get("n").cloned().unwrap_or(json!(0));
-            ToolResult::text(format!("step {} done", n))
+            ToolOutcome::Result(ToolResult::text(format!("step {} done", n)))
         })
     }
 }

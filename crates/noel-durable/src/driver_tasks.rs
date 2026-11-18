@@ -130,6 +130,39 @@ pub(super) async fn run_to_terminal(
         let Some(record) = controller.runtime().session().tasks.get(task_id).cloned() else {
             return TaskRecord::orphaned(task_id);
         };
+        // A woken tool park resumes the run it interrupted first (slice
+        // 6): the replay reruns the parked call, whose execute returns
+        // the result the run then completes with.
+        if record.kind == "noel.tool-park"
+            && let RecordState::WaitingOnSignals {
+                checkpoint,
+                until,
+                signals,
+            } = record_state(&record)
+        {
+            let now = controller.host().clock.now();
+            let woken = crate::driver_tasks::first_signalled(controller, &record, &signals)
+                .is_some()
+                || until.is_some_and(|until| now >= until);
+            if woken
+                && let Some(run_id) = controller
+                    .runtime()
+                    .session()
+                    .runs
+                    .last()
+                    .filter(|run| run.status == noel_core::RunStatus::Interrupted)
+                    .map(|run| run.id.clone())
+                && let Ok(start) = controller.resume(&run_id).await
+            {
+                let (sender, mut inbox) =
+                    tokio::sync::mpsc::unbounded_channel::<crate::driver::Request>();
+                drop(sender);
+                let _ = controller
+                    .run(start, &mut inbox, crate::driver::busy_noop)
+                    .await;
+            }
+            let _ = checkpoint;
+        }
         match record_state(&record) {
             RecordState::Terminal { outcome } => {
                 return public(
@@ -597,6 +630,49 @@ pub(super) fn signal(
             SignalResult::Delivered
         }
     }
+}
+
+/// Parks a tool call (slice 6): a task that waits on the park's signals
+/// (or deadline), resuming the run when it wakes — the run's replay then
+/// reruns the replay-safe call, whose execute reads what it waited for
+/// and returns the result (upstream's parked ToolTask).
+pub(super) async fn park_tool(
+    controller: &mut SessionController<SdkHost>,
+    park: crate::tools::ToolPark,
+) {
+    // The park is a task: a definition-free wait the driver holds.
+    let id = noel_core::controller::new_id();
+    let signals = park
+        .signals
+        .iter()
+        .map(|(signal, key)| serde_json::json!({ "signal": signal, "key": key }))
+        .collect::<Vec<_>>();
+    let state = serde_json::to_value(RecordState::WaitingOnSignals {
+        checkpoint: serde_json::json!({
+            "kind": "tool-park",
+            "call_id": park.call_id,
+            "tool": park.tool,
+            "checkpoint": park.checkpoint,
+        }),
+        until: park.until,
+        signals,
+    })
+    .expect("a task state serializes");
+    let _ = controller_mut_of(controller).save_task(DurableTaskRecord {
+        id: id.clone(),
+        kind: "noel.tool-park".into(),
+        version: 1,
+        input: park.arguments,
+        state,
+        background: false,
+        abort_requested: false,
+        restarts: 0,
+        memos: Default::default(),
+    });
+    // The run the park interrupted stays open (it was cancelled by the
+    // park itself); a host's wait_task on the park, or a wake poll,
+    // resumes it once woken. Nothing more here: the run's cancellation
+    // already ended this pass.
 }
 
 /// The earliest deadline of the session's sleeping tasks (the harness's

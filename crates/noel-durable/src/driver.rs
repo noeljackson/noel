@@ -27,7 +27,7 @@ use crate::submission::{Settled, Submission};
 use crate::{Input, InputId, QueuedItem, SubmitError, Withdrawn};
 
 /// What a handle asks the driver.
-enum Request {
+pub(crate) enum Request {
     Submit {
         input: Input,
         id: InputId,
@@ -461,8 +461,22 @@ async fn drive(
     for waiter in waiters {
         let _ = waiter.send(settled.clone());
     }
+    // A tool that parked holds the run's continuation: park each as a
+    // task (slice 6), and the harness resumes the run when it wakes.
+    let parks = controller
+        .host()
+        .tools
+        .lock()
+        .expect("tool registry")
+        .take_parks();
+    for park in parks {
+        crate::driver_tasks::park_tool(controller, park).await;
+    }
     finished
 }
+
+/// A busy handler that serves nothing (a resumed run driven inline).
+pub(crate) fn busy_noop(_request: Request, _run: &mut Busy<'_, SdkHost>) {}
 
 /// What arrived while the run worked, applied through `Busy` (the
 /// worker's `busy_command`).
