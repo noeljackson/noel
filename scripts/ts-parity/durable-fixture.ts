@@ -31,6 +31,7 @@ const {
 	createRegistry,
 	createSession,
 	defineExtension,
+	defineSignal,
 	defineTask,
 	defineTool,
 	Harness,
@@ -39,6 +40,7 @@ const {
 	MemoryStorage,
 } = await import(`${REFERENCE}/packages/durable/src/index.ts`);
 const { openNodeSqliteStorage } = await import(`${REFERENCE}/packages/durable/src/storage/sqlite/node.ts`);
+const { obj, str } = await import(`${REFERENCE}/node_modules/@earendil-works/pi-schema/src/index.ts`);
 
 const git = (...args: string[]): string =>
 	execFileSync("git", ["-C", REFERENCE, ...args], { encoding: "utf8" }).trim();
@@ -457,6 +459,100 @@ async function taskSleep(): Promise<Json> {
 	};
 }
 
+/** harness-signals (delivery + wakes, fake clock where due): delivery
+ * results; an early delivery waking a wait at once; a wait waking on the
+ * first key holding a value; a deadline expiring its keys. */
+async function taskSignals(): Promise<Json> {
+	let clock = 1_000;
+	const Answer = defineSignal<{ text: string }>({ name: "test.answer", version: 1, schema: obj({ text: str() }) });
+	type AskState = { phase: "ask" } | { phase: "answered" };
+	const Ask = defineTask<{ keys: string[]; until?: number }, AskState, unknown>({
+		name: "test.ask",
+		version: 1,
+		initial: () => ({ phase: "ask" }),
+		phases: {
+			ask: async (task, runtime, ctx) => {
+				const { keys, until } = task.input;
+				await runtime.commit(
+					() => ({
+						status: "sleeping",
+						checkpoint: { phase: "answered" },
+						signals: keys.map((key) => Answer.key(key)),
+						...(until === undefined ? {} : { until }),
+					}),
+					ctx,
+				);
+			},
+			answered: async (task, runtime, ctx) => {
+				const states = [];
+				for (const key of task.input.keys) states.push((await runtime.readSignal(Answer, key, ctx)) ?? null);
+				const wake = task.state.wake;
+				await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: { wake, states } } }), ctx);
+			},
+		},
+		abort: (_task, runtime, ctx) => runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
+	});
+	const registry = createRegistry();
+	registry.install(defineExtension({ name: "asks", tasks: [Ask] }));
+	const open = () =>
+		Harness.open(new MemoryStorage(), { models: createModels(), registry, now: () => clock }, BACKGROUND_CONTEXT);
+	const start = async (harness: Awaited<ReturnType<typeof open>>, input: { keys: string[]; until?: number }) => {
+		const root = await harness.root(BACKGROUND_CONTEXT);
+		return root.commit((tx) => tx.createTask(Ask, input, { ownership: { kind: "conversation" } }), BACKGROUND_CONTEXT);
+	};
+
+	// Delivery results, in upstream's order.
+	const delivery = await open();
+	const delivered = await start(delivery, { keys: ["a"] });
+	const results = [
+		await delivery.signal(999_999, Answer, "a", { text: "x" }, BACKGROUND_CONTEXT),
+		await delivery.signal(delivered, Answer, "a", { text: "yes" }, BACKGROUND_CONTEXT),
+		await delivery.signal(delivered, Answer, "a", { text: "again" }, BACKGROUND_CONTEXT),
+	];
+	const deliveryDone = (await delivery.waitForTask(delivered, BACKGROUND_CONTEXT)).state.outcome;
+	await delivery.close(BACKGROUND_CONTEXT);
+
+	// An early delivery wakes the wait at once, its value kept.
+	const early = await open();
+	const earlyTask = await start(early, { keys: ["a"] });
+	await early.signal(earlyTask, Answer, "a", { text: "early" }, BACKGROUND_CONTEXT);
+	const earlyDone = (await early.waitForTask(earlyTask, BACKGROUND_CONTEXT)).state.outcome;
+	await early.close(BACKGROUND_CONTEXT);
+
+	// A wait wakes on the first listed key holding a value.
+	const first = await open();
+	const firstTask = await start(first, { keys: ["a", "b"] });
+	first.resume();
+	await new Promise<void>((resolve) => setTimeout(resolve, 20));
+	await first.signal(firstTask, Answer, "b", { text: "bee" }, BACKGROUND_CONTEXT);
+	const firstDone = (await first.waitForTask(firstTask, BACKGROUND_CONTEXT)).state.outcome;
+	await first.close(BACKGROUND_CONTEXT);
+
+	// A deadline expires its keys, so a late delivery is closed.
+	const expire = await open();
+	const expireTask = await start(expire, { keys: ["a"], until: 2_000 });
+	expire.resume();
+	await new Promise<void>((resolve) => setTimeout(resolve, 20));
+	clock = 2_500;
+	const late = await expire.signal(expireTask, Answer, "a", { text: "late" }, BACKGROUND_CONTEXT);
+	const expireDone = (await expire.waitForTask(expireTask, BACKGROUND_CONTEXT)).state.outcome;
+	await expire.close(BACKGROUND_CONTEXT);
+
+	return {
+		delivery: {
+			results,
+			outcome: deliveryDone?.status === "completed" ? deliveryDone.result : null,
+			lateIsClosed: null,
+		},
+		early: earlyDone?.status === "completed" ? earlyDone.result : null,
+		firstKey: firstDone?.status === "completed" ? firstDone.result : null,
+		expire: {
+			late,
+			outcome: expireDone?.status === "completed" ? expireDone.result : null,
+		},
+	};
+}
+
 const scenarios: Record<string, () => Promise<Json>> = {
 	chat,
 	print: printMode,
@@ -467,6 +563,7 @@ const scenarios: Record<string, () => Promise<Json>> = {
 	tasks,
 	taskRecovery,
 	taskSleep,
+	taskSignals,
 };
 
 const outDir = process.argv[2];

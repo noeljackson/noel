@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use noel_core::controller::{AbortPolicy, Busy, SessionController, Start};
 use noel_core::{QueueItem, QueueMode, RunStatus, SubmissionKind};
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::events::{Events, OwnedEvent, Subscription};
@@ -63,6 +64,14 @@ enum Request {
     /// The earliest sleeping deadline (the harness's wake).
     TaskWake {
         reply: oneshot::Sender<Option<u64>>,
+    },
+    /// Delivers a signal value under a key (upstream `harness.signal`).
+    TaskSignal {
+        task_id: String,
+        signal: String,
+        key: String,
+        value: Value,
+        reply: oneshot::Sender<crate::tasks::SignalResult>,
     },
     Close {
         reply: oneshot::Sender<()>,
@@ -174,6 +183,31 @@ impl Handle {
 
     /// The harness's wake: the earliest deadline of its sleeping tasks,
     /// or `None` when none sleeps (upstream `harness.wake()`).
+    /// Delivers a signal value under a key (upstream `harness.signal`).
+    pub(crate) async fn task_signal(
+        &self,
+        task_id: &str,
+        signal: &str,
+        key: &str,
+        value: Value,
+    ) -> crate::tasks::SignalResult {
+        let (reply, done) = oneshot::channel();
+        if self
+            .requests
+            .send(Request::TaskSignal {
+                task_id: task_id.to_owned(),
+                signal: signal.to_owned(),
+                key: key.to_owned(),
+                value,
+                reply,
+            })
+            .is_err()
+        {
+            return crate::tasks::SignalResult::NotFound;
+        }
+        done.await.unwrap_or(crate::tasks::SignalResult::NotFound)
+    }
+
     pub(crate) async fn wake(&self) -> Option<u64> {
         let (reply, done) = oneshot::channel();
         if self.requests.send(Request::TaskWake { reply }).is_err() {
@@ -324,6 +358,21 @@ async fn driver(
             }
             Request::TaskWake { reply } => {
                 let _ = reply.send(crate::driver_tasks::wake(&controller));
+            }
+            Request::TaskSignal {
+                task_id,
+                signal,
+                key,
+                value,
+                reply,
+            } => {
+                let _ = reply.send(crate::driver_tasks::signal(
+                    &mut controller,
+                    &task_id,
+                    &signal,
+                    &key,
+                    value,
+                ));
             }
             Request::Close { reply } => {
                 let _ = reply.send(());
@@ -482,6 +531,9 @@ fn busy_request(request: Request, run: &mut Busy<'_, SdkHost>) {
         }
         Request::TaskWake { reply } => {
             let _ = reply.send(None);
+        }
+        Request::TaskSignal { reply, .. } => {
+            let _ = reply.send(crate::tasks::SignalResult::Closed);
         }
         Request::Close { reply } => {
             let _ = reply.send(());

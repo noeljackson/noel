@@ -47,10 +47,30 @@ impl RuntimeMut<'_> {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub(crate) enum RecordState {
-    Pending { checkpoint: Value },
-    Running { checkpoint: Value },
-    Sleeping { checkpoint: Value, until: u64 },
-    Terminal { outcome: RecordOutcome },
+    Pending {
+        checkpoint: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake: Option<Value>,
+    },
+    Running {
+        checkpoint: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake: Option<Value>,
+    },
+    Sleeping {
+        checkpoint: Value,
+        until: u64,
+    },
+    WaitingOnSignals {
+        checkpoint: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        signals: Vec<Value>,
+    },
+    Terminal {
+        outcome: RecordOutcome,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
@@ -85,6 +105,7 @@ pub(super) fn create(
         input,
         state: serde_json::to_value(RecordState::Pending {
             checkpoint: Value::Null,
+            wake: None,
         })
         .expect("a task state serializes"),
         background,
@@ -129,7 +150,64 @@ pub(super) async fn run_to_terminal(
                     return public(&record, TaskState::Sleeping { checkpoint, until });
                 }
             }
-            RecordState::Pending { checkpoint } | RecordState::Running { checkpoint } => {
+            RecordState::WaitingOnSignals {
+                checkpoint,
+                until,
+                signals,
+            } => {
+                // A wake is decided: a key holding a value no wake used
+                // (delivered, or kept from an earlier wake), or the
+                // deadline passing (which expires the keys).
+                let now = controller.host().clock.now();
+                let due = until.is_some_and(|until| now >= until);
+                if let Some(wake) = first_signalled(controller, &record, &signals) {
+                    let woken = with_wake(controller, &record, wake);
+                    invoke(controller, &woken, checkpoint, false).await;
+                } else if due {
+                    expire_signals(controller, &record, &signals);
+                    let woken = with_wake(
+                        controller,
+                        &record,
+                        serde_json::to_value(crate::tasks::WakeReason::Expired).expect("wake"),
+                    );
+                    invoke(controller, &woken, checkpoint, false).await;
+                } else if signals.is_empty() && until.is_none() {
+                    // Cannot wait on nothing (upstream faults it); refuse
+                    // at commit time would be better, so settle failed.
+                    settle(
+                        controller,
+                        &record,
+                        RecordOutcome::Failed {
+                            error: "cannot sleep without until or signals".into(),
+                        },
+                    );
+                    return public(
+                        controller
+                            .runtime()
+                            .session()
+                            .tasks
+                            .get(task_id)
+                            .unwrap_or(&record),
+                        TaskState::Terminal {
+                            outcome: TaskOutcome::Failed {
+                                error: "cannot sleep without until or signals".into(),
+                            },
+                        },
+                    );
+                } else {
+                    let deadline = until.filter(|until| *until > now);
+                    let _ = deadline;
+                    return public(
+                        &record,
+                        TaskState::WaitingOnSignals {
+                            checkpoint,
+                            until,
+                            signals,
+                        },
+                    );
+                }
+            }
+            RecordState::Pending { checkpoint, .. } | RecordState::Running { checkpoint, .. } => {
                 invoke(controller, &record, checkpoint, false).await;
             }
         }
@@ -148,9 +226,10 @@ pub(super) async fn abort(
     let state = record_state(&record);
     match state {
         RecordState::Terminal { .. } => Ok(()),
-        RecordState::Pending { checkpoint }
-        | RecordState::Running { checkpoint }
-        | RecordState::Sleeping { checkpoint, .. } => {
+        RecordState::Pending { checkpoint, .. }
+        | RecordState::Running { checkpoint, .. }
+        | RecordState::Sleeping { checkpoint, .. }
+        | RecordState::WaitingOnSignals { checkpoint, .. } => {
             record.abort_requested = true;
             controller_mut_of(controller)
                 .save_task(record.clone())
@@ -175,7 +254,7 @@ pub(super) fn recover(controller: &mut SessionController<SdkHost>, restart_limit
         .cloned()
         .collect::<Vec<_>>();
     for record in records {
-        if let RecordState::Running { checkpoint } = record_state(&record) {
+        if let RecordState::Running { checkpoint, .. } = record_state(&record) {
             let restarts = record.restarts + 1;
             if restarts >= restart_limit {
                 let state = serde_json::to_value(RecordState::Terminal {
@@ -185,8 +264,11 @@ pub(super) fn recover(controller: &mut SessionController<SdkHost>, restart_limit
                 let _ =
                     controller_mut_of(controller).save_task(DurableTaskRecord { state, ..record });
             } else {
-                let state = serde_json::to_value(RecordState::Pending { checkpoint })
-                    .expect("a task state serializes");
+                let state = serde_json::to_value(RecordState::Pending {
+                    checkpoint,
+                    wake: None,
+                })
+                .expect("a task state serializes");
                 let _ = controller_mut_of(controller).save_task(DurableTaskRecord {
                     restarts,
                     state,
@@ -206,10 +288,17 @@ async fn invoke(
     checkpoint: Value,
     aborting: bool,
 ) {
-    // Mark running (one record).
+    // Mark running (one record), keeping the wake this invocation
+    // resumes at (a wait's wake, stamped by the pass that woke it).
+    let wake = record
+        .state
+        .get("wake")
+        .cloned()
+        .filter(|wake| !wake.is_null());
     let running = DurableTaskRecord {
         state: serde_json::to_value(RecordState::Running {
             checkpoint: checkpoint.clone(),
+            wake: wake.clone(),
         })
         .expect("a task state serializes"),
         ..record.clone()
@@ -330,7 +419,22 @@ fn apply(
         .unwrap_or_default();
     let state = match commit {
         TaskCommit::Sleep { until, checkpoint } => RecordState::Sleeping { checkpoint, until },
-        TaskCommit::Continue(checkpoint) => RecordState::Pending { checkpoint },
+        TaskCommit::Wait {
+            until,
+            signals,
+            checkpoint,
+        } => RecordState::WaitingOnSignals {
+            checkpoint,
+            until,
+            signals: signals
+                .into_iter()
+                .map(|(signal, key)| serde_json::json!({ "signal": signal, "key": key }))
+                .collect(),
+        },
+        TaskCommit::Continue(checkpoint) => RecordState::Pending {
+            checkpoint,
+            wake: None,
+        },
         TaskCommit::Completed(result) => RecordState::Terminal {
             outcome: RecordOutcome::Completed { result },
         },
@@ -361,6 +465,140 @@ fn settle(
     });
 }
 
+/// The first of `signals` whose key holds a value no wake used, as a
+/// wake (checked in the task's memos).
+fn first_signalled(
+    _controller: &SessionController<SdkHost>,
+    record: &DurableTaskRecord,
+    signals: &[Value],
+) -> Option<Value> {
+    for key in signals {
+        let (Some(signal), Some(key)) = (
+            key.get("signal").and_then(Value::as_str),
+            key.get("key").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let memo = format!("pi.signal.{signal}/{key}");
+        if let Some(state) = record.memos.get(&memo)
+            && state.get("value").is_some()
+        {
+            return Some(
+                serde_json::to_value(crate::tasks::WakeReason::Signal {
+                    signal: signal.to_owned(),
+                    key: key.to_owned(),
+                })
+                .expect("a wake serializes"),
+            );
+        }
+    }
+    None
+}
+
+/// Saves the record with `wake` on its state, for the invocation that
+/// resumes at it to read.
+fn with_wake(
+    controller: &mut SessionController<SdkHost>,
+    record: &DurableTaskRecord,
+    wake: Value,
+) -> DurableTaskRecord {
+    let mut state = record.state.clone();
+    state["wake"] = wake;
+    let woken = DurableTaskRecord {
+        state,
+        ..record.clone()
+    };
+    let _ = controller_mut_of(controller).save_task(woken.clone());
+    woken
+}
+
+/// Expires a wait's keys at its deadline: a later delivery is closed
+/// (upstream expires in the delivery path once due).
+fn expire_signals(
+    controller: &mut SessionController<SdkHost>,
+    record: &DurableTaskRecord,
+    signals: &[Value],
+) {
+    let mut memos = record.memos.clone();
+    for key in signals {
+        let (Some(signal), Some(key)) = (
+            key.get("signal").and_then(Value::as_str),
+            key.get("key").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let memo = format!("pi.signal.{signal}/{key}");
+        memos.insert(memo, serde_json::json!({ "expired": true }));
+    }
+    let _ = controller_mut_of(controller).save_task(DurableTaskRecord {
+        memos,
+        ..record.clone()
+    });
+}
+
+/// Delivers a signal value under a key (upstream `harness.signal`):
+/// the value waits in the task's memos until a wake uses it. A task that
+/// ended, is abort-marked, or whose key expired answers `Closed`.
+pub(super) fn signal(
+    controller: &mut SessionController<SdkHost>,
+    task_id: &str,
+    signal: &str,
+    key: &str,
+    value: Value,
+) -> crate::tasks::SignalResult {
+    use crate::tasks::SignalResult;
+    let Some(record) = controller.runtime().session().tasks.get(task_id).cloned() else {
+        return SignalResult::NotFound;
+    };
+    if record.abort_requested {
+        return SignalResult::Closed;
+    }
+    let state = record_state(&record);
+    match state {
+        RecordState::Terminal { .. } => SignalResult::Closed,
+        RecordState::WaitingOnSignals { until, signals, .. } => {
+            // A delivery after the deadline closed expires the key.
+            let now = controller.host().clock.now();
+            if until.is_some_and(|until| now >= until) {
+                expire_signals(controller, &record, &signals);
+                return SignalResult::Closed;
+            }
+            let memo = format!("pi.signal.{signal}/{key}");
+            let mut memos = record.memos.clone();
+            if memos.get(&memo).is_some_and(|state| {
+                state.get("value").is_some() || state.get("expired") == Some(&Value::Bool(true))
+            }) {
+                return SignalResult::Duplicate;
+            }
+            memos.insert(memo, serde_json::json!({ "version": 1, "value": value }));
+            let _ = controller_mut_of(controller).save_task(DurableTaskRecord {
+                memos,
+                ..record.clone()
+            });
+            SignalResult::Delivered
+        }
+        // A task not waiting still accepts a delivery (upstream: the
+        // value waits in the task; its wait then wakes at once).
+        RecordState::Pending { .. }
+        | RecordState::Running { .. }
+        | RecordState::Sleeping { .. } => {
+            let memo = format!("pi.signal.{signal}/{key}");
+            let mut memos = record.memos.clone();
+            if memos.get(&memo).is_some_and(|state| {
+                state.get("value").is_some() || state.get("expired") == Some(&Value::Bool(true))
+            }) {
+                return SignalResult::Duplicate;
+            }
+            memos.insert(memo, serde_json::json!({ "version": 1, "value": value }));
+            let _ = controller_mut_of(controller).save_task(DurableTaskRecord {
+                memos,
+                ..record.clone()
+            });
+            SignalResult::Delivered
+        }
+    }
+}
+
 /// The earliest deadline of the session's sleeping tasks (the harness's
 /// wake): a host arms its own wakeup with it (upstream `onWake` hosts,
 /// like a Durable Object alarm).
@@ -380,6 +618,7 @@ pub(super) fn wake(controller: &SessionController<SdkHost>) -> Option<u64> {
 fn record_state(record: &DurableTaskRecord) -> RecordState {
     serde_json::from_value(record.state.clone()).unwrap_or(RecordState::Pending {
         checkpoint: Value::Null,
+        wake: None,
     })
 }
 
