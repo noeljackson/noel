@@ -399,6 +399,64 @@ async function taskRecovery(): Promise<Json> {
 	};
 }
 
+/** harness-sleep (first scenario, fake clock): a task sleeps without an
+ * invocation, its record holding the deadline; the deadline passing (and
+ * only that) resumes it at its checkpoint; the wake reports the deadline. */
+async function taskSleep(): Promise<Json> {
+	let clock = 1_000;
+	const Nap = defineTask<null, { phase: "start" } | { phase: "after" }, number>({
+		name: "test.nap",
+		version: 1,
+		initial: () => ({ phase: "start" }),
+		phases: {
+			start: async (_task, runtime, ctx) => {
+				await runtime.sleepUntil(runtime.now() + 1_000, { phase: "after" }, ctx);
+			},
+			after: async (_task, runtime, ctx) => {
+				await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: runtime.now() } }), ctx);
+			},
+		},
+		abort: async (_task, runtime, ctx) => {
+			await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx);
+		},
+	});
+	const registry = createRegistry();
+	registry.install(defineExtension({ name: "naps", tasks: [Nap] }));
+	const harness = await Harness.open(new MemoryStorage(), {
+		models: createModels(),
+		registry,
+		now: () => clock,
+		onWake: () => {},
+	}, BACKGROUND_CONTEXT);
+	const root = await harness.root(BACKGROUND_CONTEXT);
+	const id = await root.commit(
+		(tx) => tx.createTask(Nap, null, { ownership: { kind: "conversation" } }),
+		BACKGROUND_CONTEXT,
+	);
+	harness.resume();
+	// Sleeping, without an invocation, its record holding the deadline.
+	await new Promise<void>((resolve) => setTimeout(resolve, 20));
+	const asleep = (await harness.getTask(id, BACKGROUND_CONTEXT))?.state;
+	const wakeAsleep = harness.wake();
+	// Early wakes run nothing.
+	clock = 1_999;
+	harness.resume();
+	await new Promise<void>((resolve) => setTimeout(resolve, 20));
+	const stillAsleep = (await harness.getTask(id, BACKGROUND_CONTEXT))?.state;
+	// The deadline passing resumes it; its result is the resumed clock.
+	clock = 2_000;
+	const receipt = await harness.waitForTask(id, BACKGROUND_CONTEXT);
+	const wakeDone = harness.wake();
+	await harness.close(BACKGROUND_CONTEXT);
+	return {
+		asleep: { status: asleep?.status, until: (asleep as { until?: number } | undefined)?.until },
+		wakeAsleep,
+		stillAsleep: stillAsleep?.status,
+		result: receipt.state.outcome?.status === "completed" ? receipt.state.outcome.result : null,
+		wakeDone,
+	};
+}
+
 const scenarios: Record<string, () => Promise<Json>> = {
 	chat,
 	print: printMode,
@@ -408,6 +466,7 @@ const scenarios: Record<string, () => Promise<Json>> = {
 	forks,
 	tasks,
 	taskRecovery,
+	taskSleep,
 };
 
 const outDir = process.argv[2];

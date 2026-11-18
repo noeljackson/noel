@@ -26,6 +26,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "durable-inbox.json",
     "durable-print.json",
     "durable-taskRecovery.json",
+    "durable-taskSleep.json",
     "durable-tasks.json",
     "durable-turnLimit.json",
     "error-classification.json",
@@ -214,6 +215,7 @@ fn every_script_output_is_committed() {
                 "durable-inbox.json",
                 "durable-print.json",
                 "durable-taskRecovery.json",
+                "durable-taskSleep.json",
                 "durable-tasks.json",
                 "durable-turnLimit.json",
             ]),
@@ -388,6 +390,10 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("durable-print.json", "crates/noel-durable/tests/slice1.rs"),
         (
             "durable-taskRecovery.json",
+            "crates/noel-durable/tests/tasks.rs",
+        ),
+        (
+            "durable-taskSleep.json",
             "crates/noel-durable/tests/tasks.rs",
         ),
         ("durable-tasks.json", "crates/noel-durable/tests/tasks.rs"),

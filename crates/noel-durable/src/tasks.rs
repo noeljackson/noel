@@ -95,6 +95,12 @@ impl<I, S> TaskContext<I, S> {
         .await;
     }
 
+    /// Sleeps until `until` on the harness clock, committing
+    /// `checkpoint` to resume at (upstream `runtime.sleepUntil`).
+    pub async fn sleep_until(&mut self, until: u64, checkpoint: Value) {
+        self.commit(TaskCommit::Sleep { until, checkpoint }).await;
+    }
+
     /// The first value written under `name`, writing `value` if none:
     /// exactly-once bookkeeping for effects between checkpoints (upstream
     /// `runtime.memo`). The memo is saved with the task's next commit.
@@ -113,12 +119,18 @@ impl TaskCommit {
     }
 }
 
-/// What a phase commits: the next checkpoint, or the outcome.
+/// What a phase commits: the next checkpoint, a sleep, or the outcome.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaskCommit {
     /// Continue at this checkpoint (the task stays runnable). The value
     /// is serialized into the record.
     Continue(Value),
+    /// Sleep until `until` on the harness clock, resuming at
+    /// `checkpoint` once due (upstream `runtime.sleepUntil`). The sleep
+    /// is stored with the checkpoint, so the task holds no invocation
+    /// meanwhile, and a harness opened later continues it once its time
+    /// has come.
+    Sleep { until: u64, checkpoint: Value },
     /// The task is done, with its result.
     Completed(Value),
     /// The task failed, with its error.
@@ -145,6 +157,13 @@ where
 /// A task definition: its name, version, initial checkpoint, one handler
 /// per phase, and an abort handler — upstream's `defineTask` as a value:
 /// `TaskDefinition::new(...).phase(name, phase(...)).abort(phase(...))`.
+///
+/// The checkpoint type `S` must round-trip the JSON the phases commit
+/// (as `Serialize` writes it, so `Deserialize` reads it back), and a
+/// checkpoint a handler resumes at should carry its phase as a `phase`
+/// string field, which the engine routes on. A struct with a `phase`
+/// field is the usual shape; an externally-tagged enum is not, because
+/// the commits are plain objects.
 pub struct TaskDefinition<I, S> {
     /// Registered name, persisted with the record (`kind`).
     pub name: &'static str,
@@ -152,9 +171,10 @@ pub struct TaskDefinition<I, S> {
     pub version: u32,
     /// The first checkpoint, from the input.
     pub initial: Arc<dyn Fn(&I) -> S + Send + Sync>,
-    /// One handler per phase. Each commits its next checkpoint or
-    /// terminal outcome; what it does between commits is not durable.
-    pub phases: BTreeMap<&'static str, PhaseHandler<I, S>>,
+    /// One handler per phase, in declaration order (the first is the
+    /// entry phase). Each commits its next checkpoint or terminal
+    /// outcome; what it does between commits is not durable.
+    pub phases: Vec<(&'static str, PhaseHandler<I, S>)>,
     /// Runs instead of the phases after an abort; it decides the outcome.
     pub abort: Option<PhaseHandler<I, S>>,
 }
@@ -169,16 +189,17 @@ impl<I, S> TaskDefinition<I, S> {
             name,
             version,
             initial: Arc::new(initial),
-            phases: BTreeMap::new(),
+            phases: Vec::new(),
             abort: None,
         }
     }
 }
 
 impl<I: Send + Sync + 'static, S: Send + Sync + 'static> TaskDefinition<I, S> {
-    /// Adds a phase handler (see [`phase`]).
+    /// Adds a phase handler (see [`phase`]); the first added is the
+    /// entry phase.
     pub fn phase(mut self, name: &'static str, handler: PhaseHandler<I, S>) -> Self {
-        self.phases.insert(name, handler);
+        self.phases.push((name, handler));
         self
     }
 
@@ -228,6 +249,9 @@ pub enum TaskState {
     Pending { checkpoint: Value },
     /// Reserved by one in-memory invocation.
     Running { checkpoint: Value },
+    /// Parked without an invocation until the harness clock reaches
+    /// `until`, then resuming at `checkpoint` (upstream `sleeping`).
+    Sleeping { checkpoint: Value, until: u64 },
     /// Settled, with its outcome.
     Terminal { outcome: TaskOutcome },
 }
@@ -315,7 +339,11 @@ where
     pub(crate) fn erased(self: &Arc<Self>) -> ErasedTask {
         let invoke = erased_invoke::<I, S>(self.clone());
         let abort = erased_abort::<I, S>(self.clone());
-        let names = self.phases.keys().copied().collect::<Vec<&'static str>>();
+        let names = self
+            .phases
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<&'static str>>();
         let phase_name = Arc::new(move |phase: &str| -> &'static str {
             if phase.is_empty() {
                 return names.first().copied().unwrap_or("");
@@ -345,7 +373,11 @@ where
             let Some((input, checkpoint)) = parsed::<I, S>(&record, &definition) else {
                 return;
             };
-            let handler = definition.phases.get(phase).cloned();
+            let handler = definition
+                .phases
+                .iter()
+                .find(|(name, _)| *name == phase)
+                .map(|(_, handler)| handler.clone());
             let Some(handler) = handler else {
                 return;
             };

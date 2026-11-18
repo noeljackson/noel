@@ -13,6 +13,9 @@ use crate::submission::Settled;
 use crate::tools::ToolRegistry;
 
 pub(super) struct SdkHost {
+    /// The harness clock (injected; default the system clock), which
+    /// sleeps and their deadlines are measured on.
+    pub(super) clock: Arc<crate::clock::Clock>,
     pub(super) providers: Arc<ProviderResolver>,
     pub(super) tools: Mutex<ToolRegistry>,
     pub(super) events: Arc<Events>,

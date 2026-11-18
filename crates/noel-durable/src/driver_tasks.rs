@@ -49,6 +49,7 @@ impl RuntimeMut<'_> {
 pub(crate) enum RecordState {
     Pending { checkpoint: Value },
     Running { checkpoint: Value },
+    Sleeping { checkpoint: Value, until: u64 },
     Terminal { outcome: RecordOutcome },
 }
 
@@ -117,6 +118,17 @@ pub(super) async fn run_to_terminal(
                     },
                 )
             }
+            RecordState::Sleeping { checkpoint, until } => {
+                // A due sleep runs at this pass (upstream: any scheduling
+                // pass runs it, before its timer); one not due answers its
+                // sleeping record, and a later wait runs it.
+                let now = controller.host().clock.now();
+                if now >= until {
+                    invoke(controller, &record, checkpoint, false).await;
+                } else {
+                    return public(&record, TaskState::Sleeping { checkpoint, until });
+                }
+            }
             RecordState::Pending { checkpoint } | RecordState::Running { checkpoint } => {
                 invoke(controller, &record, checkpoint, false).await;
             }
@@ -136,7 +148,9 @@ pub(super) async fn abort(
     let state = record_state(&record);
     match state {
         RecordState::Terminal { .. } => Ok(()),
-        RecordState::Pending { checkpoint } | RecordState::Running { checkpoint } => {
+        RecordState::Pending { checkpoint }
+        | RecordState::Running { checkpoint }
+        | RecordState::Sleeping { checkpoint, .. } => {
             record.abort_requested = true;
             controller_mut_of(controller)
                 .save_task(record.clone())
@@ -307,7 +321,15 @@ fn apply(
     record: &DurableTaskRecord,
     commit: TaskCommit,
 ) -> std::collections::BTreeMap<String, Value> {
+    let memos = controller
+        .runtime()
+        .session()
+        .tasks
+        .get(&record.id)
+        .map(|record| record.memos.clone())
+        .unwrap_or_default();
     let state = match commit {
+        TaskCommit::Sleep { until, checkpoint } => RecordState::Sleeping { checkpoint, until },
         TaskCommit::Continue(checkpoint) => RecordState::Pending { checkpoint },
         TaskCommit::Completed(result) => RecordState::Terminal {
             outcome: RecordOutcome::Completed { result },
@@ -319,13 +341,6 @@ fn apply(
             outcome: RecordOutcome::Aborted,
         },
     };
-    let memos = controller
-        .runtime()
-        .session()
-        .tasks
-        .get(&record.id)
-        .map(|record| record.memos.clone())
-        .unwrap_or_default();
     let state = serde_json::to_value(state).expect("a task state serializes");
     let _ = controller_mut_of(controller).save_task(DurableTaskRecord {
         state,
@@ -344,6 +359,22 @@ fn settle(
         state,
         ..record.clone()
     });
+}
+
+/// The earliest deadline of the session's sleeping tasks (the harness's
+/// wake): a host arms its own wakeup with it (upstream `onWake` hosts,
+/// like a Durable Object alarm).
+pub(super) fn wake(controller: &SessionController<SdkHost>) -> Option<u64> {
+    controller
+        .runtime()
+        .session()
+        .tasks
+        .values()
+        .filter_map(|record| match record_state(record) {
+            RecordState::Sleeping { until, .. } => Some(until),
+            _ => None,
+        })
+        .min()
 }
 
 fn record_state(record: &DurableTaskRecord) -> RecordState {
