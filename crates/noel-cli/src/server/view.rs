@@ -312,11 +312,17 @@ impl View {
                 self.inbox = inbox(&queue.items());
                 true
             }
-            Event::Placed { submissions, .. } => {
+            Event::Placed {
+                submissions, queue, ..
+            } => {
                 if let Some(run) = &mut self.live.run {
                     let ids = submissions.iter().map(|id| id.submission_id.clone());
                     run.inputs.extend(ids);
                 }
+                // What was placed left the queue: the inbox must not list
+                // it still, or a client's "up to edit" withdraws an id
+                // the run already took and hears "already placed".
+                self.inbox = inbox(&queue.items());
                 true
             }
             Event::Withdrawn { .. } => false,
@@ -1337,6 +1343,65 @@ mod tests {
         assert_eq!(
             live(&view)["compactionFailure"],
             json!({"trigger": "manual", "error": "nothing to compact"})
+        );
+    }
+}
+
+#[cfg(test)]
+mod placed_inbox_tests {
+    use super::*;
+    use noel_core::controller::Queue;
+    use noel_core::{QueueItemId, ReloadableSystems};
+
+    #[test]
+    fn placing_into_the_run_empties_the_inbox_that_listed_it() {
+        // A steer queued while a run works is listed in pi.inbox until the
+        // run places it at its next boundary. The placement is not a
+        // QueueChanged, so the inbox must refresh on Placed too: a client
+        // that withdraws the stale id hears "already placed" and its
+        // "up to edit" cannot recall what it sees.
+        let session = SessionState::new("s1".to_owned(), PathBuf::from("/w"));
+        let runtime = Runtime::new(session.clone(), ReloadableSystems::default());
+        let mut view = View::new(&session, &[]);
+        // The inbox lists one steer.
+        let listed = [QueueItem {
+            id: QueueItemId {
+                submission_id: "q1".into(),
+                request_id: Some("req-1".into()),
+                mode: QueueMode::Steer,
+            },
+            content: "a steer".into(),
+        }];
+        view.refresh(&runtime, json!({}), &listed);
+        assert_eq!(
+            view.value()["docs"]["pi.inbox"],
+            json!({"items": [
+                {"id": "q1", "mode": "steer", "content": "a steer", "requestId": "req-1"}
+            ]})
+        );
+        // The run starts, then places the steer at its next boundary.
+        view.event(&Event::RunStarted {
+            run_id: "r1",
+            runtime: &runtime,
+        });
+        view.event(&Event::Placed {
+            run_id: "r1",
+            submissions: &[QueueItemId {
+                submission_id: "q1".into(),
+                request_id: Some("req-1".into()),
+                mode: QueueMode::Steer,
+            }],
+            queue: &Queue::default(),
+        });
+        assert_eq!(
+            view.value()["docs"]["pi.inbox"],
+            json!({"items": []}),
+            "the placed steer leaves the inbox"
+        );
+        // And the run's inputs name it, beside the run's own id.
+        assert_eq!(
+            view.value()["docs"]["pi.live"]["run"]["inputs"],
+            json!(["r1", "q1"])
         );
     }
 }

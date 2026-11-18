@@ -278,10 +278,14 @@ pub enum Event<'a> {
         session: &'a SessionState,
         queue: &'a Queue,
     },
-    /// Queued submissions were placed into the active run.
+    /// Queued submissions were placed into the active run. `queue` is the
+    /// queue as it is now: what was placed left it, so a host's view of
+    /// the queue refreshes here too, not only on `QueueChanged` (a
+    /// placement is not a queue change).
     Placed {
         run_id: &'a str,
         submissions: &'a [QueueItemId],
+        queue: &'a Queue,
     },
     /// Queued submissions were withdrawn, unanswered.
     Withdrawn { submissions: &'a [QueueItem] },
@@ -1344,6 +1348,7 @@ impl<H: Host> Live<H> {
         self.host.event(Event::Placed {
             run_id: &run_id,
             submissions: placed,
+            queue: &self.queue,
         });
     }
 
