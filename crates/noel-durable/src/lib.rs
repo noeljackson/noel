@@ -13,12 +13,14 @@
 //! its handle methods are request/response over it.
 
 mod driver;
+mod driver_tasks;
 mod events;
 mod host;
 mod multi;
 mod provider;
 mod sqlite;
 mod submission;
+mod tasks;
 mod tools;
 
 pub use events::{Outcome, OwnedEvent};
@@ -27,6 +29,10 @@ pub use noel_providers::ModelSpec;
 pub use provider::{ProviderOptions, ProviderResolver, ProviderSource};
 pub use sqlite::SqliteJournal;
 pub use submission::{Settled, Submission, SubmissionState};
+pub use tasks::{
+    phase, TaskCommit, TaskContext, TaskDefinition, TaskOutcome, TaskRecord, TaskRegistry,
+    TaskSettings, TaskState,
+};
 pub use tools::{Tool, ToolContext, ToolRegistry, ToolResult};
 
 use std::path::PathBuf;
@@ -154,6 +160,10 @@ pub struct HarnessOptions {
     pub providers: ProviderResolver,
     /// In-process Rust tools, offered to the model beside noel's built-ins.
     pub tools: ToolRegistry,
+    /// Durable task definitions (slice 3): what `create_task` runs.
+    pub tasks: TaskRegistry,
+    /// Task scheduling: the per-task restart limit.
+    pub task_settings: TaskSettings,
     /// The model the session runs on; `None` keeps the session's own.
     pub model: Option<noel_ai::ModelRef>,
     /// The working directory the session reports and its file tools use.
@@ -171,6 +181,8 @@ impl HarnessOptions {
             config: empty_config(cwd.clone()),
             providers: ProviderResolver::default(),
             tools: ToolRegistry::new(),
+            tasks: TaskRegistry::new(),
+            task_settings: TaskSettings::default(),
             model: None,
             cwd,
             env: None,
@@ -367,6 +379,38 @@ impl Conversation<'_> {
     /// The queue as it is now: steering, then follow-ups.
     pub async fn queue(&mut self) -> Vec<QueuedItem> {
         self.harness.driver.queue().await
+    }
+
+    /// Creates a durable task of a registered `kind` with `input`
+    /// (upstream `tx.createTask`): saved pending, nothing run. Returns
+    /// its id.
+    pub async fn create_task(
+        &mut self,
+        kind: &str,
+        input: serde_json::Value,
+    ) -> Result<String, String> {
+        self.harness.driver.task_create(kind, input, false).await
+    }
+
+    /// A background task: excluded from the conversation's ordinary idle
+    /// waits and aborts.
+    pub async fn create_background_task(
+        &mut self,
+        kind: &str,
+        input: serde_json::Value,
+    ) -> Result<String, String> {
+        self.harness.driver.task_create(kind, input, true).await
+    }
+
+    /// Waits for a task's terminal record, running it (upstream
+    /// `waitForTask`): waiting is what starts work.
+    pub async fn wait_task(&mut self, task_id: &str) -> TaskRecord {
+        self.harness.driver.task_wait(task_id).await
+    }
+
+    /// Marks a task aborted; its abort handler decides the outcome.
+    pub async fn abort_task(&mut self, task_id: &str) -> Result<(), String> {
+        self.harness.driver.task_abort(task_id).await
     }
 }
 

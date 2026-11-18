@@ -31,12 +31,14 @@ const {
 	createRegistry,
 	createSession,
 	defineExtension,
+	defineTask,
 	defineTool,
 	Harness,
 	InboxDoc,
 	LiveDoc,
 	MemoryStorage,
 } = await import(`${REFERENCE}/packages/durable/src/index.ts`);
+const { openNodeSqliteStorage } = await import(`${REFERENCE}/packages/durable/src/storage/sqlite/node.ts`);
 
 const git = (...args: string[]): string =>
 	execFileSync("git", ["-C", REFERENCE, ...args], { encoding: "utf8" }).trim();
@@ -280,6 +282,123 @@ async function forks(): Promise<Json> {
 	};
 }
 
+/** 11-tasks: a task with phases runs to a terminal outcome. */
+async function tasks(): Promise<Json> {
+	const payments = new Map<string, number>();
+	type PaymentState = { phase: "prepare" } | { phase: "charge"; key: string };
+	const Payment = defineTask<{ amount: number }, PaymentState, { receipt: number }>({
+		name: "example.payment",
+		version: 1,
+		initial: () => ({ phase: "prepare" }),
+		phases: {
+			prepare: async (task, runtime, ctx) => {
+				await runtime.commit(
+					() => ({ status: "running", checkpoint: { phase: "charge", key: `payment-${task.id}` } }),
+					ctx,
+				);
+			},
+			charge: async (task, runtime, ctx) => {
+				const key = task.state.checkpoint.key;
+				if (!payments.has(key)) payments.set(key, task.input.amount * 100);
+				const receipt = payments.get(key)!;
+				await runtime.commit(
+					() => ({ status: "terminal", outcome: { status: "completed", result: { receipt } } }),
+					ctx,
+				);
+			},
+		},
+		abort: async (_task, runtime, ctx) => {
+			await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx);
+		},
+	});
+	const registry = createRegistry();
+	registry.install(defineExtension({ name: "payments", tasks: [Payment] }));
+	const harness = await Harness.open(
+		new MemoryStorage(),
+		{ models: createModels(), registry },
+		BACKGROUND_CONTEXT,
+	);
+	const root = await harness.root(BACKGROUND_CONTEXT);
+	const paymentId = await root.commit(
+		(tx) => tx.createTask(Payment, { amount: 5 }, { ownership: { kind: "conversation" } }),
+		BACKGROUND_CONTEXT,
+	);
+	const paid = await harness.waitForTask(paymentId, BACKGROUND_CONTEXT);
+	await harness.close(BACKGROUND_CONTEXT);
+	return {
+		payment: paid.state.outcome?.status ?? null,
+		receipt: paid.state.outcome?.status === "completed" ? paid.state.outcome.result.receipt : null,
+	};
+}
+
+/** 12-recovery: a task interrupted before its checkpoint is saved
+ * resumes at its last checkpoint after a reopen; memos are exactly-once. */
+async function taskRecovery(): Promise<Json> {
+	const directory = await mkdtemp(join(tmpdir(), "pi-durable-fixture-"));
+	const databasePath = join(directory, "session.sqlite");
+	let reachedTick = (_n: number): void => {};
+	const Ticker = defineTask<{ to: number }, { phase: "tick"; n: number }, string>({
+		name: "example.ticker",
+		version: 1,
+		initial: () => ({ phase: "tick", n: 1 }),
+		phases: {
+			tick: async (task, runtime, ctx) => {
+				const n = task.state.checkpoint.n;
+				if ((await runtime.memo(`printed-${n}`, ctx)) === undefined) {
+					await runtime.memo(`printed-${n}`, true, ctx);
+				}
+				reachedTick(n);
+				if (n === task.input.to) {
+					await runtime.commit(
+						() => ({ status: "terminal", outcome: { status: "completed", result: `counted to ${n}` } }),
+						ctx,
+					);
+					return;
+				}
+				await runtime.sleepUntil(runtime.now() + 20, { phase: "tick", n: n + 1 }, ctx);
+			},
+		},
+		abort: async (_task, runtime, ctx) => {
+			await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx);
+		},
+	});
+	const registry = createRegistry();
+	registry.install(defineExtension({ name: "ticker", tasks: [Ticker] }));
+	const open = async () =>
+		Harness.open(await openNodeSqliteStorage(databasePath), { models: createModels(), registry }, BACKGROUND_CONTEXT);
+
+	const firstRun = await open();
+	const tickerId = await (await firstRun.root(BACKGROUND_CONTEXT)).commit(
+		(tx) => tx.createTask(Ticker, { to: 3 }, { ownership: { kind: "conversation" } }),
+		BACKGROUND_CONTEXT,
+	);
+	const tickTwo = new Promise<void>((resolve) => {
+		reachedTick = (n) => {
+			if (n === 2) resolve();
+		};
+	});
+	firstRun.resume();
+	await tickTwo;
+	await firstRun.close(BACKGROUND_CONTEXT);
+	reachedTick = () => {};
+
+	const reader = await open();
+	const saved = (await reader.getTask(tickerId, BACKGROUND_CONTEXT))!;
+	await reader.close(BACKGROUND_CONTEXT);
+
+	const secondRun = await open();
+	const counted = await secondRun.waitForTask(tickerId, BACKGROUND_CONTEXT);
+	await secondRun.close(BACKGROUND_CONTEXT);
+	await rm(directory, { recursive: true, force: true });
+	return {
+		closedState: saved.state.status,
+		closedCheckpoint: saved.state.checkpoint,
+		afterReopen: counted.state.outcome?.status ?? null,
+		result: counted.state.outcome?.status === "completed" ? counted.state.outcome.result : null,
+		restartsAfterReopen: counted.restarts ?? 0,
+	};
+}
+
 const scenarios: Record<string, () => Promise<Json>> = {
 	chat,
 	print: printMode,
@@ -287,6 +406,8 @@ const scenarios: Record<string, () => Promise<Json>> = {
 	turnLimit,
 	harnessMany,
 	forks,
+	tasks,
+	taskRecovery,
 };
 
 const outDir = process.argv[2];
