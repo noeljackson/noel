@@ -12,6 +12,7 @@
 //! (the worker's command loop, cut to the operations a program sends), and
 //! its handle methods are request/response over it.
 
+mod clock;
 mod driver;
 mod driver_tasks;
 mod events;
@@ -23,6 +24,7 @@ mod submission;
 mod tasks;
 mod tools;
 
+pub use clock::Clock;
 pub use events::{Outcome, OwnedEvent};
 pub use multi::{Backend, MultiHarness, MultiOptions};
 pub use noel_providers::ModelSpec;
@@ -164,6 +166,9 @@ pub struct HarnessOptions {
     pub tasks: TaskRegistry,
     /// Task scheduling: the per-task restart limit.
     pub task_settings: TaskSettings,
+    /// The harness clock sleeps and deadlines are measured on (upstream
+    /// `HarnessOptions.now`); the default is the system clock.
+    pub clock: Clock,
     /// The model the session runs on; `None` keeps the session's own.
     pub model: Option<noel_ai::ModelRef>,
     /// The working directory the session reports and its file tools use.
@@ -183,6 +188,7 @@ impl HarnessOptions {
             tools: ToolRegistry::new(),
             tasks: TaskRegistry::new(),
             task_settings: TaskSettings::default(),
+            clock: Clock::default(),
             model: None,
             cwd,
             env: None,
@@ -411,6 +417,13 @@ impl Conversation<'_> {
     /// Marks a task aborted; its abort handler decides the outcome.
     pub async fn abort_task(&mut self, task_id: &str) -> Result<(), String> {
         self.harness.driver.task_abort(task_id).await
+    }
+
+    /// The harness's wake: the earliest deadline of its sleeping tasks,
+    /// or `None` when none sleeps (upstream `harness.wake()`); a host
+    /// arms its own wakeup with it.
+    pub async fn wake(&self) -> Option<u64> {
+        self.harness.driver.wake().await
     }
 }
 

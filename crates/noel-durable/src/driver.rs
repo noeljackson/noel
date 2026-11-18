@@ -60,6 +60,10 @@ enum Request {
         task_id: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// The earliest sleeping deadline (the harness's wake).
+    TaskWake {
+        reply: oneshot::Sender<Option<u64>>,
+    },
     Close {
         reply: oneshot::Sender<()>,
     },
@@ -168,6 +172,16 @@ impl Handle {
             .unwrap_or_else(|_| crate::tasks::TaskRecord::orphaned(task_id))
     }
 
+    /// The harness's wake: the earliest deadline of its sleeping tasks,
+    /// or `None` when none sleeps (upstream `harness.wake()`).
+    pub(crate) async fn wake(&self) -> Option<u64> {
+        let (reply, done) = oneshot::channel();
+        if self.requests.send(Request::TaskWake { reply }).is_err() {
+            return None;
+        }
+        done.await.unwrap_or(None)
+    }
+
     /// Marks a task aborted; its abort handler decides the outcome.
     pub(crate) async fn task_abort(&self, task_id: &str) -> Result<(), String> {
         let (reply, done) = oneshot::channel();
@@ -206,6 +220,7 @@ pub(super) async fn spawn(
     let (requests, inbox) = mpsc::unbounded_channel();
     let events = Arc::new(Events::new());
     let host = SdkHost {
+        clock: Arc::new(options.clock.clone()),
         providers: Arc::new(options.providers),
         tools: Mutex::new(options.tools),
         events: events.clone(),
@@ -306,6 +321,9 @@ async fn driver(
             }
             Request::TaskAbort { task_id, reply } => {
                 let _ = reply.send(crate::driver_tasks::abort(&mut controller, &task_id).await);
+            }
+            Request::TaskWake { reply } => {
+                let _ = reply.send(crate::driver_tasks::wake(&controller));
             }
             Request::Close { reply } => {
                 let _ = reply.send(());
@@ -461,6 +479,9 @@ fn busy_request(request: Request, run: &mut Busy<'_, SdkHost>) {
             let _ = reply.send(Err(format!(
                 "a run is active; task {task_id} cannot be aborted through it"
             )));
+        }
+        Request::TaskWake { reply } => {
+            let _ = reply.send(None);
         }
         Request::Close { reply } => {
             let _ = reply.send(());

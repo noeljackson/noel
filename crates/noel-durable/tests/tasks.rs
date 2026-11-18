@@ -29,50 +29,58 @@ struct Payments(Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>);
 impl Payments {
     fn definition(&self) -> noel_durable::TaskDefinition<u64, PaymentState> {
         let charges = self.0.clone();
-        noel_durable::TaskDefinition::new("example.payment", 1, |_: &u64| PaymentState::Prepare)
-            .phase(
-                "prepare",
-                phase(
-                    move |mut ctx: noel_durable::TaskContext<u64, PaymentState>| async move {
-                        let key = "payment-key";
-                        ctx.commit(TaskCommit::Continue(
-                            json!({ "phase": "charge", "key": key }),
-                        ))
-                        .await;
-                    },
-                ),
-            )
-            .phase(
-                "charge",
-                phase({
-                    let charges = charges.clone();
-                    move |mut ctx: noel_durable::TaskContext<u64, PaymentState>| {
-                        let charges = charges.clone();
-                        async move {
-                            let key = "payment-key";
-                            let amount = *ctx.input;
-                            let receipt = {
-                                let mut charges = charges.lock().expect("charges");
-                                *charges.entry(key.to_owned()).or_insert(amount * 100)
-                            };
-                            ctx.commit(TaskCommit::Completed(json!({ "receipt": receipt })))
-                                .await;
-                        }
-                    }
-                }),
-            )
-            .abort(phase(
-                |mut ctx: noel_durable::TaskContext<u64, PaymentState>| async move {
-                    let _ = &ctx.input;
-                    ctx.commit(TaskCommit::Aborted).await;
+        noel_durable::TaskDefinition::new("example.payment", 1, |_: &u64| PaymentState {
+            phase: None,
+            key: None,
+        })
+        .phase(
+            "prepare",
+            phase(
+                move |mut ctx: noel_durable::TaskContext<u64, PaymentState>| async move {
+                    let key = "payment-key";
+                    ctx.commit(TaskCommit::Continue(
+                        json!({ "phase": "charge", "key": key }),
+                    ))
+                    .await;
                 },
-            ))
+            ),
+        )
+        .phase(
+            "charge",
+            phase({
+                let charges = charges.clone();
+                move |mut ctx: noel_durable::TaskContext<u64, PaymentState>| {
+                    let charges = charges.clone();
+                    async move {
+                        let key = "payment-key";
+                        let amount = *ctx.input;
+                        let receipt = {
+                            let mut charges = charges.lock().expect("charges");
+                            *charges.entry(key.to_owned()).or_insert(amount * 100)
+                        };
+                        ctx.commit(TaskCommit::Completed(json!({ "receipt": receipt })))
+                            .await;
+                    }
+                }
+            }),
+        )
+        .abort(phase(
+            |mut ctx: noel_durable::TaskContext<u64, PaymentState>| async move {
+                let _ = &ctx.input;
+                ctx.commit(TaskCommit::Aborted).await;
+            },
+        ))
     }
 }
 
+/// The payment's checkpoint, as it is on the wire: a `phase` field the
+/// engine routes on, plus whatever the phase carries.
 #[derive(serde::Serialize, serde::Deserialize)]
-enum PaymentState {
-    Prepare,
+struct PaymentState {
+    #[serde(default)]
+    phase: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
 }
 
 /// 11-tasks: a task runs its phases to a terminal outcome, and its
@@ -91,7 +99,12 @@ async fn a_task_runs_its_phases_to_completion() {
         .create_task("example.payment", json!(5))
         .await
         .expect("create");
-    let settled = conversation.wait_task(&task_id).await;
+    let settled = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        conversation.wait_task(&task_id),
+    )
+    .await
+    .expect("the payment settles within 5s");
     match &settled.state {
         TaskState::Terminal {
             outcome: TaskOutcome::Completed { result },
@@ -325,4 +338,214 @@ fn a_closed_harnesss_task_record_is_orphaned() {
             outcome: TaskOutcome::Orphaned
         }
     ));
+}
+
+/// Slice 4: sleeps on the injected clock (upstream harness-sleep).
+mod sleep {
+    use super::*;
+    use noel_durable::{Clock, TaskState as State};
+
+    fn nap_definition(
+        runs: Arc<std::sync::Mutex<u32>>,
+    ) -> noel_durable::TaskDefinition<u64, NapState> {
+        noel_durable::TaskDefinition::new("test.nap", 1, |_: &u64| NapState::default())
+            .phase(
+                "start",
+                phase(
+                    |mut ctx: noel_durable::TaskContext<u64, NapState>| async move {
+                        let until = 2_000;
+                        ctx.sleep_until(until, json!({ "phase": "after" })).await;
+                    },
+                ),
+            )
+            .phase(
+                "after",
+                phase({
+                    let runs = runs.clone();
+                    move |mut ctx: noel_durable::TaskContext<u64, NapState>| {
+                        let runs = runs.clone();
+                        async move {
+                            *runs.lock().expect("runs") += 1;
+                            ctx.commit(TaskCommit::Completed(json!("resumed"))).await;
+                        }
+                    }
+                }),
+            )
+            .abort(phase(
+                |mut ctx: noel_durable::TaskContext<u64, NapState>| async move {
+                    let _ = &ctx.input;
+                    ctx.commit(TaskCommit::Aborted).await;
+                },
+            ))
+    }
+
+    /// The nap's checkpoint, as it is on the wire (a `phase` field).
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    pub(crate) struct NapState {
+        #[serde(default)]
+        phase: Option<String>,
+    }
+
+    /// harness-sleep: a task sleeps without an invocation, its record
+    /// holding the deadline; an early wake runs nothing; the deadline
+    /// passing resumes it; wake reports the deadline (golden
+    /// durable-taskSleep.json).
+    #[tokio::test]
+    async fn a_task_sleeps_until_its_deadline_on_the_injected_clock() {
+        let golden = load_fixture("durable-taskSleep.json");
+        assert_eq!(
+            golden["outcome"]["asleep"],
+            json!({"status": "sleeping", "until": 2000}),
+            "upstream: the record holds the deadline"
+        );
+        assert_eq!(
+            golden["outcome"]["stillAsleep"],
+            json!("sleeping"),
+            "upstream: an early wake runs nothing"
+        );
+        assert_eq!(
+            golden["outcome"]["result"],
+            json!(2000),
+            "upstream: it resumes when due, at the clock then"
+        );
+        assert_eq!(
+            golden["outcome"]["wakeAsleep"],
+            json!({"active": false, "at": 2000}),
+            "upstream: wake reports the deadline while it sleeps"
+        );
+        assert_eq!(
+            golden["outcome"]["wakeDone"],
+            json!({"active": true}),
+            "upstream: no wake once terminal"
+        );
+
+        let clock = Arc::new(std::sync::Mutex::new(1_000u64));
+        let runs = Arc::new(std::sync::Mutex::new(0u32));
+        let mut options = options_with(Scripted::default().into(), Default::default());
+        options.tasks = TaskRegistry::new().register(nap_definition(runs.clone()));
+        options.clock = {
+            let clock = clock.clone();
+            Clock::injected(move || *clock.lock().expect("clock"))
+        };
+        let harness = Harness::in_memory(options).await.expect("open");
+        let mut conversation = harness.conversation();
+        let task_id = conversation
+            .create_task("test.nap", json!(0))
+            .await
+            .expect("create");
+        // Not due: the wait answers its sleeping record without running.
+        let asleep = conversation.wait_task(&task_id).await;
+        match &asleep.state {
+            State::Sleeping { until, .. } => assert_eq!(*until, 2_000),
+            other => panic!("the nap sleeps: {other:?}"),
+        }
+        assert_eq!(
+            conversation.wake().await,
+            Some(2_000),
+            "wake reports the deadline"
+        );
+        assert_eq!(*runs.lock().expect("runs"), 0, "nothing ran");
+        // Early: still sleeping.
+        *clock.lock().expect("clock") = 1_999;
+        let still = conversation.wait_task(&task_id).await;
+        assert!(
+            matches!(still.state, State::Sleeping { .. }),
+            "an early wake runs nothing"
+        );
+        // Due: it resumes and completes.
+        *clock.lock().expect("clock") = 2_000;
+        let done = conversation.wait_task(&task_id).await;
+        assert!(
+            matches!(
+                &done.state,
+                State::Terminal {
+                    outcome: TaskOutcome::Completed { .. }
+                }
+            ),
+            "the deadline resumes it: {:?}",
+            done.state
+        );
+        assert_eq!(*runs.lock().expect("runs"), 1, "the after phase ran once");
+        assert_eq!(conversation.wake().await, None, "no wake once terminal");
+        harness.close().await.expect("close");
+    }
+
+    /// A sleep survives a reopen (upstream: "keeps a sleep across
+    /// reopen"): the reopened harness's wake reads the deadline from the
+    /// journal, and the task resumes only once due.
+    #[tokio::test]
+    async fn a_sleep_survives_a_reopen_and_resumes_once_due() {
+        let dir = std::env::temp_dir().join(format!("noel-durable-sleep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let journal = dir.join("session.jsonl");
+        let clock = Arc::new(std::sync::Mutex::new(1_000u64));
+        let runs = Arc::new(std::sync::Mutex::new(0u32));
+        let options = {
+            let mut options = options_with(Scripted::default().into(), Default::default());
+            options.tasks = TaskRegistry::new().register(nap_definition(runs.clone()));
+            let clock = clock.clone();
+            options.clock = Clock::injected(move || *clock.lock().expect("clock"));
+            options
+        };
+        let storage: noel_core::storage::Storage =
+            Arc::new(noel_core::storage::JsonlFile::open(journal.clone()).expect("journal"));
+        let harness = Harness::open(storage, options).await.expect("open");
+        let task_id = harness
+            .conversation()
+            .create_task("test.nap", json!(0))
+            .await
+            .expect("create");
+        let asleep = harness.conversation().wait_task(&task_id).await;
+        assert!(matches!(asleep.state, State::Sleeping { .. }));
+        harness.close().await.expect("close");
+
+        // Reopen, still early: the sleep is read from the journal.
+        let clock = Arc::new(std::sync::Mutex::new(1_500u64));
+        let options = {
+            let mut options = options_with(Scripted::default().into(), Default::default());
+            options.tasks = TaskRegistry::new().register(nap_definition(runs.clone()));
+            let clock = clock.clone();
+            options.clock = Clock::injected(move || *clock.lock().expect("clock"));
+            options
+        };
+        let storage: noel_core::storage::Storage =
+            Arc::new(noel_core::storage::JsonlFile::open(journal.clone()).expect("journal"));
+        let harness = Harness::open(storage, options).await.expect("reopen");
+        assert_eq!(
+            harness.conversation().wake().await,
+            Some(2_000),
+            "the reopened harness reads the deadline"
+        );
+        let still = harness.conversation().wait_task(&task_id).await;
+        assert!(matches!(still.state, State::Sleeping { .. }));
+        harness.close().await.expect("close");
+
+        // Reopen due: it resumes and completes.
+        let clock = Arc::new(std::sync::Mutex::new(2_000u64));
+        let options = {
+            let mut options = options_with(Scripted::default().into(), Default::default());
+            options.tasks = TaskRegistry::new().register(nap_definition(runs.clone()));
+            let clock = clock.clone();
+            options.clock = Clock::injected(move || *clock.lock().expect("clock"));
+            options
+        };
+        let storage: noel_core::storage::Storage =
+            Arc::new(noel_core::storage::JsonlFile::open(journal).expect("journal"));
+        let harness = Harness::open(storage, options).await.expect("reopen due");
+        let done = harness.conversation().wait_task(&task_id).await;
+        assert!(
+            matches!(
+                &done.state,
+                State::Terminal {
+                    outcome: TaskOutcome::Completed { .. }
+                }
+            ),
+            "the due sleep resumes: {:?}",
+            done.state
+        );
+        assert_eq!(*runs.lock().expect("runs"), 1);
+        harness.close().await.expect("close");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
