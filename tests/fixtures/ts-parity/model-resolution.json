@@ -540,7 +540,7 @@
         "model": null,
         "thinkingLevel": null,
         "warning": null,
-        "error": "Model \"glm-5\" is ambiguous across providers: opencode/glm-5, qwen-token-plan-cn/glm-5, qwen-token-plan/glm-5. No matching provider is authenticated. Use --provider or provider/model."
+        "error": "Model \"glm-5\" is ambiguous across providers: qwen-token-plan-cn/glm-5, qwen-token-plan/glm-5. No matching provider is authenticated. Use --provider or provider/model."
       }
     },
     {

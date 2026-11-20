@@ -23,8 +23,11 @@
       "model": "gpt-6.1-sol",
       "store": false,
       "stream": true,
-      "instructions": "pi rust cli",
       "input": [
+        {
+          "role": "developer",
+          "content": "pi rust cli"
+        },
         {
           "role": "user",
           "content": [
