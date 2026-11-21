@@ -17,7 +17,7 @@
       "content-type": "application/json",
       "openai-beta": "responses=experimental",
       "originator": "pi",
-      "user-agent": "pi/1.5.2 (linux; node/v26.13.1; x64)"
+      "user-agent": "pi/1.6.0 (linux; node/v26.13.1; x64)"
     },
     "body": {
       "model": "gpt-6.1-sol",
@@ -36,6 +36,12 @@
               "text": "hello"
             }
           ]
+        },
+        {
+          "type": "configuration_update",
+          "reasoning": {
+            "effort": "xhigh"
+          }
         }
       ],
       "text": {
@@ -47,7 +53,7 @@
       "tool_choice": "auto",
       "parallel_tool_calls": true,
       "reasoning": {
-        "effort": "xhigh",
+        "effort": "medium",
         "summary": "auto"
       }
     }
