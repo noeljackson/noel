@@ -540,7 +540,7 @@
         "model": null,
         "thinkingLevel": null,
         "warning": null,
-        "error": "Model \"glm-5\" is ambiguous across providers: opencode/glm-5, qwen-token-plan-cn/glm-5, qwen-token-plan/glm-5. No matching provider is authenticated. Use --provider or provider/model."
+        "error": "Model \"glm-5\" is ambiguous across providers: qwen-token-plan-cn/glm-5, qwen-token-plan/glm-5. No matching provider is authenticated. Use --provider or provider/model."
       }
     },
     {
@@ -2244,6 +2244,11 @@
             "provider": "openai",
             "id": "gpt-6.1-sol",
             "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-6.2-sol",
+            "thinkingLevel": null
           }
         ],
         "diagnostics": []
@@ -2912,7 +2917,7 @@
       },
       "expected": {
         "provider": "openai",
-        "id": "gpt-6.1-sol"
+        "id": "gpt-6.2-sol"
       }
     }
   ],
@@ -2941,7 +2946,7 @@
         ],
         "initialModel": {
           "provider": "openai-codex",
-          "id": "gpt-6.1-sol"
+          "id": "gpt-6.2-sol"
         }
       }
     },
@@ -2967,7 +2972,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-6.1-sol"
+          "id": "gpt-6.2-sol"
         }
       }
     },
@@ -2990,7 +2995,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-6.1-sol"
+          "id": "gpt-6.2-sol"
         }
       }
     },
@@ -3042,7 +3047,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-6.1-sol"
+          "id": "gpt-6.2-sol"
         }
       }
     },
@@ -3070,7 +3075,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-6.1-sol"
+          "id": "gpt-6.2-sol"
         }
       }
     },
@@ -3098,7 +3103,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-6.1-sol"
+          "id": "gpt-6.2-sol"
         }
       }
     },
@@ -6053,8 +6058,8 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-6.1-sol",
-              "name": "GPT-6.1 Sol",
+              "id": "gpt-6.2-sol",
+              "name": "GPT-6.2 Sol",
               "api": "openai-codex-responses",
               "provider": "openai-codex",
               "baseUrl": "https://chatgpt.com/backend-api",
@@ -6113,8 +6118,8 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-6.1-sol",
-              "name": "GPT-6.1 Sol",
+              "id": "gpt-6.2-sol",
+              "name": "GPT-6.2 Sol",
               "api": "openai-codex-responses",
               "provider": "openai-codex",
               "baseUrl": "https://chatgpt.com/backend-api",
@@ -6181,8 +6186,8 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-6.1-sol",
-              "name": "GPT-6.1 Sol",
+              "id": "gpt-6.2-sol",
+              "name": "GPT-6.2 Sol",
               "api": "openai-responses",
               "provider": "openai",
               "baseUrl": "https://api.openai.com/v1",
@@ -6242,8 +6247,8 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-6.1-sol",
-              "name": "GPT-6.1 Sol",
+              "id": "gpt-6.2-sol",
+              "name": "GPT-6.2 Sol",
               "api": "openai-responses",
               "provider": "openai",
               "baseUrl": "https://api.openai.com/v1",
@@ -6302,8 +6307,8 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-6.1-sol",
-              "name": "GPT-6.1 Sol",
+              "id": "gpt-6.2-sol",
+              "name": "GPT-6.2 Sol",
               "api": "openai-responses",
               "provider": "openai",
               "baseUrl": "https://api.openai.com/v1",

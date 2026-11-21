@@ -1839,8 +1839,7 @@
         "max": "max"
       },
       "examples": [
-        "openrouter/thinkingmachines/inkling-2-small",
-        "openrouter/thinkingmachines/inkling-2-small:free"
+        "openrouter/thinkingmachines/inkling-2-small"
       ],
       "supported": [
         "minimal",
