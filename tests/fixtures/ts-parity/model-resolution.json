@@ -477,7 +477,7 @@
       "expected": {
         "model": {
           "provider": "zai",
-          "id": "glm-5.3-highspeed"
+          "id": "glm-5.4"
         },
         "thinkingLevel": null,
         "warning": null,
@@ -628,7 +628,7 @@
       "expected": {
         "model": {
           "provider": "zai",
-          "id": "glm-5.3-highspeed"
+          "id": "glm-5.4"
         },
         "thinkingLevel": null,
         "warning": null,

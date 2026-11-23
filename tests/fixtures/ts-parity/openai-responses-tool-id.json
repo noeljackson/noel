@@ -12,6 +12,7 @@
       "id": "fc_ifd2c719fz6a9",
       "call_id": "call_4VnzVawQXPB9MgYib7CiQFEY",
       "name": "edit",
+      "status": "completed",
       "arguments": "{\"path\":\"src/styles/app.css\"}"
     },
     "toolOutput": {
