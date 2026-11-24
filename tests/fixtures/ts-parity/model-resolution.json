@@ -162,13 +162,10 @@
         "authenticated": []
       },
       "expected": {
-        "model": {
-          "provider": "mistral",
-          "id": "devstral-medium-latest"
-        },
-        "thinkingLevel": "high",
+        "model": null,
+        "thinkingLevel": null,
         "warning": null,
-        "error": null
+        "error": "Model \"devstral-medium-latest:high\" not found. Use --list-models to see available models."
       }
     },
     {
@@ -413,7 +410,7 @@
       "expected": {
         "model": {
           "provider": "openai",
-          "id": "gpt-5.3-codex-spark"
+          "id": "gpt-5.3-codex"
         },
         "thinkingLevel": null,
         "warning": null,
@@ -1191,14 +1188,24 @@
           "api": "mistral-conversations",
           "provider": "mistral",
           "baseUrl": "https://api.mistral.ai",
-          "reasoning": false,
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          },
           "input": [
-            "text"
+            "text",
+            "image"
           ],
           "cost": {
-            "input": 0.4,
-            "output": 2,
-            "cacheRead": 0.04,
+            "input": 1.5,
+            "output": 7.5,
+            "cacheRead": 0.15,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -1228,13 +1235,23 @@
           "provider": "mistral",
           "baseUrl": "https://api.mistral.ai",
           "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          },
           "input": [
-            "text"
+            "text",
+            "image"
           ],
           "cost": {
-            "input": 0.4,
-            "output": 2,
-            "cacheRead": 0.04,
+            "input": 1.5,
+            "output": 7.5,
+            "cacheRead": 0.15,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -1263,14 +1280,24 @@
           "api": "mistral-conversations",
           "provider": "mistral",
           "baseUrl": "https://api.mistral.ai",
-          "reasoning": false,
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          },
           "input": [
-            "text"
+            "text",
+            "image"
           ],
           "cost": {
-            "input": 0.4,
-            "output": 2,
-            "cacheRead": 0.04,
+            "input": 1.5,
+            "output": 7.5,
+            "cacheRead": 0.15,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -1298,13 +1325,23 @@
           "provider": "mistral",
           "baseUrl": "https://api.mistral.ai",
           "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          },
           "input": [
-            "text"
+            "text",
+            "image"
           ],
           "cost": {
-            "input": 0.4,
-            "output": 2,
-            "cacheRead": 0.04,
+            "input": 1.5,
+            "output": 7.5,
+            "cacheRead": 0.15,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -2328,11 +2365,6 @@
           {
             "provider": "openai",
             "id": "gpt-5.3-codex",
-            "thinkingLevel": null
-          },
-          {
-            "provider": "openai",
-            "id": "gpt-5.3-codex-spark",
             "thinkingLevel": null
           },
           {
@@ -4454,13 +4486,23 @@
               "provider": "mistral",
               "baseUrl": "https://api.mistral.ai",
               "reasoning": true,
+              "thinkingLevelMap": {
+                "off": "none",
+                "minimal": null,
+                "low": null,
+                "medium": null,
+                "high": "high",
+                "xhigh": null,
+                "max": null
+              },
               "input": [
-                "text"
+                "text",
+                "image"
               ],
               "cost": {
-                "input": 0.4,
-                "output": 2,
-                "cacheRead": 0.04,
+                "input": 1.5,
+                "output": 7.5,
+                "cacheRead": 0.15,
                 "cacheWrite": 0
               },
               "contextWindow": 262144,
@@ -4498,20 +4540,30 @@
               "api": "mistral-conversations",
               "provider": "mistral",
               "baseUrl": "https://api.mistral.ai",
-              "reasoning": false,
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": "none",
+                "minimal": null,
+                "low": null,
+                "medium": null,
+                "high": "high",
+                "xhigh": null,
+                "max": null
+              },
               "input": [
-                "text"
+                "text",
+                "image"
               ],
               "cost": {
-                "input": 0.4,
-                "output": 2,
-                "cacheRead": 0.04,
+                "input": 1.5,
+                "output": 7.5,
+                "cacheRead": 0.15,
                 "cacheWrite": 0
               },
               "contextWindow": 262144,
               "maxTokens": 262144
             },
-            "thinkingLevel": "off"
+            "thinkingLevel": "high"
           }
         }
       ]

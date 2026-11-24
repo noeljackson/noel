@@ -298,29 +298,6 @@
       }
     },
     {
-      "reasoning": false,
-      "thinkingLevelMap": {
-        "off": null
-      },
-      "examples": [
-        "azure/gpt-5-chat-latest",
-        "openai/gpt-5-chat-latest"
-      ],
-      "supported": [
-        "off"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "off",
-        "low": "off",
-        "medium": "off",
-        "high": "off",
-        "xhigh": "off",
-        "max": "off",
-        "invalid": "off"
-      }
-    },
-    {
       "reasoning": true,
       "thinkingLevelMap": {
         "off": null,
@@ -891,7 +868,7 @@
       },
       "examples": [
         "cloudflare-workers-ai/@cf/thinkingmachines/inkling-2-small",
-        "huggingface/thinkingmachines/Inkling-2-Small"
+        "huggingface/thinkingmachines/Inkling-2-Mini"
       ],
       "supported": [
         "off",
@@ -1125,35 +1102,6 @@
         "xhigh": "high",
         "max": "high",
         "invalid": "minimal"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": "none",
-        "minimal": null,
-        "low": null,
-        "medium": null,
-        "high": "default",
-        "xhigh": null,
-        "max": null
-      },
-      "examples": [
-        "groq/qwen/qwen3.6-27b"
-      ],
-      "supported": [
-        "off",
-        "high"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "high",
-        "low": "high",
-        "medium": "high",
-        "high": "high",
-        "xhigh": "high",
-        "max": "high",
-        "invalid": "off"
       }
     },
     {
@@ -1953,7 +1901,7 @@
       },
       "examples": [
         "together/deepseek-ai/DeepSeek-V4.1-Flash",
-        "together/meta-models/Muse-Spark-Open-816B-A42B"
+        "together/deepseek-ai/DeepSeek-V4.1-Flash-1017"
       ],
       "supported": [
         "off",
