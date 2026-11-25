@@ -87,13 +87,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -816,13 +816,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -860,13 +860,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -904,13 +904,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -948,13 +948,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -993,13 +993,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -1038,13 +1038,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -4248,13 +4248,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4305,13 +4305,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4362,13 +4362,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4647,13 +4647,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4700,13 +4700,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4820,13 +4820,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4874,13 +4874,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4931,13 +4931,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4991,13 +4991,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -5251,13 +5251,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -6432,13 +6432,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -6483,13 +6483,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
