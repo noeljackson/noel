@@ -489,6 +489,9 @@ pub struct SelectorItem {
     pub label: String,
     pub value: String,
     pub active: bool,
+    /// A muted description column next to the label, as the slash list
+    /// shows one; empty rows render label-only.
+    pub description: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -680,14 +683,25 @@ impl TerminalRenderer {
         lines.extend(selector.items.iter().enumerate().map(|(index, item)| {
             let selected = if index == selector.selected { ">" } else { " " };
             let active = if item.active { "*" } else { " " };
-            if item.label == item.value {
-                format!("{:>2}. {selected}{active} {}", index + 1, item.label)
+            let described = if item.description.is_empty() {
+                String::new()
             } else {
+                format!("  {}", item.description)
+            };
+            if item.label == item.value {
                 format!(
-                    "{:>2}. {selected}{active} {} ({})",
+                    "{:>2}. {selected}{active} {}{}",
                     index + 1,
                     item.label,
-                    item.value
+                    described
+                )
+            } else {
+                format!(
+                    "{:>2}. {selected}{active} {} ({}){}",
+                    index + 1,
+                    item.label,
+                    item.value,
+                    described
                 )
             }
         }));
@@ -913,6 +927,7 @@ mod tests {
                 label: "anthropic/claude".to_string(),
                 value: "anthropic/claude".to_string(),
                 active: true,
+                description: String::new(),
             }],
         ));
         for marker in markers("selector") {
@@ -959,11 +974,13 @@ mod tests {
                     label: "faux/echo".to_string(),
                     value: "faux/echo".to_string(),
                     active: true,
+                    description: String::new(),
                 },
                 SelectorItem {
                     label: "openai/gpt".to_string(),
                     value: "openai/gpt".to_string(),
                     active: false,
+                    description: String::new(),
                 },
             ],
         );

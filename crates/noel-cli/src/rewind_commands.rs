@@ -62,6 +62,7 @@ pub(crate) fn rewind_selector(runtime: &Runtime) -> Selector {
         label: "(current)".to_string(),
         value: format!("m{}", session.messages.len()),
         active: true,
+        description: String::new(),
     }];
     let prompts = session
         .messages
@@ -79,6 +80,7 @@ pub(crate) fn rewind_selector(runtime: &Runtime) -> Selector {
             label: format!("{} · {changes}", prompt_summary(message)),
             value: format!("m{index}"),
             active: false,
+            description: String::new(),
         });
     }
     Selector::new("rewind", items)
@@ -136,11 +138,13 @@ pub(crate) async fn pick(
                         label: format!("conversation and files · {}", files_label(&files)),
                         value: format!("m{messages}:all"),
                         active: true,
+                        description: String::new(),
                     },
                     SelectorItem {
                         label: "conversation only · the files stay as they are".to_string(),
                         value: format!("m{messages}:chat"),
                         active: false,
+                        description: String::new(),
                     },
                 ],
             );

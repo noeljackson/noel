@@ -1,0 +1,36 @@
+{
+	"source": {
+		"repository": "https://github.com/earendil-works/pi",
+		"ref": "main",
+		"commit": "841dc6050b5f0014733ee40436f8ad7cf80c93fe",
+		"package": "packages/durable",
+		"script": "/ts-parity/durable-fixture.ts"
+	},
+	"scenario": "inbox",
+	"outcome": {
+		"rejected": "ConversationBusy",
+		"withdraw": "aborted",
+		"queued": [
+			"followUp",
+			"steer"
+		],
+		"outcomes": {
+			"first": {
+				"status": "done",
+				"reason": null
+			},
+			"followUp": {
+				"status": "done",
+				"reason": null
+			},
+			"steer": {
+				"status": "done",
+				"reason": null
+			},
+			"withdrawn": {
+				"status": "unanswered",
+				"reason": "aborted"
+			}
+		}
+	}
+}

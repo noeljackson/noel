@@ -140,6 +140,7 @@ pub(crate) fn selector_for_kind(
                                 active.provider == model.provider && active.id == model.id
                             })
                             .unwrap_or(false),
+                        description: String::new(),
                     }
                 })
                 .collect(),
@@ -166,6 +167,7 @@ pub(crate) fn selector_for_kind(
                             && config.settings.theme.as_deref() == Some("default")),
                     label: name.clone(),
                     value: name,
+                    description: String::new(),
                 })
                 .collect(),
         )),
@@ -186,6 +188,7 @@ pub(crate) fn selector_for_kind(
                     label: format_session_picker_label(&session),
                     value: session.session_id.clone(),
                     active: runtime.session().session_id == session.session_id,
+                    description: String::new(),
                 })
                 .collect(),
         )),
@@ -211,6 +214,7 @@ pub(crate) fn selector_for_kind(
                     },
                     value: provider.clone(),
                     active: auth_for_provider(&config.auth, &provider, None).is_some(),
+                    description: String::new(),
                 })
                 .collect(),
         )),
@@ -275,6 +279,7 @@ pub(crate) fn provider_selector_items(
                 ),
                 value: provider,
                 active: active_provider,
+                description: String::new(),
             }
         })
         .collect()
@@ -327,6 +332,7 @@ pub(crate) fn account_selector_items_for(
         },
         value: String::new(),
         active: active.is_none(),
+        description: String::new(),
     }];
     items.extend(
         listed_accounts_for_provider(&auth, provider)
@@ -366,6 +372,7 @@ pub(crate) fn account_selector_items_for(
                     label: state,
                     active: active == Some(account.as_str()),
                     value: account,
+                    description: String::new(),
                 }
             }),
     );
@@ -440,6 +447,7 @@ pub(crate) fn bool_setting_item(label: &str, value: &str, active: bool) -> Selec
         label: format!("{label}: {}", on_off(active)),
         value: value.to_string(),
         active,
+        description: String::new(),
     }
 }
 

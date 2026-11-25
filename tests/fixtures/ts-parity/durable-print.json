@@ -1,0 +1,21 @@
+{
+	"source": {
+		"repository": "https://github.com/earendil-works/pi",
+		"ref": "main",
+		"commit": "841dc6050b5f0014733ee40436f8ad7cf80c93fe",
+		"package": "packages/durable",
+		"script": "/ts-parity/durable-fixture.ts"
+	},
+	"scenario": "print",
+	"outcome": {
+		"status": "done",
+		"answer": "This directory holds the durable package sources, tests, and docs.",
+		"turns": [
+			"user",
+			"system",
+			"assistant",
+			"toolResult",
+			"assistant"
+		]
+	}
+}

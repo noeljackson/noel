@@ -26,6 +26,8 @@ mod rewind;
 mod rewind_tests;
 mod session_export;
 mod session_lock;
+
+pub use session_lock::{acquire as acquire_session_lock, SessionLock};
 pub mod storage;
 #[cfg(test)]
 mod subagent_tests;
@@ -56,8 +58,6 @@ use progress::{ReplyProgress, ToolProgress};
 pub use rewind::Undone;
 #[allow(unused_imports)]
 pub use session_export::*;
-#[cfg(test)]
-use session_lock::SessionLock;
 pub use subagents::{run_task_tool, SubagentEvent, TaskToolArgs};
 pub use system_prompt::PRODUCT_NAME;
 use system_prompt::{PromptTool, SystemPromptInput};
@@ -160,6 +160,37 @@ pub enum TodoStatus {
     Pending,
     InProgress,
     Completed,
+}
+
+/// A durable task's record (the Durable SDK, `docs/durable-sdk-2026-11.md`):
+/// one per task state change, complete-replacement, shaped after upstream
+/// Durable's `TaskRecord`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DurableTaskRecord {
+    pub id: String,
+    /// The definition's registered name (`kind`).
+    pub kind: String,
+    pub version: u32,
+    pub input: Value,
+    /// The task's state: its status and, while it can run, its checkpoint
+    /// (a JSON value; the definition owns its shape).
+    pub state: Value,
+    /// Whether ordinary idle waits and aborts skip it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
+    /// The durable abort mark.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub abort_requested: bool,
+    /// Crash restarts in a row without a state change.
+    #[serde(default, skip_serializing_if = "is_zero_task_restarts")]
+    pub restarts: u32,
+    /// First-writer-wins values kept while the task can run.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub memos: BTreeMap<String, Value>,
+}
+
+fn is_zero_task_restarts(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,7 +472,7 @@ impl RunStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionState {
     pub session_id: String,
     pub cwd: PathBuf,
@@ -483,6 +514,11 @@ pub struct SessionState {
     /// What codemode scripts keep with `store()` (key to JSON value).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub codemode_store: BTreeMap<String, Value>,
+    /// The session's durable tasks, by id (the Durable SDK's task model,
+    /// `docs/durable-sdk-2026-11.md`): the last `task` record for each,
+    /// complete-replacement. Older versions ignore the records.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tasks: BTreeMap<String, DurableTaskRecord>,
     #[serde(default)]
     pub usage: SessionUsage,
     /// The session's runs, oldest first.
@@ -741,6 +777,7 @@ impl SessionState {
             todos: Vec::new(),
             edited_files: Vec::new(),
             codemode_store: BTreeMap::new(),
+            tasks: BTreeMap::new(),
             usage: SessionUsage::default(),
             runs: Vec::new(),
             partial: None,
@@ -909,6 +946,8 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         todos: export.todos,
         edited_files: export.edited_files,
         codemode_store: export.codemode_store,
+        // An export carries no durable tasks.
+        tasks: BTreeMap::new(),
         usage: export.usage,
         // Runs belong to the session that ran them.
         runs: Vec::new(),
@@ -1466,6 +1505,11 @@ enum SessionRecord {
     },
     Todos {
         todos: Vec<TodoItem>,
+    },
+    /// A durable task's state, complete-replacement by id (the Durable
+    /// SDK). Older versions ignore it.
+    Task {
+        record: DurableTaskRecord,
     },
     EditedFiles {
         paths: Vec<String>,
@@ -2116,6 +2160,12 @@ impl SessionStore {
         self.append(&SessionRecord::Todos { todos })
     }
 
+    /// Saves a durable task's state, complete-replacement by id (the
+    /// Durable SDK's task model).
+    pub fn record_task(&self, record: DurableTaskRecord) -> Result<(), SessionError> {
+        self.append(&SessionRecord::Task { record })
+    }
+
     pub fn record_codemode_store(
         &self,
         store: BTreeMap<String, Value>,
@@ -2459,6 +2509,32 @@ impl SessionStore {
 
     /// Replaces the journal with the full state in one atomic rename, so a
     /// crash leaves either the previous journal or the complete new one.
+    /// [`SessionStore::fork_with_id`] into a caller's storage (the SDK's
+    /// multi-conversation harness forks into the journal it manages): the
+    /// source's state written whole as a new session named `session_id`,
+    /// runs and unfinished work left with the source.
+    pub fn fork_into_storage(
+        storage: storage::Storage,
+        source: &SessionState,
+        session_id: impl Into<String>,
+    ) -> Result<(Self, SessionState), SessionError> {
+        let store = Self::on(storage);
+        let session_id = session_id.into();
+        let mut state = source.clone();
+        state.session_id = session_id.clone();
+        state.runs.clear();
+        state.partial = None;
+        state.tool_outputs.clear();
+        state.parent_session_id = Some(source.session_id.clone());
+        state.branch_summaries.push(BranchSummary {
+            from_session_id: source.session_id.clone(),
+            to_session_id: session_id,
+            summary: summarize_branch(source),
+        });
+        store.write_full_state(&state)?;
+        Ok((store, state))
+    }
+
     fn write_full_state(&self, state: &SessionState) -> Result<(), SessionError> {
         let mut records = vec![SessionRecord::Started {
             session_id: state.session_id.clone(),
@@ -2799,6 +2875,17 @@ impl Runtime {
     /// with (see the field). Each mode sets its own at startup.
     pub fn set_subagent_provider_factory(&mut self, factory: SubagentProviderFactory) {
         self.subagent_provider_factory = Some(factory);
+    }
+
+    /// Saves a durable task's record: the session's task table and one
+    /// journal record, together (the Durable SDK, slice 3). A save that
+    /// fails writes nothing.
+    pub fn save_task(&mut self, record: DurableTaskRecord) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.record_task(record.clone())?;
+        }
+        self.session.tasks.insert(record.id.clone(), record);
+        Ok(())
     }
 
     /// The plugin tools the run offers from now on, run by `host`; they

@@ -2190,6 +2190,17 @@ impl Remote {
                     crate::recall_queued_message(app, text)
                 }
                 Some("withdrawn") => app.push(TuiEntryKind::System, format!("withdrew: {text}")),
+                // A recall that found the item placed (the view lagged the
+                // run's boundary) tries the next one up: the queue the
+                // user sees is what Up must keep working over.
+                Some("already_placed") if recall => {
+                    self.withdrawing.retain(|id| {
+                        !inbox(&self.view)
+                            .iter()
+                            .any(|(listed, _, listed_text)| listed == id && *listed_text == text)
+                    });
+                    self.withdraw_last();
+                }
                 Some("already_placed") => app.push(
                     TuiEntryKind::System,
                     format!("already placed into the run: {text}"),

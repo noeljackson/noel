@@ -87,6 +87,26 @@ The committed TypeScript parity fixtures are:
 - `local-tools.json`: built-in local tool inventory (names, labels, prompt
   snippets, parameter names). Rust checks only that every upstream tool is
   present; `tool-behavior.json` covers what the tools do.
+- `durable-chat.json`, `durable-print.json`, `durable-inbox.json`,
+  `durable-turnLimit.json`, `durable-harnessMany.json`, `durable-forks.json`,
+  `durable-tasks.json`, `durable-taskRecovery.json`,
+  `durable-taskSleep.json`, `durable-taskSignals.json`:
+  the scenarios of upstream Durable's own examples
+  `13-chat`, `17-print` (faux variant), `19-inbox` and
+  `33-turn-limit-and-continue`, plus slice 2's `05-harness`/
+  `07-harness-conversations` (many conversations, found by id) and `02-forks`
+  (a fork's transcript at an entry), and slice 3's `11-tasks` (a phased
+  payment task's outcome) and `12-recovery` (a task's saved checkpoint at a
+  close, resumed and completed after a reopen, exactly-once through memos),
+  run through upstream's Harness on the faux
+  provider and recorded by `scripts/ts-parity/durable-fixture.ts`
+  (`make ts-parity-durable`, from the local pi checkout at
+  `TS_REFERENCE_REF`): the settled record (status, reason), the transcript's
+  entry kinds and turn roles, the queue's order, the refusal of a
+  `whenBusy: "reject"` submit, `runFailure` and its clearing, and a second
+  continue refused `ConversationBusy`. `crates/noel-durable`'s slice-1 tests
+  replay each scenario against the SDK and compare (`crates/noel-durable`'s
+  slice-1 and slice-2 tests).
 - `mistral-devstral.json`: Mistral chat-completions request shape.
 - `mistral-tool-id.json`: Mistral tool-history request shape and 9-character
   tool-call ID normalization.

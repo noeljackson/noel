@@ -23,7 +23,7 @@ ENV_DAEMONS_SCRIPT := scripts/build-env-daemons.sh
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e e2e-render-inprocess dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures chord2-fixtures codemode-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord2-interop app app-check ios ios-libs env-interop env-daemon env-daemons noel-static workspace-journey bridge-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
+.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e e2e-render-inprocess dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures chord2-fixtures codemode-fixtures ts-parity-chord ts-parity-env ts-parity-durable ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord2-interop app app-check ios ios-libs env-interop env-daemon env-daemons noel-static workspace-journey bridge-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -58,6 +58,7 @@ help:
 		'  ts-parity-fixtures  Generate TS reference fixtures inside Docker' \
 		'  ts-parity-chord     Regenerate only the Chord goldens inside Docker' \
 		'  ts-parity-env       Regenerate only the LocalEnv goldens inside Docker' \
+		'  ts-parity-durable   Regenerate the Durable SDK goldens from the local pi checkout' \
 		'  ts-parity-pi-env    Regenerate only the pi-env daemon goldens inside Docker' \
 		'  ts-parity-pi-env-ssh Regenerate only the pi-env SSH deployment goldens inside Docker' \
 		'  chord2-interop      Run noel against upstream Chord v2 (Bun, CHORD2_REFERENCE_DIR)' \
@@ -239,6 +240,17 @@ ts-parity-env: ts-parity-build
 	mkdir -p "$(TS_PARITY_FIXTURES_DIR)"
 	$(DOCKER) run --rm -v "$(CURDIR)/$(TS_PARITY_FIXTURES_DIR):/fixtures" $(TS_PARITY_IMAGE) \
 		npx tsx /ts-parity/local-env-fixture.ts /fixtures
+
+# Durable SDK goldens (docs/durable-sdk-2026-11.md): upstream's own
+# example scenarios (13-chat, 17-print, 19-inbox, 33-turn-limit), on the
+# faux provider, for noel-durable. Runs from the local pi checkout at
+# DURABLE_REFERENCE_DIR with Bun (the codemode-fixtures pattern); in the
+# fixture image it is /ts-reference.
+DURABLE_REFERENCE_DIR ?= ../pi
+unexport DURABLE_REFERENCE_DIR
+ts-parity-durable:
+	mkdir -p "$(TS_PARITY_FIXTURES_DIR)"
+	bun --conditions=source scripts/ts-parity/durable-fixture.ts "$(TS_PARITY_FIXTURES_DIR)"
 
 # Upstream pi-env's client driving its own daemon (both from upstream's
 # checkout) through a tap, for noel-env serve's goldens. Runs as the caller, so
