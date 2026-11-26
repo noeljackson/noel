@@ -3,7 +3,7 @@
     "repository": "https://github.com/earendil-works/pi",
     "ref": "main",
     "package": "packages/env",
-    "envCommit": "6d8fd53775248ba3f679edcca92628f9f2f972c9",
+    "envCommit": "dbc8075abb0c1dc6da679c5bdbb730efc09a2cec",
     "daemon": "pi-env 1.6.1, built from packages/env/daemon at ref (release, musl)",
     "script": "/ts-parity/pi-env-fixture.ts"
   },
