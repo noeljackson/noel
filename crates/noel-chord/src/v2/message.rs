@@ -96,7 +96,9 @@ pub enum Message {
     Hello {
         protocol: u64,
         incarnation: String,
-        calls: u64,
+        /// The call window this side accepts; `None` when it announces no
+        /// window (the wire writes 0 for it, a window is at least 1).
+        calls: Option<u64>,
     },
     Hold {
         origin: Option<u64>,
@@ -307,7 +309,9 @@ impl Message {
             } => {
                 put("protocol", json!(protocol));
                 put("incarnation", json!(incarnation));
-                put("calls", json!(calls));
+                if let Some(calls) = calls {
+                    put("calls", json!(calls));
+                }
             }
             Message::Hold {
                 hold,
@@ -537,7 +541,12 @@ impl Message {
             "hello" => Message::Hello {
                 protocol: int("protocol")?,
                 incarnation: text("incarnation")?,
-                calls: int("calls")?,
+                // Absent means no window; 0 is kept as given (a window is at
+                // least 1, so the check refuses it).
+                calls: match value.get("calls") {
+                    Some(Value::Null) | None => None,
+                    Some(_) => Some(int("calls")?),
+                },
             },
             "hold" => Message::Hold {
                 origin,

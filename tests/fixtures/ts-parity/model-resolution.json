@@ -87,13 +87,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -162,13 +162,10 @@
         "authenticated": []
       },
       "expected": {
-        "model": {
-          "provider": "mistral",
-          "id": "devstral-medium-latest"
-        },
-        "thinkingLevel": "high",
+        "model": null,
+        "thinkingLevel": null,
         "warning": null,
-        "error": null
+        "error": "Model \"devstral-medium-latest:high\" not found. Use --list-models to see available models."
       }
     },
     {
@@ -413,7 +410,7 @@
       "expected": {
         "model": {
           "provider": "openai",
-          "id": "gpt-5.3-codex-spark"
+          "id": "gpt-5.3-codex"
         },
         "thinkingLevel": null,
         "warning": null,
@@ -477,7 +474,7 @@
       "expected": {
         "model": {
           "provider": "zai",
-          "id": "glm-5.3-highspeed"
+          "id": "glm-5.4"
         },
         "thinkingLevel": null,
         "warning": null,
@@ -523,8 +520,8 @@
       },
       "expected": {
         "model": {
-          "provider": "cloudflare-ai-gateway",
-          "id": "workers-ai/@cf/moonshotai/kimi-k2.7-code"
+          "provider": "amazon-bedrock",
+          "id": "us.moonshotai.kimi-k3.1"
         },
         "thinkingLevel": null,
         "warning": null,
@@ -540,7 +537,7 @@
         "model": null,
         "thinkingLevel": null,
         "warning": null,
-        "error": "Model \"glm-5\" is ambiguous across providers: opencode/glm-5, qwen-token-plan-cn/glm-5, qwen-token-plan/glm-5. No matching provider is authenticated. Use --provider or provider/model."
+        "error": "Model \"glm-5\" is ambiguous across providers: qwen-token-plan-cn/glm-5, qwen-token-plan/glm-5. No matching provider is authenticated. Use --provider or provider/model."
       }
     },
     {
@@ -628,7 +625,7 @@
       "expected": {
         "model": {
           "provider": "zai",
-          "id": "glm-5.3-highspeed"
+          "id": "glm-5.4"
         },
         "thinkingLevel": null,
         "warning": null,
@@ -819,13 +816,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -863,13 +860,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -907,13 +904,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -951,13 +948,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -996,13 +993,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -1041,13 +1038,13 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": "max"
+            "max": "max",
+            "off": null
           },
           "input": [
             "text",
@@ -1191,14 +1188,24 @@
           "api": "mistral-conversations",
           "provider": "mistral",
           "baseUrl": "https://api.mistral.ai",
-          "reasoning": false,
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          },
           "input": [
-            "text"
+            "text",
+            "image"
           ],
           "cost": {
-            "input": 0.4,
-            "output": 2,
-            "cacheRead": 0.04,
+            "input": 1.5,
+            "output": 7.5,
+            "cacheRead": 0.15,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -1228,13 +1235,23 @@
           "provider": "mistral",
           "baseUrl": "https://api.mistral.ai",
           "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          },
           "input": [
-            "text"
+            "text",
+            "image"
           ],
           "cost": {
-            "input": 0.4,
-            "output": 2,
-            "cacheRead": 0.04,
+            "input": 1.5,
+            "output": 7.5,
+            "cacheRead": 0.15,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -1263,14 +1280,24 @@
           "api": "mistral-conversations",
           "provider": "mistral",
           "baseUrl": "https://api.mistral.ai",
-          "reasoning": false,
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          },
           "input": [
-            "text"
+            "text",
+            "image"
           ],
           "cost": {
-            "input": 0.4,
-            "output": 2,
-            "cacheRead": 0.04,
+            "input": 1.5,
+            "output": 7.5,
+            "cacheRead": 0.15,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -1298,13 +1325,23 @@
           "provider": "mistral",
           "baseUrl": "https://api.mistral.ai",
           "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          },
           "input": [
-            "text"
+            "text",
+            "image"
           ],
           "cost": {
-            "input": 0.4,
-            "output": 2,
-            "cacheRead": 0.04,
+            "input": 1.5,
+            "output": 7.5,
+            "cacheRead": 0.15,
             "cacheWrite": 0
           },
           "contextWindow": 262144,
@@ -2244,6 +2281,11 @@
             "provider": "openai",
             "id": "gpt-6.1-sol",
             "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-6.2-sol",
+            "thinkingLevel": null
           }
         ],
         "diagnostics": []
@@ -2323,11 +2365,6 @@
           {
             "provider": "openai",
             "id": "gpt-5.3-codex",
-            "thinkingLevel": null
-          },
-          {
-            "provider": "openai",
-            "id": "gpt-5.3-codex-spark",
             "thinkingLevel": null
           },
           {
@@ -2912,7 +2949,7 @@
       },
       "expected": {
         "provider": "openai",
-        "id": "gpt-6.1-sol"
+        "id": "gpt-6.2-sol"
       }
     }
   ],
@@ -2941,7 +2978,7 @@
         ],
         "initialModel": {
           "provider": "openai-codex",
-          "id": "gpt-6.1-sol"
+          "id": "gpt-6.2-sol"
         }
       }
     },
@@ -2967,7 +3004,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-6.1-sol"
+          "id": "gpt-6.2-sol"
         }
       }
     },
@@ -2990,7 +3027,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-6.1-sol"
+          "id": "gpt-6.2-sol"
         }
       }
     },
@@ -3042,7 +3079,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-6.1-sol"
+          "id": "gpt-6.2-sol"
         }
       }
     },
@@ -3070,7 +3107,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-6.1-sol"
+          "id": "gpt-6.2-sol"
         }
       }
     },
@@ -3098,7 +3135,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-6.1-sol"
+          "id": "gpt-6.2-sol"
         }
       }
     },
@@ -3266,7 +3303,7 @@
         ],
         "initialModel": {
           "provider": "cloudflare-workers-ai",
-          "id": "@cf/moonshotai/kimi-k2.7-code"
+          "id": "@cf/zai-org/glm-5.3"
         }
       }
     },
@@ -3291,7 +3328,7 @@
         ],
         "initialModel": {
           "provider": "cloudflare-workers-ai",
-          "id": "@cf/moonshotai/kimi-k2.7-code"
+          "id": "@cf/zai-org/glm-5.3"
         }
       }
     },
@@ -4211,13 +4248,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4268,13 +4305,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4325,13 +4362,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4449,13 +4486,23 @@
               "provider": "mistral",
               "baseUrl": "https://api.mistral.ai",
               "reasoning": true,
+              "thinkingLevelMap": {
+                "off": "none",
+                "minimal": null,
+                "low": null,
+                "medium": null,
+                "high": "high",
+                "xhigh": null,
+                "max": null
+              },
               "input": [
-                "text"
+                "text",
+                "image"
               ],
               "cost": {
-                "input": 0.4,
-                "output": 2,
-                "cacheRead": 0.04,
+                "input": 1.5,
+                "output": 7.5,
+                "cacheRead": 0.15,
                 "cacheWrite": 0
               },
               "contextWindow": 262144,
@@ -4493,20 +4540,30 @@
               "api": "mistral-conversations",
               "provider": "mistral",
               "baseUrl": "https://api.mistral.ai",
-              "reasoning": false,
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": "none",
+                "minimal": null,
+                "low": null,
+                "medium": null,
+                "high": "high",
+                "xhigh": null,
+                "max": null
+              },
               "input": [
-                "text"
+                "text",
+                "image"
               ],
               "cost": {
-                "input": 0.4,
-                "output": 2,
-                "cacheRead": 0.04,
+                "input": 1.5,
+                "output": 7.5,
+                "cacheRead": 0.15,
                 "cacheWrite": 0
               },
               "contextWindow": 262144,
               "maxTokens": 262144
             },
-            "thinkingLevel": "off"
+            "thinkingLevel": "high"
           }
         }
       ]
@@ -4590,13 +4647,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4643,13 +4700,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4763,13 +4820,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4817,13 +4874,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4874,13 +4931,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -4934,13 +4991,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -5194,13 +5251,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -6053,8 +6110,8 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-6.1-sol",
-              "name": "GPT-6.1 Sol",
+              "id": "gpt-6.2-sol",
+              "name": "GPT-6.2 Sol",
               "api": "openai-codex-responses",
               "provider": "openai-codex",
               "baseUrl": "https://chatgpt.com/backend-api",
@@ -6113,8 +6170,8 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-6.1-sol",
-              "name": "GPT-6.1 Sol",
+              "id": "gpt-6.2-sol",
+              "name": "GPT-6.2 Sol",
               "api": "openai-codex-responses",
               "provider": "openai-codex",
               "baseUrl": "https://chatgpt.com/backend-api",
@@ -6181,8 +6238,8 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-6.1-sol",
-              "name": "GPT-6.1 Sol",
+              "id": "gpt-6.2-sol",
+              "name": "GPT-6.2 Sol",
               "api": "openai-responses",
               "provider": "openai",
               "baseUrl": "https://api.openai.com/v1",
@@ -6242,8 +6299,8 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-6.1-sol",
-              "name": "GPT-6.1 Sol",
+              "id": "gpt-6.2-sol",
+              "name": "GPT-6.2 Sol",
               "api": "openai-responses",
               "provider": "openai",
               "baseUrl": "https://api.openai.com/v1",
@@ -6302,8 +6359,8 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-6.1-sol",
-              "name": "GPT-6.1 Sol",
+              "id": "gpt-6.2-sol",
+              "name": "GPT-6.2 Sol",
               "api": "openai-responses",
               "provider": "openai",
               "baseUrl": "https://api.openai.com/v1",
@@ -6375,13 +6432,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",
@@ -6426,13 +6483,13 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": "max"
+                "max": "max",
+                "off": null
               },
               "input": [
                 "text",

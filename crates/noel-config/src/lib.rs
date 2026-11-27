@@ -501,6 +501,7 @@ impl ModelDefinition {
             // requests keep tools in the top-level field.
             supports_mid_convo_system_messages: None,
             supports_additional_tools: None,
+            supports_mid_convo_effort: None,
         }
     }
 }

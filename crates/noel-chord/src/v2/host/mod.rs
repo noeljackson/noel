@@ -1034,7 +1034,7 @@ impl Actor {
             BinaryCodec,
             ChannelOptions {
                 incarnation: self.incarnation.clone(),
-                calls: CALLS,
+                calls: Some(CALLS),
                 trusted: options.trusted,
             },
             self.now(),
@@ -2560,8 +2560,9 @@ impl Actor {
                 return;
             }
             // The peer's call window, as its `hello` gave it (#175: read
-            // from the channel, which alone knows it).
-            let window = host_link.channel.peer_calls();
+            // from the channel, which alone knows it): `None` when it
+            // announced none, so nothing waits.
+            let window = host_link.channel.peer_calls().unwrap_or(u64::MAX);
             let consumer = &mut host_link.consumer;
             if consumer.in_flight >= window {
                 return;

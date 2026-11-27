@@ -7,6 +7,9 @@
   "about": "pi - AI coding assistant with read, bash, edit, write tools",
   "options": [
     {
+      "long": "agent-dir"
+    },
+    {
       "long": "api-key"
     },
     {

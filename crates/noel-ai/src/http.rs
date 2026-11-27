@@ -130,10 +130,15 @@ pub(crate) fn pi_user_agent() -> &'static str {
 
 /// The `@earendil-works/pi-ai` version of the TS parity reference, which
 /// upstream embeds in the detailed `User-Agent`.
-pub(crate) const REFERENCE_PI_AI_VERSION: &str = "1.5.2";
+pub(crate) const REFERENCE_PI_AI_VERSION: &str = "1.6.1";
 /// The Node version of the TS parity reference image, which upstream
 /// embeds as the runtime in the detailed `User-Agent`.
 pub(crate) const REFERENCE_NODE_VERSION: &str = "v26.13.1";
+/// The `@google/genai` SDK version of the TS parity reference, which its
+/// client sends as both `User-Agent` and `x-goog-api-client` (its library
+/// label plus the Node runtime); pi's own `User-Agent` wins, so only the
+/// `x-goog-api-client` header carries it.
+pub(crate) const REFERENCE_GOOGLE_GENAI_CLIENT: &str = "google-genai-sdk/3.6.1 gl-node/v26.13.1";
 
 pub(crate) fn format_pi_user_agent(platform: &str, arch: &str) -> String {
     format!("pi/{REFERENCE_PI_AI_VERSION} ({platform}; node/{REFERENCE_NODE_VERSION}; {arch})")

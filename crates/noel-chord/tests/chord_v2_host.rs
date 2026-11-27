@@ -318,7 +318,7 @@ async fn the_window_holds_state_until_acknowledged() {
         BinaryCodec,
         ChannelOptions {
             incarnation: uuidv7(),
-            calls: 1,
+            calls: Some(1),
             trusted: false,
         },
         0,
@@ -404,7 +404,7 @@ async fn a_calls_answer_follows_its_state_past_a_full_window() {
         BinaryCodec,
         ChannelOptions {
             incarnation: uuidv7(),
-            calls: 1,
+            calls: Some(1),
             trusted: false,
         },
         0,

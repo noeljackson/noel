@@ -219,7 +219,7 @@ fn provider_max_tokens_leaves_room_for_the_input() {
     let config = ProviderConfig {
         model: ModelRef {
             provider: "cloudflare-ai-gateway".to_string(),
-            id: "workers-ai/@cf/moonshotai/kimi-k2.6".to_string(),
+            id: "workers-ai/@cf/zai-org/glm-5.3".to_string(),
         },
         api: ProviderApi::OpenAi,
         base_url: None,
@@ -2050,7 +2050,7 @@ fn mistral_body_preserves_tools_calls_and_results() {
     let config = ProviderConfig {
         model: ModelRef {
             provider: "mistral".to_string(),
-            id: "devstral-medium-latest".to_string(),
+            id: "mistral-medium-latest".to_string(),
         },
         api: ProviderApi::Mistral,
         base_url: None,
@@ -3090,7 +3090,7 @@ fn openai_compatible_headers_cover_copilot_and_cloudflare() {
     let cloudflare = ProviderConfig {
         model: ModelRef {
             provider: "cloudflare-ai-gateway".to_string(),
-            id: "workers-ai/@cf/moonshotai/kimi-k2.6".to_string(),
+            id: "workers-ai/@cf/zai-org/glm-5.3".to_string(),
         },
         api: ProviderApi::OpenAi,
         base_url: None,
@@ -3173,15 +3173,20 @@ fn openai_codex_oauth_matches_ts_request_shape() {
     let body = openai_responses_body(&config, &request);
     assert_eq!(body, fixture_request["body"]);
 
-    // Without a system prompt, upstream's placeholder stands in.
+    // Without a system prompt, no developer item is sent (upstream
+    // `edfe6b2ef`: the instructions field is gone with it).
     for system_prompt in [None, Some(String::new())] {
         let request = ProviderRequest {
             system_prompt,
             ..request.clone()
         };
+        let input = openai_responses_body(&config, &request)["input"].clone();
         assert_eq!(
-            openai_responses_body(&config, &request)["instructions"],
-            "You are a helpful assistant."
+            input,
+            json!([{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "hello" }],
+            }])
         );
     }
 }
@@ -3376,6 +3381,15 @@ fn google_tools_matches_ts_request_shape() {
         session_id: None,
         traits: ModelTraits::default(),
     });
+    let headers = google_headers("google-key").expect("headers");
+    for name in ["content-type", "user-agent", "x-goog-api-client"] {
+        assert_eq!(
+            headers.get(name).and_then(|value| value.to_str().ok()),
+            fixture["request"]["headers"][name].as_str(),
+            "header {name}"
+        );
+    }
+    assert!(headers.get("x-goog-api-key").is_some());
 
     assert_eq!(google_body(&config, &request), fixture["request"]["body"]);
 }
@@ -3402,7 +3416,7 @@ fn mistral_tools_matches_ts_request_shape() {
     let config = with_catalog(ProviderConfig {
         model: ModelRef {
             provider: "mistral".to_string(),
-            id: "devstral-medium-latest".to_string(),
+            id: "mistral-medium-latest".to_string(),
         },
         api: ProviderApi::Mistral,
         base_url: Some("https://api.mistral.ai/v1".to_string()),
@@ -3627,12 +3641,13 @@ fn google_gemini_matches_ts_request_shape() {
         google_url(&config).expect("url"),
         fixture_request["url"].as_str().expect("fixture url")
     );
-    assert_eq!(
-        headers
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        fixture_request["headers"]["content-type"].as_str()
-    );
+    for name in ["content-type", "user-agent", "x-goog-api-client"] {
+        assert_eq!(
+            headers.get(name).and_then(|value| value.to_str().ok()),
+            fixture_request["headers"][name].as_str(),
+            "header {name}"
+        );
+    }
     assert!(headers.get("x-goog-api-key").is_some());
 
     assert_eq!(google_body(&config, &request), fixture_request["body"]);
@@ -3700,7 +3715,7 @@ fn cloudflare_ai_gateway_matches_ts_request_shape() {
     let config = with_catalog(ProviderConfig {
         model: ModelRef {
             provider: "cloudflare-ai-gateway".to_string(),
-            id: "workers-ai/@cf/moonshotai/kimi-k2.6".to_string(),
+            id: "workers-ai/@cf/zai-org/glm-5.3".to_string(),
         },
         api: ProviderApi::OpenAi,
         base_url: Some(
@@ -3758,9 +3773,9 @@ fn cloudflare_ai_gateway_matches_ts_request_shape() {
 }
 
 #[test]
-fn mistral_devstral_matches_ts_request_shape() {
+fn mistral_medium_matches_ts_request_shape() {
     let fixture = serde_json::from_str::<Value>(include_str!(
-        "../../../tests/fixtures/ts-parity/mistral-devstral.json"
+        "../../../tests/fixtures/ts-parity/mistral-medium.json"
     ))
     .expect("parse TS parity fixture");
     let request = ProviderRequest {
@@ -3779,7 +3794,7 @@ fn mistral_devstral_matches_ts_request_shape() {
     let config = with_catalog(ProviderConfig {
         model: ModelRef {
             provider: "mistral".to_string(),
-            id: "devstral-medium-latest".to_string(),
+            id: "mistral-medium-latest".to_string(),
         },
         api: ProviderApi::Mistral,
         base_url: Some("https://api.mistral.ai/v1".to_string()),

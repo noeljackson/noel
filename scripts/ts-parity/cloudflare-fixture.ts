@@ -52,7 +52,9 @@ async function captureCloudflareGatewayRequest(): Promise<CapturedRequest> {
 			import("/ts-reference/packages/ai/src/compat.ts"),
 			import("/ts-reference/packages/ai/src/compat.ts"),
 		]);
-		const model = getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6");
+		// Cloudflare retired the @cf/moonshotai models; the gateway's default
+		// is @cf/zai-org/glm-5.3 (models.dev refresh, 2026-11-25).
+		const model = getModel("cloudflare-ai-gateway", "workers-ai/@cf/zai-org/glm-5.3");
 		const stream = streamSimple(
 			model,
 			{

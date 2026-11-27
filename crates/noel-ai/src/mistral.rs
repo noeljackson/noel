@@ -146,6 +146,21 @@ pub(crate) fn mistral_chat_body(config: &ProviderConfig, request: &ProviderReque
     if let Some(max_tokens) = provider_max_tokens(config, request) {
         body["max_tokens"] = json!(max_tokens);
     }
+    // Models with a thinking level map use `reasoning_effort` mapped from
+    // the requested level; other reasoning models use `prompt_mode`
+    // (upstream `mistral-conversations.ts`, dc84c1ac0).
+    if config.traits.reasoning == Some(true)
+        && let Some(effort_map) = config.traits.thinking_level_map.as_ref()
+    {
+        if let Some(level) = request_thinking_level(config) {
+            let effort = mapped_thinking_level(config, level).unwrap_or("high");
+            body["reasoning_effort"] = json!(effort);
+        } else if let Some(off) = effort_map.get("off").and_then(|v| v.as_deref()) {
+            body["reasoning_effort"] = json!(off);
+        }
+    } else if config.traits.reasoning == Some(true) && request_thinking_level(config).is_some() {
+        body["prompt_mode"] = json!("reasoning");
+    }
     if let Some(session_id) = &config.session_id {
         body["prompt_cache_key"] = json!(session_id);
     }

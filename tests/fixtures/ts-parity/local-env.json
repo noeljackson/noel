@@ -3,7 +3,7 @@
     "repository": "https://github.com/earendil-works/pi",
     "ref": "main",
     "package": "packages/durable",
-    "envCommit": "75ca6e7d0849d75739984f028f1b6b5e21264240",
+    "envCommit": "da7e26cc8bca83c15f04e83c9b468e79d8a35cfe",
     "script": "/ts-parity/local-env-fixture.ts"
   },
   "format": {

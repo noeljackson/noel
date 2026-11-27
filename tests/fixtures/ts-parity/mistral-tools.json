@@ -13,11 +13,11 @@
       "accept": "text/event-stream",
       "authorization": "Bearer <redacted>",
       "content-type": "application/json",
-      "user-agent": "pi/1.5.2 (linux; node/v26.13.1; x64)",
+      "user-agent": "pi/1.6.1 (linux; node/v26.13.1; x64)",
       "x-affinity": "session_ts_parity"
     },
     "body": {
-      "model": "devstral-medium-latest",
+      "model": "mistral-medium-latest",
       "stream": true,
       "messages": [
         {
@@ -51,6 +51,7 @@
         }
       ],
       "max_tokens": 257994,
+      "reasoning_effort": "high",
       "prompt_cache_key": "session_ts_parity"
     }
   }

@@ -14,19 +14,19 @@
       "cf-aig-authorization": "Bearer <redacted>",
       "content-type": "application/json",
       "session_id": "session_ts_parity",
-      "user-agent": "pi/1.5.2 (linux; node/v26.13.1; x64)",
+      "user-agent": "pi/1.6.1 (linux; node/v26.13.1; x64)",
       "x-client-request-id": "session_ts_parity",
       "x-session-affinity": "session_ts_parity",
       "x-stainless-arch": "x64",
       "x-stainless-lang": "js",
       "x-stainless-os": "Linux",
-      "x-stainless-package-version": "7.19.0",
+      "x-stainless-package-version": "7.59.0",
       "x-stainless-retry-count": "0",
       "x-stainless-runtime": "node",
       "x-stainless-runtime-version": "v26.13.1"
     },
     "body": {
-      "model": "workers-ai/@cf/moonshotai/kimi-k2.6",
+      "model": "workers-ai/@cf/zai-org/glm-5.3",
       "messages": [
         {
           "role": "system",
@@ -41,7 +41,7 @@
       "stream_options": {
         "include_usage": true
       },
-      "max_tokens": 256000
+      "max_tokens": 1044474
     }
   }
 }

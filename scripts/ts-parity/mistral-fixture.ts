@@ -127,7 +127,9 @@ async function captureMistralRequestForContext(context: Record<string, unknown>)
 			import("/ts-reference/packages/ai/src/compat.ts"),
 			import("/ts-reference/packages/ai/src/compat.ts"),
 		]);
-		const model = getModel("mistral", "devstral-medium-latest");
+		// Mistral retired devstral-medium-latest upstream (4d6a37d08); its
+		// requests are answered by mistral-medium-latest, the new default.
+		const model = getModel("mistral", "mistral-medium-latest");
 		const stream = streamSimple(
 			model,
 			context as never,
@@ -166,7 +168,7 @@ async function main() {
 	}
 	await mkdir(outputDir, { recursive: true });
 	await writeFile(
-		join(outputDir, "mistral-devstral.json"),
+		join(outputDir, "mistral-medium.json"),
 		`${JSON.stringify(
 			{
 				source: {
