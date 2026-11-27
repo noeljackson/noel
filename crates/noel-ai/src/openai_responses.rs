@@ -15,6 +15,22 @@ pub(crate) fn responses_tools_in_place(config: &ProviderConfig) -> bool {
         && config.traits.supports_additional_tools.unwrap_or(false)
 }
 
+/// The effort a thinking level change names, when the model takes it as a
+/// `configuration_update` input item instead of the request's
+/// `reasoning.effort` (upstream `getConfigurationUpdateEffort`: the model's
+/// compat flag, the requested level, and its own mapping).
+pub(crate) fn mid_convo_effort(config: &ProviderConfig) -> Option<String> {
+    if !config.traits.supports_mid_convo_effort.unwrap_or(false) {
+        return None;
+    }
+    let level = request_thinking_level(config)?;
+    Some(
+        mapped_thinking_level(config, level)
+            .unwrap_or(level)
+            .to_string(),
+    )
+}
+
 /// The leading `additional_tools` item declaring the request's tools in
 /// place, or nothing when the transport keeps them top-level.
 pub(crate) fn additional_tools_item(tools: &[ToolDefinition], strict: Value) -> Option<Value> {
@@ -72,6 +88,17 @@ pub(crate) fn github_copilot_responses_body(
     {
         input.insert(0, item);
     }
+    // A thinking level change travels as a trailing `configuration_update`
+    // input item with the mapped effort, and the request's own effort stays
+    // `medium`, so a change keeps the prompt cache (upstream
+    // `getConfigurationUpdateEffort`, `CONFIGURATION_UPDATE_REQUEST_EFFORT`).
+    let configuration_update_effort = mid_convo_effort(config);
+    if let Some(ref effort) = configuration_update_effort {
+        input.push(json!({
+            "type": "configuration_update",
+            "reasoning": { "effort": effort },
+        }));
+    }
     let mut body = json!({
         "model": config.model.id,
         "input": input,
@@ -81,7 +108,16 @@ pub(crate) fn github_copilot_responses_body(
     });
     // Copilot is sent no reasoning parameter when thinking is off
     // (upstream `openai-responses.ts`).
-    if let Some(effort) = reasoning_effort(config).filter(|_| !thinking_is_off(config)) {
+    if let Some(effort) = reasoning_effort(config)
+        .filter(|_| !thinking_is_off(config))
+        .map(|effort| {
+            if configuration_update_effort.is_some() {
+                "medium".to_string()
+            } else {
+                effort
+            }
+        })
+    {
         body["reasoning"] = json!({
             "effort": effort,
             "summary": "auto",
@@ -100,7 +136,7 @@ pub(crate) fn openai_codex_responses_body(
     config: &ProviderConfig,
     request: &ProviderRequest,
 ) -> Value {
-    let mut input = openai_responses_input(request);
+    let mut input = openai_responses_input_with_developer_system(request);
     if responses_tools_in_place(config)
         && let Some(item) = additional_tools_item(&request.tools, Value::Null)
     {
@@ -110,14 +146,11 @@ pub(crate) fn openai_codex_responses_body(
         "model": config.model.id,
         "store": false,
         "stream": true,
-        // The Codex backend rejects a request without instructions, so a
-        // caller that sends no system prompt gets upstream's placeholder
-        // (`openai-codex-responses.ts`). noel's sessions always send one.
-        "instructions": request
-            .system_prompt
-            .clone()
-            .filter(|prompt| !prompt.trim().is_empty())
-            .unwrap_or_else(|| "You are a helpful assistant.".to_string()),
+        // The system prompt is the leading developer input item, not
+        // top-level `instructions`: from GPT-6.2 on the backend appends
+        // `instructions` after `input`, so every new turn changed the prompt
+        // before the system prompt and it was never served from the prompt
+        // cache (#12273).
         "input": input,
         "text": {
             "verbosity": "low",
@@ -469,10 +502,14 @@ pub(crate) fn openai_responses_input(request: &ProviderRequest) -> Vec<Value> {
             }
             input.extend(message.tool_calls.iter().map(|tool_call| {
                 let (call_id, item_id) = openai_responses_tool_call_ids(&tool_call.id);
+                // Replayed calls carry `status: "completed"`: OpenAI returns
+                // them with it, and over the Codex WebSocket it keeps later
+                // reasoning attached to calls that have it (#12367).
                 let mut item = json!({
                     "type": "function_call",
                     "call_id": call_id,
                     "name": tool_call.name,
+                    "status": "completed",
                     "arguments": tool_call.arguments,
                 });
                 if let Some(item_id) = item_id {

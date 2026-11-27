@@ -44,7 +44,7 @@ fn valid(message: &Message) -> bool {
     match message {
         Message::Hello {
             incarnation, calls, ..
-        } => *calls >= 1 && is_incarnation(incarnation),
+        } => calls.is_none_or(|calls| calls >= 1) && is_incarnation(incarnation),
         Message::Hold {
             type_name,
             address,
@@ -173,8 +173,11 @@ mod tests {
             incarnation: uuidv7(),
             calls,
         };
-        assert!(hello(1).check().is_ok());
-        assert_eq!(hello(0).check().unwrap_err(), SCHEMA_FAILURE);
+        assert!(hello(Some(1)).check().is_ok());
+        // Absent: no window, which the check accepts (a window is at least
+        // 1, so an explicit 0 is refused).
+        assert!(hello(None).check().is_ok());
+        assert_eq!(hello(Some(0)).check().unwrap_err(), SCHEMA_FAILURE);
         assert!(Message::Ack { origin: Some(0) }.check().is_err());
         assert!(Message::Closed { origin: 0 }.check().is_err());
         for (hops, ok) in [(0, false), (1, true), (16, true), (17, false)] {

@@ -68,8 +68,9 @@ impl Codec for BinaryCodec {
 pub struct ChannelOptions {
     /// This host's incarnation, sent in `hello`.
     pub incarnation: String,
-    /// How many concurrent calls this side accepts, sent in `hello`.
-    pub calls: u64,
+    /// How many concurrent calls this side accepts, sent in `hello`;
+    /// `None` announces no window (the peer sends without one).
+    pub calls: Option<u64>,
     /// Skips the message check (the codec's decode still runs).
     pub trusted: bool,
 }
@@ -108,12 +109,12 @@ enum State {
     },
     Open {
         peer: String,
-        calls: u64,
+        calls: Option<u64>,
     },
     Closed,
 }
 
-/// One end of a link. It sends `hello { protocol, incarnation, calls }`
+/// One end of a link. It sends `hello { protocol, incarnation, calls? }`
 /// first and nothing else until the peer's arrived. Every message is
 /// decoded by the link's codec and, unless the link is trusted, checked; a
 /// first message that is no `hello` of this codec, a second `hello`,
@@ -166,11 +167,12 @@ impl Channel {
         }
     }
 
-    /// How many concurrent calls the peer accepts; 0 before its `hello`.
-    pub fn peer_calls(&self) -> u64 {
+    /// How many concurrent calls the peer accepts, from its `hello`:
+    /// `None` before it arrived or when it announced no window.
+    pub fn peer_calls(&self) -> Option<u64> {
         match &self.state {
             State::Open { calls, .. } => *calls,
-            _ => 0,
+            _ => None,
         }
     }
 
@@ -315,7 +317,7 @@ mod tests {
             BinaryCodec,
             ChannelOptions {
                 incarnation: uuidv7(),
-                calls: CALLS,
+                calls: Some(CALLS),
                 trusted: false,
             },
             now,
@@ -343,7 +345,7 @@ mod tests {
         assert_eq!(b.receive(&hello[0], 0).unwrap(), Received::Opened);
         assert_eq!(pump(&mut b, &mut a, 1), [Received::Opened]);
         assert!(a.is_open());
-        assert_eq!(a.peer_calls(), CALLS);
+        assert_eq!(a.peer_calls(), Some(CALLS));
         assert_eq!(
             a.outgoing()
                 .iter()
@@ -380,7 +382,7 @@ mod tests {
         let old = binary::encode(&Message::Hello {
             protocol: 4,
             incarnation: uuidv7(),
-            calls: 1,
+            calls: Some(1),
         });
         assert_eq!(
             a.receive(&old, 0).unwrap_err().0,
@@ -414,7 +416,7 @@ mod tests {
             BinaryCodec,
             ChannelOptions {
                 incarnation: uuidv7(),
-                calls: 1,
+                calls: Some(1),
                 trusted: true,
             },
             0,

@@ -42,13 +42,19 @@
               "text": "hello"
             }
           ]
+        },
+        {
+          "type": "configuration_update",
+          "reasoning": {
+            "effort": "xhigh"
+          }
         }
       ],
       "stream": true,
       "store": false,
       "max_output_tokens": 128000,
       "reasoning": {
-        "effort": "xhigh",
+        "effort": "medium",
         "summary": "auto"
       },
       "include": [

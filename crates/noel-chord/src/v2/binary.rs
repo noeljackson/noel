@@ -89,7 +89,8 @@ fn encode_fields(message: &Message, writer: &mut Writer) {
         } => {
             writer.varint(*protocol);
             writer.uuid(incarnation);
-            writer.varint(*calls);
+            // 0 when absent: no window (a window is at least 1).
+            writer.varint(calls.unwrap_or(0));
         }
         Message::Hold {
             hold,
@@ -371,11 +372,17 @@ fn decode_fields(
     reader: &mut Reader<'_>,
 ) -> Result<Message, DecodeError> {
     Ok(match kind {
-        "hello" => Message::Hello {
-            protocol: reader.varint()?,
-            incarnation: reader.uuid()?,
-            calls: reader.varint()?,
-        },
+        "hello" => {
+            let protocol = reader.varint()?;
+            let incarnation = reader.uuid()?;
+            let calls = reader.varint()?;
+            Message::Hello {
+                protocol,
+                incarnation,
+                // 0 means no window was announced; any other number is it.
+                calls: (calls != 0).then_some(calls),
+            }
+        }
         "hold" => {
             let hold = reader.varint()?;
             let type_name = reader.string()?;

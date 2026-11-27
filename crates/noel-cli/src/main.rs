@@ -102,7 +102,7 @@ use noel_config::{
     ImageProviderApi as ConfigImageProviderApi, ImageSettings, LoadedConfig, ModelCache,
     ModelDefinition, ModelRefreshSettings, PackageSource, ProviderApi as ConfigProviderApi,
     ResolvedAuth, ResourceFile, RetrySettings, Settings, TerminalSettings, WarningSettings,
-    DEFAULT_ACCOUNT_NAME, ENV_SESSION_DIR, MODEL_CACHE_VERSION,
+    DEFAULT_ACCOUNT_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR, MODEL_CACHE_VERSION,
 };
 use noel_core::{
     default_active_tool_names, expand_input, format_todo_list, run_excluded_bash_result,
@@ -174,6 +174,12 @@ struct Cli {
 
     #[arg(long)]
     session_dir: Option<PathBuf>,
+
+    /// The directory noel keeps its state in (`NOEL_DIR`): settings, auth,
+    /// models, and extensions. Applied as an absolute path before anything
+    /// reads the agent dir, so subcommands and extensions see it too.
+    #[arg(long, value_name = "DIR")]
+    agent_dir: Option<PathBuf>,
 
     /// Open the TUI on a session that `noel server` holds, starting the
     /// server when none listens. The session runs with its own settings, so
@@ -425,6 +431,13 @@ fn exit_code(code: i32) -> std::process::ExitCode {
 }
 
 async fn run() -> Result<()> {
+    // `--agent-dir <dir>`, the flag form of `NOEL_DIR`, is applied before
+    // anything reads the agent dir, so subcommands (`noel --agent-dir D
+    // install ...`), extensions, and child processes all see it. An
+    // absolute path, so a reported command does not depend on the directory
+    // noel runs in (upstream `applyAgentDirArg`, dd71a6fc). The flag stays
+    // in the arguments: clap parses it again as the `agent_dir` field.
+    apply_agent_dir_arg(std::env::args().skip(1))?;
     // `noel server`, `noel worker` and `noel client` (Mode 2) handle their
     // own signals.
     if let Some(code) = server::try_run(&std::env::args().collect::<Vec<_>>()).await {
@@ -972,6 +985,50 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
     // `--models`, else `enabledModels`: a scope over the models that can
     // run with the credentials now known. It removes no model.
     config.model_scope = resolve_scope(cli, config, offline_enabled(cli.offline)).models;
+    Ok(())
+}
+
+/// `--agent-dir <dir>` from the arguments, applied as `NOEL_DIR`: the last
+/// one wins, an argument after `--` is a message, and the pair is kept for
+/// clap to parse as the `agent_dir` field (upstream `applyAgentDirArg`).
+fn apply_agent_dir_arg(args: impl Iterator<Item = String>) -> Result<()> {
+    let args = args.collect::<Vec<_>>();
+    let mut agent_dir: Option<PathBuf> = None;
+    let mut in_messages = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--" {
+            in_messages = true;
+        }
+        if !in_messages {
+            if arg == "--agent-dir" {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow!("--agent-dir requires a directory"))?
+                    .clone();
+                if value.trim().is_empty() {
+                    return Err(anyhow!("--agent-dir requires a directory"));
+                }
+                agent_dir = Some(PathBuf::from(value));
+                index += 2;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--agent-dir=") {
+                agent_dir = Some(PathBuf::from(value));
+            }
+        }
+        index += 1;
+    }
+    if let Some(agent_dir) = agent_dir {
+        let agent_dir = if agent_dir.is_absolute() {
+            agent_dir
+        } else {
+            std::env::current_dir()?.join(agent_dir)
+        };
+        // SAFETY: startup, single-threaded.
+        unsafe { std::env::set_var(ENV_AGENT_DIR, agent_dir) };
+    }
     Ok(())
 }
 

@@ -70,7 +70,9 @@ The committed TypeScript parity fixtures are:
   statuses and bodies as noel words them, the overflow errors of each provider,
   transport failures, and quota and billing limits).
 - `github-copilot-gpt-6.1-sol.json`: GitHub Copilot Responses request shape.
-- `google-gemini-2.5-pro.json`: Gemini request shape and thinking config.
+- `google-gemini-2.5-pro.json`: Gemini request shape and thinking config,
+  with the identity headers (`user-agent`, `x-goog-api-client`) the
+  `@google/genai` SDK sends under pi's.
 - `google-tool-image-routing.json`: Gemini 2 versus Gemini 3 tool-result
   image routing.
 - `google-tools.json`: Gemini request shape with model-callable tools.
@@ -107,7 +109,8 @@ The committed TypeScript parity fixtures are:
   continue refused `ConversationBusy`. `crates/noel-durable`'s slice-1 tests
   replay each scenario against the SDK and compare (`crates/noel-durable`'s
   slice-1 and slice-2 tests).
-- `mistral-devstral.json`: Mistral chat-completions request shape.
+- `mistral-medium.json`: Mistral chat-completions request shape,
+  including `reasoning_effort` from the model's thinking level map.
 - `mistral-tool-id.json`: Mistral tool-history request shape and 9-character
   tool-call ID normalization.
 - `mistral-tools.json`: Mistral chat-completions request shape with

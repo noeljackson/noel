@@ -386,12 +386,21 @@ const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
     "servers are currently busy",
     "currently experiencing high demand",
     "model is at capacity",
+    // A request that waited too long in the provider's queue, e.g.
+    // sference's "reaching this model's admission ceiling of 60s".
+    "admission ceiling",
     "rate.?limit",
     "too many requests",
+    // Mistral: "request rate increased too quickly" (#12434).
+    "rate increased too quickly",
     // Status codes with word boundaries, so "50342" or "gpt-500" in an
     // id is not a status.
-    r"(?<![a-z0-9])(?:429|500|502|503|504|520|524)(?![a-z0-9])",
+    r"(?<![a-z0-9])(?:429|500|502|503|504|520|524|525)(?![a-z0-9])",
     "service.?(?:is.?)?(?:temporarily.?)?unavailable",
+    // Gateway wording such as "The provider is temporarily unavailable.
+    // Retry shortly." (#12227). "temporarily" is required: a plain
+    // "provider unavailable" is often a lasting routing error.
+    "provider.?(?:is.?)?temporarily.?unavailable",
     "server.?error",
     "internal.?error",
     "provider.?returned.?(?:an.?)?error",
@@ -431,13 +440,42 @@ const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
     "stream ended before message_stop",
     "stream ended before a terminal response event",
     "http2 request did not get a response",
+    // An OpenAI-compatible stream that ended with `finish_reason: "error"`,
+    // which OpenRouter sends when its provider fails mid-stream; see
+    // `mapStopReason` in openai-completions.ts.
+    "provider finish_reason: error",
+    // Mistral's `finish_reason: "error"` for a transient server failure
+    // (#10487).
+    "provider stopped with: error",
+    // OpenRouter: "Provider returned an empty response", and its wrapper for
+    // a provider that gave up, e.g. "The model stopped before completing the
+    // response.".
+    "returned an empty response",
+    "stopped before completing the response",
+    // Codex CLI mid-stream disconnect, relayed by proxies that wrap the
+    // Codex CLI, e.g. "stream disconnected before completion: stream closed
+    // before response.completed" (#11057).
     "stream disconnected before completion",
+    // Magpie gateway relaying a dropped upstream Anthropic stream, e.g.
+    // "Claude Code's stream from Anthropic was cut short after the reply had
+    // begun" (#11879).
     "cut short after the reply had begun",
+    // Gateway mid-stream failures relayed as SSE `event: error` frames
+    // without a status code, e.g. "The provider ended the response before it
+    // was complete." (#12227).
+    "ended the response before it was complete",
+    "connection to the provider was reset",
+    "reported a failure while generating the response",
+    // Node ERR_HTTP2_STREAM_CANCEL: the HTTP/2 session died before the
+    // request was sent, e.g. after the Bedrock SDK's 5-minute session
+    // timeout (#10379).
     "pending stream has been canceled",
     "retry delay",
     "you can retry your request",
     "try your request again",
     "please retry your request",
+    // recursive: "Unable to process request. Repeat the request later."
+    "repeat the request later",
     "ResourceExhausted",
     "subscription_sharing_usage_unavailable",
     "subscription_sharing_user_unavailable",
@@ -463,7 +501,9 @@ const NON_RETRYABLE_ERROR_PATTERNS: &[&str] = &[
 const OVERFLOW_PATTERNS: &[&str] = &[
     r"prompt (?:is )?too long",
     r"prompt exceeds max length",
-    r"request_too_large",
+    // Anthropic request byte-size error code (HTTP 413), matched as a
+    // complete ASCII identifier, not inside a longer one (#12438).
+    r"(?<![a-z0-9_])request_too_large(?![a-z0-9_])",
     r"input is too long for requested model",
     r"exceeds the context window",
     r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))",

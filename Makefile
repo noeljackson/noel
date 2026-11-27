@@ -8,7 +8,7 @@ TS_REFERENCE_REF ?= main
 TS_PARITY_TRACKING_REF ?= main
 # Chord v2 (docs/chord-v2-port.md), what noel speaks: chord-v2-*.json come
 # from upstream at this commit, and `make chord2-interop` runs against it.
-CHORD2_REFERENCE_REF ?= 4b11a7228d20c37637dd8cb01dabf1fd3c154297
+CHORD2_REFERENCE_REF ?= 841dc6050b5f0014733ee40436f8ad7cf80c93fe
 TS_PARITY_FIXTURES_DIR ?= tests/fixtures/ts-parity
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin

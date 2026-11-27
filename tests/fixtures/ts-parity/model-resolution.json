@@ -520,8 +520,8 @@
       },
       "expected": {
         "model": {
-          "provider": "cloudflare-ai-gateway",
-          "id": "workers-ai/@cf/moonshotai/kimi-k2.7-code"
+          "provider": "amazon-bedrock",
+          "id": "us.moonshotai.kimi-k3.1"
         },
         "thinkingLevel": null,
         "warning": null,
@@ -3303,7 +3303,7 @@
         ],
         "initialModel": {
           "provider": "cloudflare-workers-ai",
-          "id": "@cf/moonshotai/kimi-k2.7-code"
+          "id": "@cf/zai-org/glm-5.3"
         }
       }
     },
@@ -3328,7 +3328,7 @@
         ],
         "initialModel": {
           "provider": "cloudflare-workers-ai",
-          "id": "@cf/moonshotai/kimi-k2.7-code"
+          "id": "@cf/zai-org/glm-5.3"
         }
       }
     },

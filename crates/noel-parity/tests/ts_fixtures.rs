@@ -37,7 +37,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "google-tools.json",
     "local-env.json",
     "local-tools.json",
-    "mistral-devstral.json",
+    "mistral-medium.json",
     "mistral-tool-id.json",
     "mistral-tools.json",
     "model-catalog.json",
@@ -235,7 +235,7 @@ fn every_script_output_is_committed() {
         (
             "mistral-fixture.ts",
             fixture_set(&[
-                "mistral-devstral.json",
+                "mistral-medium.json",
                 "mistral-tool-id.json",
                 "mistral-tools.json",
             ]),
@@ -422,7 +422,7 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
             "crates/noel-env/tests/local_env_conformance.rs",
         ),
         ("local-tools.json", "crates/noel-tools/src/lib.rs"),
-        ("mistral-devstral.json", "crates/noel-ai/src/tests.rs"),
+        ("mistral-medium.json", "crates/noel-ai/src/tests.rs"),
         ("mistral-tool-id.json", "crates/noel-ai/src/tests.rs"),
         ("mistral-tools.json", "crates/noel-ai/src/tests.rs"),
         ("model-catalog.json", "crates/noel-ai/src/catalog.rs"),

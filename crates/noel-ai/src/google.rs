@@ -83,6 +83,15 @@ pub(crate) fn google_headers(api_key: &str) -> Result<HeaderMap, ProviderError> 
     let mut headers = HeaderMap::new();
     headers.insert("x-goog-api-key", HeaderValue::from_str(api_key)?);
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    // pi's identity headers and the `@google/genai` SDK's own defaults:
+    // the SDK merges its `User-Agent`/`x-goog-api-client` label under the
+    // identity's `User-Agent` (upstream `google-generative-ai.ts` and
+    // `google-vertex.ts` pass both through `httpOptions.headers`).
+    headers.insert(
+        "x-goog-api-client",
+        HeaderValue::from_static(REFERENCE_GOOGLE_GENAI_CLIENT),
+    );
+    headers.insert(USER_AGENT, HeaderValue::from_str(pi_user_agent())?);
     Ok(headers)
 }
 
@@ -178,6 +187,7 @@ impl Provider for GoogleVertexProvider {
         let response = self
             .client
             .post(format!("{url}?key={api_key}"))
+            .headers(google_headers(&api_key)?)
             .json(&google_body(&self.config, &request))
             .send()
             .await?;

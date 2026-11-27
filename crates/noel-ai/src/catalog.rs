@@ -154,6 +154,10 @@ pub struct CatalogModel {
     /// `compat.supportsAdditionalTools`: the Responses API's
     /// `additional_tools` input item declares tools in place.
     pub supports_additional_tools: bool,
+    /// `compat.supportsMidConvoEffort`: thinking level changes travel as
+    /// `configuration_update` input items with a fixed request effort, so a
+    /// change keeps the prompt cache.
+    pub supports_mid_convo_effort: bool,
 }
 
 impl CatalogModel {
@@ -193,6 +197,8 @@ struct CompatRecord {
     supports_mid_convo_system_messages: Option<bool>,
     #[serde(default)]
     supports_additional_tools: Option<bool>,
+    #[serde(default)]
+    supports_mid_convo_effort: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -278,6 +284,11 @@ fn load(catalog: &mut Catalog, text: &str, name: &str) -> Vec<(String, String)> 
                         .as_ref()
                         .and_then(|compat| compat.supports_additional_tools)
                         .unwrap_or(false),
+                    supports_mid_convo_effort: model
+                        .compat
+                        .as_ref()
+                        .and_then(|compat| compat.supports_mid_convo_effort)
+                        .unwrap_or(false),
                 })
             }));
         if catalog.models.len() > before {
@@ -348,6 +359,9 @@ pub struct ModelTraits {
     /// `compat.supportsAdditionalTools` (see [`CatalogModel`]); `None`
     /// outside the catalog.
     pub supports_additional_tools: Option<bool>,
+    /// `compat.supportsMidConvoEffort` (see [`CatalogModel`]); `None`
+    /// outside the catalog.
+    pub supports_mid_convo_effort: Option<bool>,
 }
 
 impl ModelTraits {
@@ -370,6 +384,7 @@ impl From<&CatalogModel> for ModelTraits {
             input_modalities: Some(model.input.clone()),
             supports_mid_convo_system_messages: Some(model.supports_mid_convo_system_messages),
             supports_additional_tools: Some(model.supports_additional_tools),
+            supports_mid_convo_effort: Some(model.supports_mid_convo_effort),
         }
     }
 }
