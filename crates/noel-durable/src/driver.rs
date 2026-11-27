@@ -73,6 +73,8 @@ enum Request {
         value: Value,
         reply: oneshot::Sender<crate::tasks::SignalResult>,
     },
+    /// Re-run scheduling after an injected clock or registry change.
+    Resume,
     Close {
         reply: oneshot::Sender<()>,
     },
@@ -216,6 +218,10 @@ impl Handle {
         done.await.unwrap_or(None)
     }
 
+    pub(crate) fn resume(&self) {
+        let _ = self.requests.send(Request::Resume);
+    }
+
     /// Marks a task aborted; its abort handler decides the outcome.
     pub(crate) async fn task_abort(&self, task_id: &str) -> Result<(), String> {
         let (reply, done) = oneshot::channel();
@@ -250,6 +256,7 @@ impl Handle {
 pub(super) async fn spawn(
     mut runtime: noel_core::Runtime,
     options: crate::HarnessOptions,
+    storage: noel_core::storage::Storage,
 ) -> Result<Handle, crate::HarnessError> {
     let (requests, inbox) = mpsc::unbounded_channel();
     let events = Arc::new(Events::new());
@@ -257,6 +264,7 @@ pub(super) async fn spawn(
         clock: Arc::new(options.clock.clone()),
         providers: Arc::new(options.providers),
         tools: Mutex::new(options.tools),
+        tool_runtime: None,
         events: events.clone(),
         waiters: Mutex::new(Vec::new()),
         tasks: options.tasks.clone(),
@@ -270,7 +278,7 @@ pub(super) async fn spawn(
     // worker's plugin tools: installed before the first run starts.
     controller.configure(|runtime, host| {
         let tools = std::mem::take(&mut *host.tools.lock().expect("tool registry"));
-        tools.install(runtime);
+        host.tool_runtime = Some(tools.install(runtime, storage, host.clock.clone()));
     });
     // A run the journal says was interrupted resumes first, as the
     // server's crash loop resumes a restarted worker's run.
@@ -354,10 +362,26 @@ async fn driver(
                 let _ = reply.send(record);
             }
             Request::TaskAbort { task_id, reply } => {
-                let _ = reply.send(crate::driver_tasks::abort(&mut controller, &task_id).await);
+                let tool = controller
+                    .host()
+                    .tool_runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.abort(&task_id));
+                let outcome = if tool {
+                    Ok(())
+                } else {
+                    crate::driver_tasks::abort(&mut controller, &task_id).await
+                };
+                let _ = reply.send(outcome);
             }
             Request::TaskWake { reply } => {
-                let _ = reply.send(crate::driver_tasks::wake(&controller));
+                let tools = controller
+                    .host()
+                    .tool_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.wake());
+                let tasks = crate::driver_tasks::wake(&controller);
+                let _ = reply.send(tools.into_iter().chain(tasks).min());
             }
             Request::TaskSignal {
                 task_id,
@@ -366,13 +390,23 @@ async fn driver(
                 value,
                 reply,
             } => {
-                let _ = reply.send(crate::driver_tasks::signal(
-                    &mut controller,
-                    &task_id,
-                    &signal,
-                    &key,
-                    value,
-                ));
+                let tool = controller
+                    .host()
+                    .tool_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.signal(&task_id, &signal, &key, value.clone()))
+                    .unwrap_or(crate::tasks::SignalResult::NotFound);
+                let outcome = if tool == crate::tasks::SignalResult::NotFound {
+                    crate::driver_tasks::signal(&mut controller, &task_id, &signal, &key, value)
+                } else {
+                    tool
+                };
+                let _ = reply.send(outcome);
+            }
+            Request::Resume => {
+                if let Some(runtime) = &controller.host().tool_runtime {
+                    runtime.resume();
+                }
             }
             Request::Close { reply } => {
                 let _ = reply.send(());
@@ -506,6 +540,9 @@ fn busy_request(request: Request, run: &mut Busy<'_, SdkHost>) {
             let _ = reply.send(outcome);
         }
         Request::Abort { reply } => {
+            if let Some(runtime) = &run.host().tool_runtime {
+                runtime.abort_all();
+            }
             let outcome = run.abort_with(None, AbortPolicy::WithdrawQueue);
             let _ = reply.send(outcome.map_err(|error| error.to_string()));
         }
@@ -525,15 +562,46 @@ fn busy_request(request: Request, run: &mut Busy<'_, SdkHost>) {
             let _ = reply.send(crate::tasks::TaskRecord::orphaned(&task_id));
         }
         Request::TaskAbort { task_id, reply } => {
-            let _ = reply.send(Err(format!(
-                "a run is active; task {task_id} cannot be aborted through it"
-            )));
+            let outcome = run
+                .host()
+                .tool_runtime
+                .as_ref()
+                .filter(|runtime| runtime.abort(&task_id))
+                .map(|_| Ok(()))
+                .unwrap_or_else(|| {
+                    Err(format!(
+                        "a run is active; task {task_id} cannot be aborted through it"
+                    ))
+                });
+            let _ = reply.send(outcome);
         }
         Request::TaskWake { reply } => {
-            let _ = reply.send(None);
+            let wake = run
+                .host()
+                .tool_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.wake());
+            let _ = reply.send(wake);
         }
-        Request::TaskSignal { reply, .. } => {
-            let _ = reply.send(crate::tasks::SignalResult::Closed);
+        Request::TaskSignal {
+            task_id,
+            signal,
+            key,
+            value,
+            reply,
+        } => {
+            let outcome = run
+                .host()
+                .tool_runtime
+                .as_ref()
+                .map(|runtime| runtime.signal(&task_id, &signal, &key, value))
+                .unwrap_or(crate::tasks::SignalResult::NotFound);
+            let _ = reply.send(outcome);
+        }
+        Request::Resume => {
+            if let Some(runtime) = &run.host().tool_runtime {
+                runtime.resume();
+            }
         }
         Request::Close { reply } => {
             let _ = reply.send(());

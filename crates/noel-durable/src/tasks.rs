@@ -56,7 +56,7 @@ pub struct TaskContext<I, S> {
 /// driver wiring.
 #[derive(Clone)]
 pub(crate) struct TaskRuntime {
-    commit: Arc<dyn Fn(TaskCommit) -> PhaseFuture + Send + Sync>,
+    commit: Arc<dyn Fn(TaskCommit, BTreeMap<String, Value>) -> PhaseFuture + Send + Sync>,
     /// The context's memos, first-writer-wins; saved with each commit.
     #[allow(dead_code)]
     memo: Arc<dyn Fn(String, Value) -> ValueFuture + Send + Sync>,
@@ -64,7 +64,7 @@ pub(crate) struct TaskRuntime {
 
 impl TaskRuntime {
     pub(crate) fn new(
-        commit: Arc<dyn Fn(TaskCommit) -> PhaseFuture + Send + Sync>,
+        commit: Arc<dyn Fn(TaskCommit, BTreeMap<String, Value>) -> PhaseFuture + Send + Sync>,
         memo: Arc<dyn Fn(String, Value) -> ValueFuture + Send + Sync>,
     ) -> Self {
         TaskRuntime { commit, memo }
@@ -92,11 +92,7 @@ impl<I, S> TaskContext<I, S> {
     /// its terminal outcome. One journal record, saved before this
     /// returns; the memos travel with it.
     pub async fn commit(&mut self, commit: TaskCommit) {
-        (self.runtime.commit)(TaskCommit::with_memos(
-            commit,
-            std::mem::take(&mut self.memos),
-        ))
-        .await;
+        (self.runtime.commit)(commit, std::mem::take(&mut self.memos)).await;
     }
 
     /// Sleeps until `until` on the harness clock, committing
@@ -157,12 +153,6 @@ impl<I, S> TaskContext<I, S> {
         }
         self.memos.insert(name.to_owned(), value.clone());
         value
-    }
-}
-
-impl TaskCommit {
-    fn with_memos(self, _memos: BTreeMap<String, Value>) -> TaskCommit {
-        self
     }
 }
 

@@ -29,6 +29,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "durable-taskSignals.json",
     "durable-taskSleep.json",
     "durable-tasks.json",
+    "durable-toolParks.json",
     "durable-turnLimit.json",
     "error-classification.json",
     "github-copilot-gpt-6.1-sol.json",
@@ -219,6 +220,7 @@ fn every_script_output_is_committed() {
                 "durable-taskSignals.json",
                 "durable-taskSleep.json",
                 "durable-tasks.json",
+                "durable-toolParks.json",
                 "durable-turnLimit.json",
             ]),
         ),
@@ -403,6 +405,10 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
             "crates/noel-durable/tests/tasks.rs",
         ),
         ("durable-tasks.json", "crates/noel-durable/tests/tasks.rs"),
+        (
+            "durable-toolParks.json",
+            "crates/noel-durable/tests/tool_parks.rs",
+        ),
         (
             "durable-turnLimit.json",
             "crates/noel-durable/tests/slice1.rs",

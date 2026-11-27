@@ -18,6 +18,9 @@ pub(super) struct SdkHost {
     pub(super) clock: Arc<crate::clock::Clock>,
     pub(super) providers: Arc<ProviderResolver>,
     pub(super) tools: Mutex<ToolRegistry>,
+    /// Suspendable tool calls live here while the controller's runtime is
+    /// lent to an active run.
+    pub(super) tool_runtime: Option<Arc<crate::tools::RegistryHost>>,
     pub(super) events: Arc<Events>,
     /// Waiters for the active run's settle: what a busy submit's reply
     /// resolves on when the run ends.

@@ -553,6 +553,49 @@ async function taskSignals(): Promise<Json> {
 	};
 }
 
+/** harness-tool-parks: a call commits a signal park, holds no tool
+ * invocation, then runs again with its checkpoint and wake. */
+async function toolParks(): Promise<Json> {
+	const Done = defineSignal<string>({ name: "test.done", version: 1, schema: str() });
+	const runs: Json[] = [];
+	const ci = defineTool({
+		name: "ci",
+		description: "wait for CI",
+		parameters: obj({}),
+		replay: "safe" as const,
+		execute: async (_args: object, api: any) => {
+			runs.push({ wake: (api.wake ?? null) as Json, checkpoint: (api.checkpoint ?? null) as Json });
+			const state = await api.readSignal(Done, "build", BACKGROUND_CONTEXT);
+			if (state !== undefined && "value" in state) return { output: [{ type: "text", text: state.value }] };
+			return { sleep: { signals: [Done.key("build")], checkpoint: { attempt: 1 } } };
+		},
+	});
+	const faux = fauxProvider();
+	faux.setResponses([
+		fauxAssistantMessage([fauxToolCall("ci", {}, { id: "call_1" })], { stopReason: "toolUse" }),
+		fauxAssistantMessage([fauxText("done")]),
+	]);
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const registry = createRegistry();
+	registry.install(defineExtension({ name: "ci", tools: [ci] }));
+	const harness = await Harness.open(new MemoryStorage(), { models, registry }, BACKGROUND_CONTEXT);
+	const root = await harness.root(BACKGROUND_CONTEXT, { agent: { model: { provider: "faux", modelId: "faux-1" } } });
+	const submission = await root.submit({ type: "input", content: "run CI" }, BACKGROUND_CONTEXT);
+	let taskId: any;
+	for (;;) {
+		const slot = (await harness.snapshot(LiveDoc, root.id, BACKGROUND_CONTEXT))?.tools?.[0];
+		if (slot?.status === "sleeping") { taskId = slot.taskId; break; }
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	}
+	const asleep = (await harness.getTask(taskId, BACKGROUND_CONTEXT))?.state.status ?? null;
+	const signal = await harness.signal(taskId, Done, "build", "passed", BACKGROUND_CONTEXT);
+	const settled = await submission.wait(BACKGROUND_CONTEXT);
+	const ended = (await harness.getTask(taskId, BACKGROUND_CONTEXT))?.state.status ?? null;
+	await harness.close(BACKGROUND_CONTEXT);
+	return { asleep, signal, settled: settled.status, ended, runs };
+}
+
 const scenarios: Record<string, () => Promise<Json>> = {
 	chat,
 	print: printMode,
@@ -564,6 +607,7 @@ const scenarios: Record<string, () => Promise<Json>> = {
 	taskRecovery,
 	taskSleep,
 	taskSignals,
+	toolParks,
 };
 
 const outDir = process.argv[2];

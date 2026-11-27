@@ -46,6 +46,22 @@ pub trait JournalStorage: Send + Sync + fmt::Debug + Any {
 /// A shared storage, as a store and its clones hold it.
 pub type Storage = Arc<dyn JournalStorage>;
 
+/// Appends one durable task replacement to a journal. Embedding hosts use
+/// this while the session runtime is lent to an active run; replay applies
+/// it exactly like [`crate::Runtime::save_task`].
+pub fn append_task_record(
+    storage: &Storage,
+    record: crate::DurableTaskRecord,
+) -> Result<(), SessionError> {
+    let bytes = serde_json::to_vec(&crate::SessionRecord::Task { record }).map_err(|source| {
+        SessionError::Write {
+            path: storage.path().to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+        }
+    })?;
+    storage.append(&bytes)
+}
+
 /// The journal file, written only while this process holds the session lock
 /// (see [`SessionError::Locked`]); handles of one process share the lock and
 /// serialize their writes.

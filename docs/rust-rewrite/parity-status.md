@@ -92,7 +92,8 @@ The committed TypeScript parity fixtures are:
 - `durable-chat.json`, `durable-print.json`, `durable-inbox.json`,
   `durable-turnLimit.json`, `durable-harnessMany.json`, `durable-forks.json`,
   `durable-tasks.json`, `durable-taskRecovery.json`,
-  `durable-taskSleep.json`, `durable-taskSignals.json`:
+  `durable-taskSleep.json`, `durable-taskSignals.json`,
+  `durable-toolParks.json`:
   the scenarios of upstream Durable's own examples
   `13-chat`, `17-print` (faux variant), `19-inbox` and
   `33-turn-limit-and-continue`, plus slice 2's `05-harness`/

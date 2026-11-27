@@ -36,7 +36,10 @@ pub use tasks::{
     TaskContext, TaskDefinition, TaskOutcome, TaskRecord, TaskRegistry, TaskSettings, TaskState,
     WakeReason,
 };
-pub use tools::{Tool, ToolContext, ToolRegistry, ToolResult};
+pub use tools::{
+    GateDecision, JoinPolicy, NestedToolCall, Tool, ToolContext, ToolGate, ToolPark, ToolRegistry,
+    ToolResult, ToolWake,
+};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -271,11 +274,11 @@ impl Harness {
                 .is_some_and(|error| matches!(error, noel_core::SessionError::Read { source, .. } if source.kind() == std::io::ErrorKind::NotFound));
         let (store, state) = if empty {
             let cwd = options.cwd.clone();
-            noel_core::SessionStore::create_in_storage(storage, cwd, "s1".to_string())?
+            noel_core::SessionStore::create_in_storage(storage.clone(), cwd, "s1".to_string())?
         } else {
-            noel_core::SessionStore::open_storage(storage)?
+            noel_core::SessionStore::open_storage(storage.clone())?
         };
-        Self::open_on(store, state, options).await
+        Self::open_on(store, state, options, storage).await
     }
 
     /// [`Harness::open`] with the session named `session_id` (the
@@ -292,11 +295,11 @@ impl Harness {
                 .is_some_and(|error| matches!(error, noel_core::SessionError::Read { source, .. } if source.kind() == std::io::ErrorKind::NotFound));
         let (store, state) = if empty {
             let cwd = options.cwd.clone();
-            noel_core::SessionStore::create_in_storage(storage, cwd, session_id)?
+            noel_core::SessionStore::create_in_storage(storage.clone(), cwd, session_id)?
         } else {
-            noel_core::SessionStore::open_storage(storage)?
+            noel_core::SessionStore::open_storage(storage.clone())?
         };
-        Self::open_on(store, state, options).await
+        Self::open_on(store, state, options, storage).await
     }
 
     /// Starts a new session named `session_id` in an empty in-memory
@@ -304,17 +307,18 @@ impl Harness {
     pub async fn in_memory(options: HarnessOptions) -> Result<Harness, HarnessError> {
         let storage: Storage = Arc::new(MemoryJournal::new(PathBuf::from("memory://session")));
         let (store, state) = noel_core::SessionStore::create_in_storage(
-            storage,
+            storage.clone(),
             options.cwd.clone(),
             "s1".to_string(),
         )?;
-        Self::open_on(store, state, options).await
+        Self::open_on(store, state, options, storage).await
     }
 
     async fn open_on(
         store: noel_core::SessionStore,
         state: noel_core::SessionState,
         options: HarnessOptions,
+        storage: Storage,
     ) -> Result<Harness, HarnessError> {
         let systems = noel_core::ReloadableSystems::from_config(&options.config, 1);
         let mut runtime = noel_core::Runtime::with_store(state, systems, store);
@@ -325,7 +329,7 @@ impl Harness {
                 .map_err(|error| HarnessError::Provider(error.to_string()))?;
         }
         let session_id = runtime.session().session_id.clone();
-        let driver = driver::spawn(runtime, options).await?;
+        let driver = driver::spawn(runtime, options, storage).await?;
         Ok(Harness { driver, session_id })
     }
 
@@ -353,6 +357,11 @@ impl Harness {
     /// (its resume counts no restart); nothing else is written.
     pub async fn close(self) -> Result<(), Error> {
         self.driver.close().await
+    }
+
+    /// Runs a scheduling pass after an injected clock or registry changed.
+    pub fn resume(&self) {
+        self.driver.resume();
     }
 }
 

@@ -254,6 +254,12 @@ pub(super) fn recover(controller: &mut SessionController<SdkHost>, restart_limit
         .cloned()
         .collect::<Vec<_>>();
     for record in records {
+        // Suspendable tool calls have their own recovery path: the model
+        // re-enters the call by call id and the tool registry resumes its
+        // committed park. A task definition never owns these records.
+        if record.kind.starts_with("pi.tool/") {
+            continue;
+        }
         if let RecordState::Running { checkpoint, .. } = record_state(&record) {
             let restarts = record.restarts + 1;
             if restarts >= restart_limit {
@@ -320,13 +326,17 @@ async fn invoke(
     // The commit channel: the engine applies each commit and answers
     // with the memos the record then holds, so the context's next memo
     // reads what was saved.
-    let (commits, mut committed) = mpsc::unbounded_channel::<(TaskCommit, OneshotReply)>();
+    let (commits, mut committed) = mpsc::unbounded_channel::<(
+        TaskCommit,
+        std::collections::BTreeMap<String, Value>,
+        OneshotReply,
+    )>();
     let runtime = TaskRuntime::new(
-        Arc::new(move |commit: TaskCommit| {
+        Arc::new(move |commit: TaskCommit, memos| {
             let commits = commits.clone();
             Box::pin(async move {
                 let (reply, done) = tokio::sync::oneshot::channel();
-                if commits.send((commit, reply)).is_ok() {
+                if commits.send((commit, memos, reply)).is_ok() {
                     let _ = done.await;
                 }
             })
@@ -376,8 +386,8 @@ async fn invoke(
     while !finished {
         let next = committed.recv().await;
         match next {
-            Some((commit, reply)) => {
-                let memos = apply(controller, record, commit);
+            Some((commit, memos, reply)) => {
+                let memos = apply(controller, record, commit, memos);
                 let _ = reply.send(memos);
             }
             None => finished = true,
@@ -409,14 +419,8 @@ fn apply(
     controller: &mut SessionController<SdkHost>,
     record: &DurableTaskRecord,
     commit: TaskCommit,
+    memos: std::collections::BTreeMap<String, Value>,
 ) -> std::collections::BTreeMap<String, Value> {
-    let memos = controller
-        .runtime()
-        .session()
-        .tasks
-        .get(&record.id)
-        .map(|record| record.memos.clone())
-        .unwrap_or_default();
     let state = match commit {
         TaskCommit::Sleep { until, checkpoint } => RecordState::Sleeping { checkpoint, until },
         TaskCommit::Wait {
@@ -448,6 +452,7 @@ fn apply(
     let state = serde_json::to_value(state).expect("a task state serializes");
     let _ = controller_mut_of(controller).save_task(DurableTaskRecord {
         state,
+        memos: memos.clone(),
         ..record.clone()
     });
     memos
