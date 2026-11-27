@@ -3,7 +3,7 @@
     "repository": "https://github.com/earendil-works/pi",
     "ref": "main",
     "package": "packages/chord",
-    "packageCommit": "8c0f89eea1dac45b62480797f45fd8a81d853802",
+    "packageCommit": "ca4badd827277d65c6e9a680bbaf1a2ab1f393e7",
     "script": "/ts-parity/chord-delta-fixture.ts"
   },
   "format": {
