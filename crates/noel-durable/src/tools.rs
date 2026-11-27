@@ -95,6 +95,31 @@ impl ToolContext<'_> {
         engine.read_signal(self.task_id, token.name, key)
     }
 
+    pub async fn read_document<T: serde::de::DeserializeOwned>(
+        &self,
+        document: &crate::Document<T>,
+        key: &str,
+    ) -> Option<T> {
+        let engine = self.engine.upgrade()?;
+        crate::documents::decode(engine.read_document(document.name, key))
+    }
+
+    pub async fn write_document<T: serde::Serialize>(
+        &self,
+        document: &crate::Document<T>,
+        key: impl Into<String>,
+        value: &T,
+    ) -> Result<(), String> {
+        let Some(engine) = self.engine.upgrade() else {
+            return Err("the harness is closed".into());
+        };
+        engine.write_documents(vec![noel_core::DurableDocumentWrite {
+            document: document.name.to_owned(),
+            key: key.into(),
+            value: Some(serde_json::to_value(value).unwrap_or(Value::Null)),
+        }])
+    }
+
     /// Executes another registered tool as a child call and waits for it.
     pub async fn execute_tool(&self, name: &str, arguments: Value, key: &str) -> ToolResult {
         let Some(engine) = self.engine.upgrade() else {
@@ -283,6 +308,7 @@ impl ToolRegistry {
             cwd,
             conversation_id,
             records: Mutex::new(records),
+            documents: Mutex::new(runtime.session().documents.clone()),
             notifies: Mutex::new(BTreeMap::new()),
         });
         let tools = host
@@ -311,6 +337,7 @@ pub(crate) struct RegistryHost {
     #[allow(dead_code)]
     conversation_id: String,
     records: Mutex<BTreeMap<String, DurableTaskRecord>>,
+    documents: Mutex<BTreeMap<String, BTreeMap<String, Value>>>,
     notifies: Mutex<BTreeMap<String, Arc<Notify>>>,
 }
 
@@ -356,6 +383,40 @@ impl RegistryHost {
         record.memos.insert(name.to_owned(), candidate.clone());
         let _ = self.save(record);
         candidate
+    }
+
+    fn read_document(&self, document: &str, key: &str) -> Option<Value> {
+        self.documents
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(document)
+            .and_then(|document| document.get(key))
+            .cloned()
+    }
+
+    fn write_documents(&self, writes: Vec<noel_core::DurableDocumentWrite>) -> Result<(), String> {
+        noel_core::storage::append_document_records(&self.storage, writes.clone())
+            .map_err(|error| error.to_string())?;
+        let mut documents = self
+            .documents
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for write in writes {
+            match write.value {
+                Some(value) => {
+                    documents
+                        .entry(write.document)
+                        .or_default()
+                        .insert(write.key, value);
+                }
+                None => {
+                    if let Some(document) = documents.get_mut(&write.document) {
+                        document.remove(&write.key);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn read_signal<T: serde::de::DeserializeOwned>(

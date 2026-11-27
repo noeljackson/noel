@@ -22,6 +22,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "codemode-declarations.json",
     "durable-chat.json",
     "durable-childTasks.json",
+    "durable-documents.json",
     "durable-forks.json",
     "durable-harnessMany.json",
     "durable-inbox.json",
@@ -214,6 +215,7 @@ fn every_script_output_is_committed() {
             fixture_set(&[
                 "durable-chat.json",
                 "durable-childTasks.json",
+                "durable-documents.json",
                 "durable-forks.json",
                 "durable-harnessMany.json",
                 "durable-inbox.json",
@@ -390,6 +392,10 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         (
             "durable-childTasks.json",
             "crates/noel-durable/tests/child_tasks.rs",
+        ),
+        (
+            "durable-documents.json",
+            "crates/noel-durable/tests/documents.rs",
         ),
         ("durable-forks.json", "crates/noel-durable/tests/multi.rs"),
         (

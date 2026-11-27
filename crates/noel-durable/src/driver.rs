@@ -81,6 +81,15 @@ enum Request {
     },
     /// Re-run scheduling after an injected clock or registry change.
     Resume,
+    DocumentRead {
+        document: String,
+        key: String,
+        reply: oneshot::Sender<Option<Value>>,
+    },
+    DocumentCommit {
+        writes: Vec<noel_core::DurableDocumentWrite>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Close {
         reply: oneshot::Sender<()>,
     },
@@ -259,6 +268,30 @@ impl Handle {
         let _ = self.requests.send(Request::Resume);
     }
 
+    pub(crate) async fn document_read(&self, document: &str, key: &str) -> Option<Value> {
+        let (reply, done) = oneshot::channel();
+        self.requests
+            .send(Request::DocumentRead {
+                document: document.to_owned(),
+                key: key.to_owned(),
+                reply,
+            })
+            .ok()?;
+        done.await.ok().flatten()
+    }
+
+    pub(crate) async fn document_commit(
+        &self,
+        writes: Vec<noel_core::DurableDocumentWrite>,
+    ) -> Result<(), String> {
+        let (reply, done) = oneshot::channel();
+        self.requests
+            .send(Request::DocumentCommit { writes, reply })
+            .map_err(|_| "the harness is closed".to_string())?;
+        done.await
+            .map_err(|_| "the harness is closed".to_string())?
+    }
+
     /// Marks a task aborted; its abort handler decides the outcome.
     pub(crate) async fn task_abort(&self, task_id: &str) -> Result<(), String> {
         let (reply, done) = oneshot::channel();
@@ -294,9 +327,15 @@ pub(super) async fn spawn(
     mut runtime: noel_core::Runtime,
     options: crate::HarnessOptions,
     storage: noel_core::storage::Storage,
+    created: bool,
 ) -> Result<Handle, crate::HarnessError> {
     let (requests, inbox) = mpsc::unbounded_channel();
     let events = Arc::new(Events::new());
+    if created {
+        events.record(OwnedEvent::ConversationCreated {
+            conversation_id: runtime.session().session_id.clone(),
+        });
+    }
     let host = SdkHost {
         clock: Arc::new(options.clock.clone()),
         providers: Arc::new(options.providers),
@@ -454,6 +493,33 @@ async fn driver(
                 if let Some(runtime) = &controller.host().tool_runtime {
                     runtime.resume();
                 }
+            }
+            Request::DocumentRead {
+                document,
+                key,
+                reply,
+            } => {
+                let value = controller
+                    .runtime()
+                    .session()
+                    .documents
+                    .get(&document)
+                    .and_then(|document| document.get(&key))
+                    .cloned();
+                let _ = reply.send(value);
+            }
+            Request::DocumentCommit { writes, reply } => {
+                let count = writes.len();
+                let result = controller
+                    .configure(|runtime, _| runtime.save_documents(writes))
+                    .map_err(|error| error.to_string());
+                if result.is_ok() && count > 0 {
+                    controller
+                        .host()
+                        .events
+                        .record(OwnedEvent::DocumentsCommitted { writes: count });
+                }
+                let _ = reply.send(result);
             }
             Request::Close { reply } => {
                 let _ = reply.send(());
@@ -652,6 +718,22 @@ fn busy_request(request: Request, run: &mut Busy<'_, SdkHost>) {
             if let Some(runtime) = &run.host().tool_runtime {
                 runtime.resume();
             }
+        }
+        Request::DocumentRead {
+            document,
+            key,
+            reply,
+        } => {
+            let value = run
+                .session()
+                .documents
+                .get(&document)
+                .and_then(|document| document.get(&key))
+                .cloned();
+            let _ = reply.send(value);
+        }
+        Request::DocumentCommit { reply, .. } => {
+            let _ = reply.send(Err("a run is active; document writes wait for idle".into()));
         }
         Request::Close { reply } => {
             let _ = reply.send(());

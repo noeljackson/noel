@@ -38,6 +38,10 @@ pub(crate) type ValueFuture = Pin<Box<dyn Future<Output = Value> + Send>>;
 pub(crate) type CreateFuture = Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
 pub(crate) type RecordFuture = Pin<Box<dyn Future<Output = TaskRecord> + Send>>;
 pub(crate) type UnitFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+pub(crate) type ReadFuture = Pin<Box<dyn Future<Output = Option<Value>> + Send>>;
+pub(crate) type CommitFn = dyn Fn(TaskCommit, BTreeMap<String, Value>, Vec<noel_core::DurableDocumentWrite>) -> PhaseFuture
+    + Send
+    + Sync;
 
 /// What a phase handler sees: its task (input, checkpoint, memos) and the
 /// runtime to commit through. It owns everything it holds, so handlers
@@ -52,6 +56,7 @@ pub struct TaskContext<I, S> {
     wake: Option<WakeReason>,
     /// First-writer-wins values kept while the task can run.
     memos: BTreeMap<String, Value>,
+    documents: Vec<noel_core::DurableDocumentWrite>,
     runtime: TaskRuntime,
 }
 
@@ -60,22 +65,24 @@ pub struct TaskContext<I, S> {
 /// driver wiring.
 #[derive(Clone)]
 pub(crate) struct TaskRuntime {
-    commit: Arc<dyn Fn(TaskCommit, BTreeMap<String, Value>) -> PhaseFuture + Send + Sync>,
+    commit: Arc<CommitFn>,
     /// The context's memos, first-writer-wins; saved with each commit.
     #[allow(dead_code)]
     memo: Arc<dyn Fn(String, Value) -> ValueFuture + Send + Sync>,
     create: Arc<dyn Fn(String, Value, bool) -> CreateFuture + Send + Sync>,
     wait: Arc<dyn Fn(String) -> RecordFuture + Send + Sync>,
     abort: Arc<dyn Fn(String) -> UnitFuture + Send + Sync>,
+    read_document: Arc<dyn Fn(String, String) -> ReadFuture + Send + Sync>,
 }
 
 impl TaskRuntime {
     pub(crate) fn new(
-        commit: Arc<dyn Fn(TaskCommit, BTreeMap<String, Value>) -> PhaseFuture + Send + Sync>,
+        commit: Arc<CommitFn>,
         memo: Arc<dyn Fn(String, Value) -> ValueFuture + Send + Sync>,
         create: Arc<dyn Fn(String, Value, bool) -> CreateFuture + Send + Sync>,
         wait: Arc<dyn Fn(String) -> RecordFuture + Send + Sync>,
         abort: Arc<dyn Fn(String) -> UnitFuture + Send + Sync>,
+        read_document: Arc<dyn Fn(String, String) -> ReadFuture + Send + Sync>,
     ) -> Self {
         TaskRuntime {
             commit,
@@ -83,6 +90,7 @@ impl TaskRuntime {
             create,
             wait,
             abort,
+            read_document,
         }
     }
 }
@@ -102,6 +110,7 @@ impl<I, S> TaskContext<I, S> {
             checkpoint,
             wake,
             memos,
+            documents: Vec::new(),
             runtime,
         }
     }
@@ -110,7 +119,12 @@ impl<I, S> TaskContext<I, S> {
     /// its terminal outcome. One journal record, saved before this
     /// returns; the memos travel with it.
     pub async fn commit(&mut self, commit: TaskCommit) {
-        (self.runtime.commit)(commit, std::mem::take(&mut self.memos)).await;
+        (self.runtime.commit)(
+            commit,
+            std::mem::take(&mut self.memos),
+            std::mem::take(&mut self.documents),
+        )
+        .await;
     }
 
     /// Sleeps until `until` on the harness clock, committing
@@ -189,6 +203,41 @@ impl<I, S> TaskContext<I, S> {
 
     pub async fn abort_task(&self, task_id: &str) -> Result<(), String> {
         (self.runtime.abort)(task_id.to_owned()).await
+    }
+
+    pub async fn read_doc<T: serde::de::DeserializeOwned>(
+        &self,
+        document: &crate::documents::Document<T>,
+        key: &str,
+    ) -> Option<T> {
+        let value = (self.runtime.read_document)(document.name.to_owned(), key.to_owned()).await;
+        crate::documents::decode(value)
+    }
+
+    /// Stages a document write in this task's next checkpoint commit.
+    pub fn write_doc<T: serde::Serialize>(
+        &mut self,
+        document: &crate::documents::Document<T>,
+        key: impl Into<String>,
+        value: &T,
+    ) {
+        self.documents.push(noel_core::DurableDocumentWrite {
+            document: document.name.to_owned(),
+            key: key.into(),
+            value: Some(serde_json::to_value(value).unwrap_or(Value::Null)),
+        });
+    }
+
+    pub fn delete_doc<T>(
+        &mut self,
+        document: &crate::documents::Document<T>,
+        key: impl Into<String>,
+    ) {
+        self.documents.push(noel_core::DurableDocumentWrite {
+            document: document.name.to_owned(),
+            key: key.into(),
+            value: None,
+        });
     }
 }
 

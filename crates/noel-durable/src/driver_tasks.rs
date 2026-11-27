@@ -41,6 +41,15 @@ impl RuntimeMut<'_> {
         self.controller
             .configure(|runtime, _| runtime.save_task(record))
     }
+
+    pub(crate) fn save_task_with_documents(
+        &mut self,
+        record: DurableTaskRecord,
+        documents: Vec<noel_core::DurableDocumentWrite>,
+    ) -> Result<(), noel_core::SessionError> {
+        self.controller
+            .configure(|runtime, _| runtime.save_task_with_documents(record, documents))
+    }
 }
 
 /// The state's serde shape on the wire (the record's `state` value).
@@ -439,7 +448,7 @@ async fn invoke(
     let runtime = TaskRuntime::new(
         {
             let actions = actions.clone();
-            Arc::new(move |commit: TaskCommit, memos| {
+            Arc::new(move |commit: TaskCommit, memos, documents| {
                 let actions = actions.clone();
                 Box::pin(async move {
                     let (reply, done) = tokio::sync::oneshot::channel();
@@ -447,6 +456,7 @@ async fn invoke(
                         .send(InvocationAction::Commit {
                             commit,
                             memos,
+                            documents,
                             reply,
                         })
                         .is_ok()
@@ -529,6 +539,26 @@ async fn invoke(
                 }) as crate::tasks::UnitFuture
             })
         },
+        {
+            let actions = actions.clone();
+            Arc::new(move |document: String, key: String| {
+                let actions = actions.clone();
+                Box::pin(async move {
+                    let (reply, done) = tokio::sync::oneshot::channel();
+                    if actions
+                        .send(InvocationAction::ReadDocument {
+                            document,
+                            key,
+                            reply,
+                        })
+                        .is_err()
+                    {
+                        return None;
+                    }
+                    done.await.ok().flatten()
+                }) as crate::tasks::ReadFuture
+            })
+        },
     );
     drop(actions);
 
@@ -561,9 +591,10 @@ async fn invoke(
             Some(InvocationAction::Commit {
                 commit,
                 memos,
+                documents,
                 reply,
             }) => {
-                let memos = apply(controller, record, commit, memos);
+                let memos = apply(controller, record, commit, memos, documents);
                 let _ = reply.send(memos);
             }
             Some(InvocationAction::Create {
@@ -584,6 +615,20 @@ async fn invoke(
                 let result = Box::pin(abort(controller, &task_id)).await;
                 let _ = reply.send(result);
             }
+            Some(InvocationAction::ReadDocument {
+                document,
+                key,
+                reply,
+            }) => {
+                let value = controller
+                    .runtime()
+                    .session()
+                    .documents
+                    .get(&document)
+                    .and_then(|document| document.get(&key))
+                    .cloned();
+                let _ = reply.send(value);
+            }
             None => finished = true,
         }
     }
@@ -596,6 +641,7 @@ enum InvocationAction {
     Commit {
         commit: TaskCommit,
         memos: std::collections::BTreeMap<String, Value>,
+        documents: Vec<noel_core::DurableDocumentWrite>,
         reply: OneshotReply,
     },
     Create {
@@ -612,6 +658,11 @@ enum InvocationAction {
     Abort {
         task_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    ReadDocument {
+        document: String,
+        key: String,
+        reply: tokio::sync::oneshot::Sender<Option<Value>>,
     },
 }
 
@@ -637,7 +688,9 @@ fn apply(
     record: &DurableTaskRecord,
     commit: TaskCommit,
     memos: std::collections::BTreeMap<String, Value>,
+    documents: Vec<noel_core::DurableDocumentWrite>,
 ) -> std::collections::BTreeMap<String, Value> {
+    let document_count = documents.len();
     let state = match commit {
         TaskCommit::Sleep { until, checkpoint } => RecordState::Sleeping { checkpoint, until },
         TaskCommit::Wait {
@@ -667,11 +720,22 @@ fn apply(
         }
     };
     let state = serde_json::to_value(state).expect("a task state serializes");
-    let _ = controller_mut_of(controller).save_task(DurableTaskRecord {
-        state,
-        memos: memos.clone(),
-        ..record.clone()
-    });
+    let _ = controller_mut_of(controller).save_task_with_documents(
+        DurableTaskRecord {
+            state,
+            memos: memos.clone(),
+            ..record.clone()
+        },
+        documents,
+    );
+    if document_count > 0 {
+        controller
+            .host()
+            .events
+            .record(crate::OwnedEvent::DocumentsCommitted {
+                writes: document_count,
+            });
+    }
     memos
 }
 

@@ -53,12 +53,30 @@ pub fn append_task_record(
     storage: &Storage,
     record: crate::DurableTaskRecord,
 ) -> Result<(), SessionError> {
-    let bytes = serde_json::to_vec(&crate::SessionRecord::Task { record }).map_err(|source| {
-        SessionError::Write {
-            path: storage.path().to_path_buf(),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
-        }
+    let bytes = serde_json::to_vec(&crate::SessionRecord::Task {
+        record,
+        documents: Vec::new(),
+    })
+    .map_err(|source| SessionError::Write {
+        path: storage.path().to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
     })?;
+    storage.append(&bytes)
+}
+
+/// Appends an atomic embedder-document batch while a runtime is lent to an
+/// active run.
+pub fn append_document_records(
+    storage: &Storage,
+    writes: Vec<crate::DurableDocumentWrite>,
+) -> Result<(), SessionError> {
+    let bytes =
+        serde_json::to_vec(&crate::SessionRecord::Documents { writes }).map_err(|source| {
+            SessionError::Write {
+                path: storage.path().to_path_buf(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+            }
+        })?;
     storage.append(&bytes)
 }
 

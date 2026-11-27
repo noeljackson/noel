@@ -13,6 +13,7 @@
 //! its handle methods are request/response over it.
 
 mod clock;
+mod documents;
 mod driver;
 mod driver_tasks;
 mod events;
@@ -25,6 +26,7 @@ mod tasks;
 mod tools;
 
 pub use clock::Clock;
+pub use documents::{define_doc, Document, DocumentBatch};
 pub use events::{Outcome, OwnedEvent};
 pub use multi::{Backend, MultiHarness, MultiOptions};
 pub use noel_providers::ModelSpec;
@@ -278,7 +280,7 @@ impl Harness {
         } else {
             noel_core::SessionStore::open_storage(storage.clone())?
         };
-        Self::open_on(store, state, options, storage).await
+        Self::open_on(store, state, options, storage, empty).await
     }
 
     /// [`Harness::open`] with the session named `session_id` (the
@@ -299,7 +301,7 @@ impl Harness {
         } else {
             noel_core::SessionStore::open_storage(storage.clone())?
         };
-        Self::open_on(store, state, options, storage).await
+        Self::open_on(store, state, options, storage, empty).await
     }
 
     /// Starts a new session named `session_id` in an empty in-memory
@@ -311,7 +313,7 @@ impl Harness {
             options.cwd.clone(),
             "s1".to_string(),
         )?;
-        Self::open_on(store, state, options, storage).await
+        Self::open_on(store, state, options, storage, true).await
     }
 
     async fn open_on(
@@ -319,6 +321,7 @@ impl Harness {
         state: noel_core::SessionState,
         options: HarnessOptions,
         storage: Storage,
+        created: bool,
     ) -> Result<Harness, HarnessError> {
         let systems = noel_core::ReloadableSystems::from_config(&options.config, 1);
         let mut runtime = noel_core::Runtime::with_store(state, systems, store);
@@ -329,7 +332,7 @@ impl Harness {
                 .map_err(|error| HarnessError::Provider(error.to_string()))?;
         }
         let session_id = runtime.session().session_id.clone();
-        let driver = driver::spawn(runtime, options, storage).await?;
+        let driver = driver::spawn(runtime, options, storage, created).await?;
         Ok(Harness { driver, session_id })
     }
 
@@ -395,6 +398,28 @@ impl Conversation<'_> {
     /// The queue as it is now: steering, then follow-ups.
     pub async fn queue(&mut self) -> Vec<QueuedItem> {
         self.harness.driver.queue().await
+    }
+
+    pub async fn read_document<T: serde::de::DeserializeOwned>(
+        &self,
+        document: &Document<T>,
+        key: &str,
+    ) -> Option<T> {
+        documents::decode(self.harness.driver.document_read(document.name, key).await)
+    }
+
+    pub async fn write_document<T: serde::Serialize>(
+        &self,
+        document: &Document<T>,
+        key: impl Into<String>,
+        value: &T,
+    ) -> Result<(), String> {
+        self.commit_documents(DocumentBatch::new().set(document, key, value))
+            .await
+    }
+
+    pub async fn commit_documents(&self, batch: DocumentBatch) -> Result<(), String> {
+        self.harness.driver.document_commit(batch.writes).await
     }
 
     /// Creates a durable task of a registered `kind` with `input`

@@ -30,6 +30,7 @@ const {
 	ConversationBusy,
 	createRegistry,
 	createSession,
+	defineDoc,
 	defineExtension,
 	defineSignal,
 	defineTask,
@@ -282,6 +283,42 @@ async function forks(): Promise<Json> {
 		parentTranscript: parentEntries.items.map((entry) => entry.data),
 		independent: after.items.map((entry) => entry.data),
 	};
+}
+
+/** 01-documents: document mutations commit atomically with transcript
+ * entries, and rewindable documents retain their value at each entry. */
+async function documents(): Promise<Json> {
+	const Notes = defineDoc<{ text: string }>({
+		checkpointWhen: () => false,
+		kind: "example.notes",
+		version: 1,
+		scope: "conversation",
+		history: "rewindable",
+		fork: "asOf",
+		initial: () => ({ text: "" }),
+	});
+	const session = createSession(new MemoryStorage());
+	const chat = await session.commit(
+		(tx) => tx.createConversation({ ownership: { kind: "ownerless" } }),
+		BACKGROUND_CONTEXT,
+	);
+	const first = await session.commit(async (tx) => {
+		const entry = await tx.appendEntry(chat.id, { kind: "note", data: "hello" });
+		(await tx.doc(Notes, chat.id)).text = "after hello";
+		return entry;
+	}, BACKGROUND_CONTEXT);
+	const second = await session.commit(async (tx) => {
+		const entry = await tx.appendEntry(chat.id, { kind: "note", data: "goodbye" });
+		(await tx.doc(Notes, chat.id)).text = "after goodbye";
+		return entry;
+	}, BACKGROUND_CONTEXT);
+	const outcome = {
+		latest: await session.snapshot(Notes, chat.id, BACKGROUND_CONTEXT),
+		first: await session.snapshotAsOf(Notes, chat.id, first.id, BACKGROUND_CONTEXT),
+		second: await session.snapshotAsOf(Notes, chat.id, second.id, BACKGROUND_CONTEXT),
+	};
+	await session.close(BACKGROUND_CONTEXT);
+	return outcome;
 }
 
 /** 11-tasks: a task with phases runs to a terminal outcome. */
@@ -650,6 +687,7 @@ const scenarios: Record<string, () => Promise<Json>> = {
 	turnLimit,
 	harnessMany,
 	forks,
+	documents,
 	tasks,
 	taskRecovery,
 	taskSleep,

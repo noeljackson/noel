@@ -168,8 +168,12 @@ pub(crate) fn apply_session_record(state: &mut Option<SessionState>, record: Ses
             state.active_tool_names = active_tools_with(&state.disabled_tools);
         }
         SessionRecord::Todos { todos } => state.todos = todos,
-        SessionRecord::Task { record } => {
+        SessionRecord::Task { record, documents } => {
+            crate::apply_document_writes(&mut state.documents, documents);
             state.tasks.insert(record.id.clone(), record);
+        }
+        SessionRecord::Documents { writes } => {
+            crate::apply_document_writes(&mut state.documents, writes);
         }
         SessionRecord::EditedFiles { paths } => state.edited_files = paths,
         SessionRecord::CodemodeStore { store } => state.codemode_store = store,

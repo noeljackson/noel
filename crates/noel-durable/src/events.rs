@@ -29,6 +29,12 @@ pub enum RunOutcome {
 /// is its owned form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OwnedEvent {
+    ConversationCreated {
+        conversation_id: String,
+    },
+    DocumentsCommitted {
+        writes: usize,
+    },
     /// A run starts, or an interrupted one continues.
     RunStarted {
         run_id: String,
@@ -105,6 +111,8 @@ impl OwnedEvent {
     /// A stable name, as goldens record events.
     pub fn name(&self) -> &'static str {
         match self {
+            OwnedEvent::ConversationCreated { .. } => "conversation_created",
+            OwnedEvent::DocumentsCommitted { .. } => "documents_committed",
             OwnedEvent::RunStarted { .. } => "run_started",
             OwnedEvent::CallStarted { .. } => "call_started",
             OwnedEvent::MessageAdded { .. } => "message_added",
