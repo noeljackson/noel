@@ -89,7 +89,7 @@ The committed TypeScript parity fixtures are:
 - `local-tools.json`: built-in local tool inventory (names, labels, prompt
   snippets, parameter names). Rust checks only that every upstream tool is
   present; `tool-behavior.json` covers what the tools do.
-- `durable-chat.json`, `durable-print.json`, `durable-inbox.json`,
+- `durable-chat.json`, `durable-childTasks.json`, `durable-print.json`, `durable-inbox.json`,
   `durable-turnLimit.json`, `durable-harnessMany.json`, `durable-forks.json`,
   `durable-tasks.json`, `durable-taskRecovery.json`,
   `durable-taskSleep.json`, `durable-taskSignals.json`,

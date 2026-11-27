@@ -515,6 +515,9 @@ impl RegistryHost {
             kind: format!("pi.tool/{name}"),
             version: 1,
             input: args.clone(),
+            owner_task_id: call_id
+                .rsplit_once('/')
+                .map(|(parent, _)| Self::task_id(parent)),
             state: serde_json::json!({"status": "pending", "checkpoint": null}),
             background: false,
             abort_requested: false,
@@ -622,6 +625,26 @@ impl RegistryHost {
         record.state = serde_json::json!({"status": "terminal", "outcome": stored});
         let _ = self.save(record.clone());
         self.notify(&record.id).notify_one();
+        self.notify_task_waiters(&record.id);
+    }
+
+    fn notify_task_waiters(&self, ended: &str) {
+        let waiting = self
+            .records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter(|record| {
+                record.state["status"] == "waiting"
+                    && record.state["on"]
+                        .as_array()
+                        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(ended)))
+            })
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        for id in waiting {
+            self.notify(&id).notify_one();
+        }
     }
 
     fn park(&self, record: &mut DurableTaskRecord, park: ToolPark) -> Result<(), String> {
@@ -700,7 +723,47 @@ impl RegistryHost {
                     ParkState::Waiting
                 }
             }
-            Some("waiting") => ParkState::Waiting,
+            Some("waiting") => {
+                let ids = record.state["on"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|id| id.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>();
+                let ended = ids
+                    .iter()
+                    .filter(|id| {
+                        self.record(id)
+                            .is_some_and(|task| task.state["status"] == "terminal")
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let policy = serde_json::from_value::<JoinPolicy>(record.state["policy"].clone())
+                    .unwrap_or(JoinPolicy::AllSettled);
+                let failed = ended.iter().any(|id| {
+                    self.record(id).is_some_and(|task| {
+                        task.state["outcome"]["is_error"] == Value::Bool(true)
+                            || task.state["outcome"]["status"] == "failed"
+                            || task.state["outcome"]["status"] == "aborted"
+                    })
+                });
+                let ready = match policy {
+                    JoinPolicy::Any => !ended.is_empty(),
+                    JoinPolicy::AllSettled => ended.len() == ids.len(),
+                    JoinPolicy::FailFast => failed || ended.len() == ids.len(),
+                };
+                if ready {
+                    if policy == JoinPolicy::FailFast && failed {
+                        for id in ids.iter().filter(|id| !ended.contains(id)) {
+                            self.abort(id);
+                        }
+                    }
+                    ParkState::Ready(Some(ToolWake::Tasks { task_ids: ended }))
+                } else {
+                    ParkState::Waiting
+                }
+            }
             Some("terminal") => ParkState::Ready(None),
             _ => ParkState::Invalid("invalid durable tool state".into()),
         }

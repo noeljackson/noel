@@ -282,6 +282,7 @@ async fn a_task_at_the_restart_limit_ends_restart_limit() {
             kind: "example.stuck".into(),
             version: 1,
             input: json!(0),
+            owner_task_id: None,
             state: json!({"status": "running", "checkpoint": {"phase": "stuck"}}),
             background: false,
             abort_requested: false,

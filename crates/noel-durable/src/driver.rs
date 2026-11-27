@@ -51,6 +51,7 @@ enum Request {
         kind: String,
         input: serde_json::Value,
         background: bool,
+        owner_task_id: Option<String>,
         reply: oneshot::Sender<Result<String, String>>,
     },
     TaskWait {
@@ -60,6 +61,11 @@ enum Request {
     TaskAbort {
         task_id: String,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    TaskJoin {
+        task_ids: Vec<String>,
+        policy: crate::tools::JoinPolicy,
+        reply: oneshot::Sender<Vec<crate::tasks::TaskRecord>>,
     },
     /// The earliest sleeping deadline (the harness's wake).
     TaskWake {
@@ -153,17 +159,48 @@ impl Handle {
         input: serde_json::Value,
         background: bool,
     ) -> Result<String, String> {
+        self.task_create_owned(kind, input, background, None).await
+    }
+
+    pub(crate) async fn task_create_owned(
+        &self,
+        kind: &str,
+        input: serde_json::Value,
+        background: bool,
+        owner_task_id: Option<String>,
+    ) -> Result<String, String> {
         let (reply, done) = oneshot::channel();
         self.requests
             .send(Request::TaskCreate {
                 kind: kind.to_owned(),
                 input,
                 background,
+                owner_task_id,
                 reply,
             })
             .map_err(|_| "the harness is closed".to_string())?;
         done.await
             .map_err(|_| "the harness is closed".to_string())?
+    }
+
+    pub(crate) async fn task_join(
+        &self,
+        task_ids: Vec<String>,
+        policy: crate::tools::JoinPolicy,
+    ) -> Vec<crate::tasks::TaskRecord> {
+        let (reply, done) = oneshot::channel();
+        if self
+            .requests
+            .send(Request::TaskJoin {
+                task_ids,
+                policy,
+                reply,
+            })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        done.await.unwrap_or_default()
     }
 
     /// Waits for a task's terminal record (running it if it is runnable).
@@ -348,13 +385,15 @@ async fn driver(
                 kind,
                 input,
                 background,
+                owner_task_id,
                 reply,
             } => {
-                let _ = reply.send(crate::driver_tasks::create(
+                let _ = reply.send(crate::driver_tasks::create_owned(
                     &mut controller,
                     &kind,
                     input,
                     background,
+                    owner_task_id,
                 ));
             }
             Request::TaskWait { task_id, reply } => {
@@ -373,6 +412,14 @@ async fn driver(
                     crate::driver_tasks::abort(&mut controller, &task_id).await
                 };
                 let _ = reply.send(outcome);
+            }
+            Request::TaskJoin {
+                task_ids,
+                policy,
+                reply,
+            } => {
+                let records = crate::driver_tasks::join(&mut controller, &task_ids, policy).await;
+                let _ = reply.send(records);
             }
             Request::TaskWake { reply } => {
                 let tools = controller
@@ -574,6 +621,9 @@ fn busy_request(request: Request, run: &mut Busy<'_, SdkHost>) {
                     ))
                 });
             let _ = reply.send(outcome);
+        }
+        Request::TaskJoin { reply, .. } => {
+            let _ = reply.send(Vec::new());
         }
         Request::TaskWake { reply } => {
             let wake = run

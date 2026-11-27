@@ -172,6 +172,10 @@ pub struct DurableTaskRecord {
     pub kind: String,
     pub version: u32,
     pub input: Value,
+    /// The live task that owns this one. `None` means the conversation
+    /// owns it directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_task_id: Option<String>,
     /// The task's state: its status and, while it can run, its checkpoint
     /// (a JSON value; the definition owns its shape).
     pub state: Value,

@@ -596,6 +596,53 @@ async function toolParks(): Promise<Json> {
 	return { asleep, signal, settled: settled.status, ended, runs };
 }
 
+/** harness-park-children: a parent waits for an owned child and does not
+ * publish its own outcome until that child is terminal. */
+async function childTasks(): Promise<Json> {
+	const Child = defineTask<null, { phase: "run" }, string>({
+		name: "test.child",
+		version: 1,
+		initial: () => ({ phase: "run" }),
+		phases: {
+			run: (_task: any, runtime: any, ctx: any) => runtime.commit(
+				() => ({ status: "terminal", outcome: { status: "completed", result: "child done" } }), ctx),
+		},
+		abort: (_task: any, runtime: any, ctx: any) => runtime.commit(
+			() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
+	});
+	type ParentState = { phase: "spawn" } | { phase: "done"; child: any };
+	const Parent = defineTask<null, ParentState, string>({
+		name: "test.parent",
+		version: 1,
+		initial: () => ({ phase: "spawn" }),
+		phases: {
+			spawn: (task: any, runtime: any, ctx: any) => runtime.commit(async (tx: any) => {
+				const child = await tx.createTask(Child, null, { ownership: { kind: "task", taskId: task.id } });
+				return { status: "waiting", checkpoint: { phase: "done", child }, on: [child], policy: "allSettled" };
+			}, ctx),
+			done: (_task: any, runtime: any, ctx: any) => runtime.commit(
+				() => ({ status: "terminal", outcome: { status: "completed", result: "parent done" } }), ctx),
+		},
+		abort: (_task: any, runtime: any, ctx: any) => runtime.commit(
+			() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
+	});
+	const registry = createRegistry();
+	registry.install(defineExtension({ name: "children", tasks: [Child, Parent] }));
+	const harness = await Harness.open(new MemoryStorage(), { models: createModels(), registry }, BACKGROUND_CONTEXT);
+	const root = await harness.root(BACKGROUND_CONTEXT);
+	const id = await root.commit((tx: any) => tx.createTask(Parent, null, { ownership: { kind: "conversation" } }), BACKGROUND_CONTEXT);
+	const ended = await harness.waitForTask(id, BACKGROUND_CONTEXT);
+	const graph = await harness.watchTaskGraph(BACKGROUND_CONTEXT);
+	const tasks = Object.values(graph.value.tasks as Record<string, any>);
+	await graph.stop();
+	await harness.close(BACKGROUND_CONTEXT);
+	return {
+		outcome: ended.state.outcome?.status ?? null,
+		result: ended.state.outcome?.status === "completed" ? ended.state.outcome.result : null,
+		ownedChildren: tasks.filter((task: any) => task.owner === id).length,
+	};
+}
+
 const scenarios: Record<string, () => Promise<Json>> = {
 	chat,
 	print: printMode,
@@ -608,6 +655,7 @@ const scenarios: Record<string, () => Promise<Json>> = {
 	taskSleep,
 	taskSignals,
 	toolParks,
+	childTasks,
 };
 
 const outDir = process.argv[2];

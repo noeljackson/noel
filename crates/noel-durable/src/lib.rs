@@ -418,6 +418,30 @@ impl Conversation<'_> {
         self.harness.driver.task_create(kind, input, true).await
     }
 
+    /// Creates a task owned by another live task. An owner's abort reaches
+    /// its whole subtree, and its outcome is held until the subtree settles.
+    pub async fn create_child_task(
+        &mut self,
+        owner_task_id: &str,
+        kind: &str,
+        input: serde_json::Value,
+        background: bool,
+    ) -> Result<String, String> {
+        self.harness
+            .driver
+            .task_create_owned(kind, input, background, Some(owner_task_id.to_owned()))
+            .await
+    }
+
+    /// Waits for tasks according to Durable's join policies.
+    pub async fn join_tasks(
+        &mut self,
+        task_ids: Vec<String>,
+        policy: JoinPolicy,
+    ) -> Vec<TaskRecord> {
+        self.harness.driver.task_join(task_ids, policy).await
+    }
+
     /// Waits for a task's terminal record, running it (upstream
     /// `waitForTask`): waiting is what starts work.
     pub async fn wait_task(&mut self, task_id: &str) -> TaskRecord {

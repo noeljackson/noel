@@ -35,11 +35,15 @@ pub type PhaseFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// A boxed future returning a JSON value (the memo channel).
 pub(crate) type ValueFuture = Pin<Box<dyn Future<Output = Value> + Send>>;
+pub(crate) type CreateFuture = Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
+pub(crate) type RecordFuture = Pin<Box<dyn Future<Output = TaskRecord> + Send>>;
+pub(crate) type UnitFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
 /// What a phase handler sees: its task (input, checkpoint, memos) and the
 /// runtime to commit through. It owns everything it holds, so handlers
 /// are plain `async move` closures.
 pub struct TaskContext<I, S> {
+    pub task_id: String,
     /// The task's creation input, retained while it is live.
     pub input: Arc<I>,
     /// The checkpoint this invocation runs at.
@@ -60,19 +64,32 @@ pub(crate) struct TaskRuntime {
     /// The context's memos, first-writer-wins; saved with each commit.
     #[allow(dead_code)]
     memo: Arc<dyn Fn(String, Value) -> ValueFuture + Send + Sync>,
+    create: Arc<dyn Fn(String, Value, bool) -> CreateFuture + Send + Sync>,
+    wait: Arc<dyn Fn(String) -> RecordFuture + Send + Sync>,
+    abort: Arc<dyn Fn(String) -> UnitFuture + Send + Sync>,
 }
 
 impl TaskRuntime {
     pub(crate) fn new(
         commit: Arc<dyn Fn(TaskCommit, BTreeMap<String, Value>) -> PhaseFuture + Send + Sync>,
         memo: Arc<dyn Fn(String, Value) -> ValueFuture + Send + Sync>,
+        create: Arc<dyn Fn(String, Value, bool) -> CreateFuture + Send + Sync>,
+        wait: Arc<dyn Fn(String) -> RecordFuture + Send + Sync>,
+        abort: Arc<dyn Fn(String) -> UnitFuture + Send + Sync>,
     ) -> Self {
-        TaskRuntime { commit, memo }
+        TaskRuntime {
+            commit,
+            memo,
+            create,
+            wait,
+            abort,
+        }
     }
 }
 
 impl<I, S> TaskContext<I, S> {
     pub(crate) fn new(
+        task_id: String,
         input: Arc<I>,
         checkpoint: Arc<S>,
         wake: Option<WakeReason>,
@@ -80,6 +97,7 @@ impl<I, S> TaskContext<I, S> {
         runtime: TaskRuntime,
     ) -> Self {
         TaskContext {
+            task_id,
             input,
             checkpoint,
             wake,
@@ -153,6 +171,24 @@ impl<I, S> TaskContext<I, S> {
         }
         self.memos.insert(name.to_owned(), value.clone());
         value
+    }
+
+    /// Creates a task owned by this invocation's task.
+    pub async fn create_child_task(
+        &self,
+        kind: &str,
+        input: Value,
+        background: bool,
+    ) -> Result<String, String> {
+        (self.runtime.create)(kind.to_owned(), input, background).await
+    }
+
+    pub async fn wait_task(&self, task_id: &str) -> TaskRecord {
+        (self.runtime.wait)(task_id.to_owned()).await
+    }
+
+    pub async fn abort_task(&self, task_id: &str) -> Result<(), String> {
+        (self.runtime.abort)(task_id.to_owned()).await
     }
 }
 
@@ -266,6 +302,7 @@ pub struct TaskRecord {
     pub kind: String,
     pub version: u32,
     pub input: Value,
+    pub owner_task_id: Option<String>,
     /// The task's state: its status and, while it can run, its checkpoint.
     pub state: TaskState,
     /// Whether the conversation's ordinary idle waits and aborts skip it.
@@ -317,6 +354,9 @@ pub enum TaskState {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         signals: Vec<Value>,
     },
+    /// The task committed an outcome and is waiting for its owned subtree
+    /// to settle before publishing it.
+    Completing { outcome: TaskOutcome },
     /// Settled, with its outcome.
     Terminal { outcome: TaskOutcome },
 }
@@ -414,6 +454,8 @@ pub enum WakeReason {
     Expired,
     /// A signal key held a value no wake used.
     Signal { signal: String, key: String },
+    /// One or more owned tasks satisfied a join.
+    Tasks { task_ids: Vec<String> },
 }
 
 /// A task's terminal outcome (upstream `TaskOutcome`).
@@ -449,6 +491,7 @@ impl TaskRecord {
             kind: String::new(),
             version: 0,
             input: Value::Null,
+            owner_task_id: None,
             state: TaskState::Terminal {
                 outcome: TaskOutcome::Orphaned,
             },
@@ -543,6 +586,7 @@ where
             };
             let wake = record_wake(&record);
             let context = TaskContext::new(
+                record.id.clone(),
                 Arc::new(input),
                 Arc::new(checkpoint),
                 wake,
@@ -582,6 +626,7 @@ where
             };
             let wake = record_wake(&record);
             let context = TaskContext::new(
+                record.id.clone(),
                 Arc::new(input),
                 Arc::new(checkpoint),
                 wake,

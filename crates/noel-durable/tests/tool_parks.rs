@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use common::{options_with, Scripted, ScriptedReply};
 use noel_durable::{
-    define_signal, GateDecision, Harness, Input, InputId, SignalState, Tool, ToolContext, ToolGate,
-    ToolPark, ToolRegistry, ToolResult, ToolWake,
+    define_signal, GateDecision, Harness, Input, InputId, JoinPolicy, SignalState, Tool,
+    ToolContext, ToolGate, ToolPark, ToolRegistry, ToolResult, ToolWake,
 };
 use noel_parity::load_fixture;
 use serde_json::{json, Value};
@@ -196,5 +196,79 @@ async fn a_before_tool_gate_parks_and_is_asked_again_after_wake() {
         noel_durable::SignalResult::Delivered,
     );
     assert!(submission.wait().await.is_done());
+    harness.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn a_detached_nested_call_can_be_joined_by_a_tool_park() {
+    struct Inner;
+    impl Tool for Inner {
+        fn name(&self) -> &str {
+            "inner"
+        }
+        fn description(&self) -> &str {
+            "inner"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn replay_safe(&self) -> bool {
+            true
+        }
+        fn execute<'a>(
+            &'a self,
+            _context: ToolContext<'a>,
+        ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
+            Box::pin(async { ToolResult::text("inner done") })
+        }
+    }
+    struct Outer;
+    impl Tool for Outer {
+        fn name(&self) -> &str {
+            "outer"
+        }
+        fn description(&self) -> &str {
+            "outer"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn replay_safe(&self) -> bool {
+            true
+        }
+        fn execute<'a>(
+            &'a self,
+            context: ToolContext<'a>,
+        ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
+            Box::pin(async move {
+                if matches!(context.wake, Some(ToolWake::Tasks { .. })) {
+                    return ToolResult::text("joined");
+                }
+                let nested = context.execute_tool_detached("inner", json!({}), "child");
+                ToolResult::wait(
+                    vec![nested.task_id],
+                    JoinPolicy::Any,
+                    Some(json!({"joined": true})),
+                )
+            })
+        }
+    }
+
+    let harness = Harness::in_memory(options_with(
+        script_for("outer"),
+        ToolRegistry::new()
+            .with(Arc::new(Inner))
+            .with(Arc::new(Outer)),
+    ))
+    .await
+    .expect("open");
+    let settled = harness
+        .conversation()
+        .submit(Input::prompt("go"), InputId::Fresh)
+        .await
+        .expect("submit")
+        .wait()
+        .await;
+    assert!(settled.is_done());
     harness.close().await.expect("close");
 }
