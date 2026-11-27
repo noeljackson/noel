@@ -89,7 +89,10 @@ The committed TypeScript parity fixtures are:
 - `local-tools.json`: built-in local tool inventory (names, labels, prompt
   snippets, parameter names). Rust checks only that every upstream tool is
   present; `tool-behavior.json` covers what the tools do.
-- `durable-chat.json`, `durable-childTasks.json`, `durable-documents.json`, `durable-print.json`, `durable-inbox.json`,
+- `durable-afterRun.json`, `durable-afterTools.json`, `durable-chat.json`,
+  `durable-childTasks.json`, `durable-documents.json`, `durable-observers.json`,
+  `durable-onYield.json`, `durable-print.json`,
+  `durable-readOnly.json`, `durable-taskGraph.json`, `durable-inbox.json`,
   `durable-turnLimit.json`, `durable-harnessMany.json`, `durable-forks.json`,
   `durable-tasks.json`, `durable-taskRecovery.json`,
   `durable-taskSleep.json`, `durable-taskSignals.json`,
@@ -101,8 +104,9 @@ The committed TypeScript parity fixtures are:
   (a fork's transcript at an entry), slice 3's `11-tasks` (a phased
   payment task's outcome) and `12-recovery` (a task's saved checkpoint at a
   close, resumed and completed after a reopen, exactly-once through memos),
-  and slice 8's `01-documents` (atomic document writes and rewindable
-  snapshots),
+  slice 8's `01-documents` (atomic document writes and rewindable
+  snapshots), and slice 9's task graph, commit-observer, read-only and
+  `afterRun`, `onYield`, and `afterTools` scenarios,
   run through upstream's Harness on the faux
   provider and recorded by `scripts/ts-parity/durable-fixture.ts`
   (`make ts-parity-durable`, from the local pi checkout at

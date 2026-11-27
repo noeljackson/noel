@@ -21,10 +21,14 @@ use noel_core::{QueueItem, QueueMode, RunStatus, SubmissionKind};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::commits::CommitFeed;
 use crate::events::{Events, OwnedEvent, Subscription};
 use crate::host::SdkHost;
 use crate::submission::{Settled, Submission};
-use crate::{Input, InputId, QueuedItem, SubmitError, Withdrawn};
+use crate::{
+    CommitSubscription, HarnessInspection, Input, InputId, QueuedItem, SubmitError, TaskGraph,
+    Withdrawn,
+};
 
 /// What a handle asks the driver.
 enum Request {
@@ -67,6 +71,12 @@ enum Request {
         policy: crate::tools::JoinPolicy,
         reply: oneshot::Sender<Vec<crate::tasks::TaskRecord>>,
     },
+    Inspect {
+        reply: oneshot::Sender<HarnessInspection>,
+    },
+    TaskGraph {
+        reply: oneshot::Sender<TaskGraph>,
+    },
     /// The earliest sleeping deadline (the harness's wake).
     TaskWake {
         reply: oneshot::Sender<Option<u64>>,
@@ -99,6 +109,7 @@ enum Request {
 pub struct Handle {
     requests: mpsc::UnboundedSender<Request>,
     events: Arc<Events>,
+    commits: Arc<CommitFeed>,
 }
 
 impl Clone for Handle {
@@ -106,6 +117,7 @@ impl Clone for Handle {
         Handle {
             requests: self.requests.clone(),
             events: self.events.clone(),
+            commits: self.commits.clone(),
         }
     }
 }
@@ -309,12 +321,41 @@ impl Handle {
         self.events.subscribe()
     }
 
+    pub(crate) fn observe_commits(&self) -> CommitSubscription {
+        self.commits.subscribe()
+    }
+
+    pub(crate) async fn inspect(&self) -> HarnessInspection {
+        let (reply, done) = oneshot::channel();
+        if self.requests.send(Request::Inspect { reply }).is_err() {
+            return HarnessInspection {
+                scheduling: crate::SchedulingState::Closing,
+                tasks: Vec::new(),
+                queued_submissions: 0,
+            };
+        }
+        done.await.unwrap_or(HarnessInspection {
+            scheduling: crate::SchedulingState::Closing,
+            tasks: Vec::new(),
+            queued_submissions: 0,
+        })
+    }
+
+    pub(crate) async fn task_graph(&self) -> TaskGraph {
+        let (reply, done) = oneshot::channel();
+        if self.requests.send(Request::TaskGraph { reply }).is_err() {
+            return TaskGraph::default();
+        }
+        done.await.unwrap_or_default()
+    }
+
     pub(super) async fn close(self) -> Result<(), crate::Error> {
         let (reply, done) = oneshot::channel();
         self.requests
             .send(Request::Close { reply })
             .map_err(|_| anyhow::anyhow!("the harness is already closed"))?;
         let _ = done.await;
+        self.commits.close();
         // Dropping `self` drops the last sender: the driver's inbox closes,
         // a run it is driving ends as a close (no restart counted), and
         // the task finishes.
@@ -328,6 +369,7 @@ pub(super) async fn spawn(
     options: crate::HarnessOptions,
     storage: noel_core::storage::Storage,
     created: bool,
+    commits: Arc<CommitFeed>,
 ) -> Result<Handle, crate::HarnessError> {
     let (requests, inbox) = mpsc::unbounded_channel();
     let events = Arc::new(Events::new());
@@ -344,6 +386,7 @@ pub(super) async fn spawn(
         events: events.clone(),
         waiters: Mutex::new(Vec::new()),
         tasks: options.tasks.clone(),
+        hooks: options.hooks.clone(),
     };
     // The program's environment hook, if it gave one.
     if let Some(env) = options.env {
@@ -359,13 +402,14 @@ pub(super) async fn spawn(
     // A run the journal says was interrupted resumes first, as the
     // server's crash loop resumes a restarted worker's run.
     let mut resume = None;
-    if let Some(run_id) = controller
-        .runtime()
-        .session()
-        .runs
-        .last()
-        .filter(|run| run.status == RunStatus::Interrupted)
-        .map(|run| run.id.clone())
+    if !options.read_only
+        && let Some(run_id) = controller
+            .runtime()
+            .session()
+            .runs
+            .last()
+            .filter(|run| run.status == RunStatus::Interrupted)
+            .map(|run| run.id.clone())
         && let Ok(start) = controller.resume(&run_id).await
     {
         resume = Some(start);
@@ -373,15 +417,22 @@ pub(super) async fn spawn(
     // Durable tasks recover at open (slice 3): those left running by a
     // stop that was not a close count a restart and go back to pending,
     // and one at the limit ends restart_limit.
-    crate::driver_tasks::recover(&mut controller, options.task_settings.restart_limit);
-    tokio::spawn(driver(controller, inbox, resume));
-    Ok(Handle { requests, events })
+    if !options.read_only {
+        crate::driver_tasks::recover(&mut controller, options.task_settings.restart_limit);
+    }
+    tokio::spawn(driver(controller, inbox, resume, options.read_only));
+    Ok(Handle {
+        requests,
+        events,
+        commits,
+    })
 }
 
 async fn driver(
     mut controller: SessionController<SdkHost>,
     mut inbox: mpsc::UnboundedReceiver<Request>,
     resume: Option<Start>,
+    read_only: bool,
 ) {
     // The resumed run drives first: its settle is in the event stream, and
     // requests that arrive while it works are served through it.
@@ -393,20 +444,33 @@ async fn driver(
     while let Some(request) = inbox.recv().await {
         match request {
             Request::Submit { input, id, reply } => {
-                submit(&mut controller, input, id, reply, &mut inbox).await;
+                if read_only {
+                    let _ =
+                        reply.send(Err(SubmitError::Refused("the harness is read-only".into())));
+                } else {
+                    submit(&mut controller, input, id, reply, &mut inbox).await;
+                }
             }
             Request::Withdraw {
                 submission_id,
                 reply,
             } => {
-                let outcome = controller
-                    .withdraw(&submission_id)
-                    .map_err(|error| error.to_string());
+                let outcome = if read_only {
+                    Err("the harness is read-only".into())
+                } else {
+                    controller
+                        .withdraw(&submission_id)
+                        .map_err(|error| error.to_string())
+                };
                 let _ = reply.send(outcome);
             }
             Request::Abort { reply } => {
                 // With no run active there is nothing to abort.
-                let _ = reply.send(Ok(()));
+                let _ = reply.send(if read_only {
+                    Err("the harness is read-only".into())
+                } else {
+                    Ok(())
+                });
             }
             Request::Queue { reply } => {
                 let queue = controller
@@ -427,25 +491,43 @@ async fn driver(
                 owner_task_id,
                 reply,
             } => {
-                let _ = reply.send(crate::driver_tasks::create_owned(
-                    &mut controller,
-                    &kind,
-                    input,
-                    background,
-                    owner_task_id,
-                ));
+                let outcome = if read_only {
+                    Err("the harness is read-only".into())
+                } else {
+                    crate::driver_tasks::create_owned(
+                        &mut controller,
+                        &kind,
+                        input,
+                        background,
+                        owner_task_id,
+                    )
+                };
+                let _ = reply.send(outcome);
             }
             Request::TaskWait { task_id, reply } => {
-                let record = crate::driver_tasks::run_to_terminal(&mut controller, &task_id).await;
+                let record = if read_only {
+                    controller
+                        .runtime()
+                        .session()
+                        .tasks
+                        .get(&task_id)
+                        .map(crate::driver_tasks::public_record)
+                        .unwrap_or_else(|| crate::tasks::TaskRecord::orphaned(&task_id))
+                } else {
+                    crate::driver_tasks::run_to_terminal(&mut controller, &task_id).await
+                };
                 let _ = reply.send(record);
             }
             Request::TaskAbort { task_id, reply } => {
-                let tool = controller
-                    .host()
-                    .tool_runtime
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.abort(&task_id));
-                let outcome = if tool {
+                let tool = !read_only
+                    && controller
+                        .host()
+                        .tool_runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.abort(&task_id));
+                let outcome = if read_only {
+                    Err("the harness is read-only".into())
+                } else if tool {
                     Ok(())
                 } else {
                     crate::driver_tasks::abort(&mut controller, &task_id).await
@@ -457,17 +539,46 @@ async fn driver(
                 policy,
                 reply,
             } => {
-                let records = crate::driver_tasks::join(&mut controller, &task_ids, policy).await;
+                let records = if read_only {
+                    task_ids
+                        .iter()
+                        .filter_map(|id| controller.runtime().session().tasks.get(id))
+                        .map(crate::driver_tasks::public_record)
+                        .collect()
+                } else {
+                    crate::driver_tasks::join(&mut controller, &task_ids, policy).await
+                };
                 let _ = reply.send(records);
             }
+            Request::Inspect { reply } => {
+                let queued = controller.queue().items().len();
+                let registry = controller.host().tasks.clone();
+                let _ = reply.send(crate::driver_tasks::inspect(
+                    controller.runtime().session(),
+                    &registry,
+                    queued,
+                    read_only,
+                ));
+            }
+            Request::TaskGraph { reply } => {
+                let registry = controller.host().tasks.clone();
+                let _ = reply.send(crate::driver_tasks::task_graph(
+                    controller.runtime().session(),
+                    &registry,
+                ));
+            }
             Request::TaskWake { reply } => {
-                let tools = controller
-                    .host()
-                    .tool_runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.wake());
-                let tasks = crate::driver_tasks::wake(&controller);
-                let _ = reply.send(tools.into_iter().chain(tasks).min());
+                if read_only {
+                    let _ = reply.send(None);
+                } else {
+                    let tools = controller
+                        .host()
+                        .tool_runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.wake());
+                    let tasks = crate::driver_tasks::wake(&controller);
+                    let _ = reply.send(tools.into_iter().chain(tasks).min());
+                }
             }
             Request::TaskSignal {
                 task_id,
@@ -476,13 +587,19 @@ async fn driver(
                 value,
                 reply,
             } => {
-                let tool = controller
-                    .host()
-                    .tool_runtime
-                    .as_ref()
-                    .map(|runtime| runtime.signal(&task_id, &signal, &key, value.clone()))
-                    .unwrap_or(crate::tasks::SignalResult::NotFound);
-                let outcome = if tool == crate::tasks::SignalResult::NotFound {
+                let tool = if read_only {
+                    crate::tasks::SignalResult::Closed
+                } else {
+                    controller
+                        .host()
+                        .tool_runtime
+                        .as_ref()
+                        .map(|runtime| runtime.signal(&task_id, &signal, &key, value.clone()))
+                        .unwrap_or(crate::tasks::SignalResult::NotFound)
+                };
+                let outcome = if read_only {
+                    crate::tasks::SignalResult::Closed
+                } else if tool == crate::tasks::SignalResult::NotFound {
                     crate::driver_tasks::signal(&mut controller, &task_id, &signal, &key, value)
                 } else {
                     tool
@@ -490,7 +607,7 @@ async fn driver(
                 let _ = reply.send(outcome);
             }
             Request::Resume => {
-                if let Some(runtime) = &controller.host().tool_runtime {
+                if !read_only && let Some(runtime) = &controller.host().tool_runtime {
                     runtime.resume();
                 }
             }
@@ -509,6 +626,10 @@ async fn driver(
                 let _ = reply.send(value);
             }
             Request::DocumentCommit { writes, reply } => {
+                if read_only {
+                    let _ = reply.send(Err("the harness is read-only".into()));
+                    continue;
+                }
                 let count = writes.len();
                 let result = controller
                     .configure(|runtime, _| runtime.save_documents(writes))
@@ -576,6 +697,7 @@ async fn drive(
     inbox: &mut mpsc::UnboundedReceiver<Request>,
     settle: Option<oneshot::Sender<Settled>>,
 ) -> bool {
+    let event_offset = controller.host().events.peek().len();
     let finished = controller.run(start, inbox, busy_request).await;
     let settled = if !finished {
         Settled::closed()
@@ -600,6 +722,36 @@ async fn drive(
         // view of the whole run.
         last
     };
+    let summary = if finished && settled.is_done() {
+        let run_id = match &settled {
+            Settled::Done { run_id } => run_id.clone(),
+            _ => unreachable!(),
+        };
+        let had_tools = controller
+            .host()
+            .events
+            .peek()
+            .into_iter()
+            .skip(event_offset)
+            .any(|event| matches!(event, OwnedEvent::ToolEnded { .. }));
+        Some(crate::RunSummary {
+            run_id,
+            completed: true,
+            had_tools,
+        })
+    } else {
+        None
+    };
+    if let Some(summary) = &summary {
+        if summary.had_tools
+            && !run_hook_tasks(controller, crate::HookPoint::AfterTools, summary, inbox).await
+        {
+            return false;
+        }
+        if !run_hook_tasks(controller, crate::HookPoint::OnYield, summary, inbox).await {
+            return false;
+        }
+    }
     if let Some(settle) = settle {
         let _ = settle.send(settled.clone());
     }
@@ -608,7 +760,162 @@ async fn drive(
     for waiter in waiters {
         let _ = waiter.send(settled.clone());
     }
+    // Upstream settles the run's inputs at its answer, then keeps the
+    // conversation busy until afterRun work drains.
+    if let Some(summary) = &summary
+        && !run_hook_tasks(controller, crate::HookPoint::AfterRun, summary, inbox).await
+    {
+        return false;
+    }
     finished
+}
+
+async fn run_hook_tasks(
+    controller: &mut SessionController<SdkHost>,
+    point: crate::HookPoint,
+    summary: &crate::RunSummary,
+    inbox: &mut mpsc::UnboundedReceiver<Request>,
+) -> bool {
+    let hooks = controller.host().hooks.clone();
+    let requests = hooks.select(point, summary);
+    let mut tasks = Vec::with_capacity(requests.len());
+    for request in requests {
+        let Ok(id) = crate::driver_tasks::create_owned(
+            controller,
+            &request.kind,
+            request.input,
+            false,
+            None,
+        ) else {
+            continue;
+        };
+        tasks.push(id);
+    }
+    loop {
+        let mut terminal = true;
+        for id in &tasks {
+            terminal &= crate::driver_tasks::run_to_terminal(controller, id)
+                .await
+                .is_terminal();
+        }
+        if terminal {
+            break;
+        }
+        let Some(request) = inbox.recv().await else {
+            return false;
+        };
+        if !hook_request(controller, request).await {
+            return false;
+        }
+    }
+    if !tasks.is_empty() {
+        controller
+            .host()
+            .events
+            .record(OwnedEvent::HookTasksCompleted { point, tasks });
+    }
+    true
+}
+
+/// Requests a host needs while a hook task is parked. Generation remains
+/// busy, but observation, signalling, abort and document reads stay live.
+async fn hook_request(controller: &mut SessionController<SdkHost>, request: Request) -> bool {
+    match request {
+        Request::Submit { reply, .. } => {
+            let _ = reply.send(Err(SubmitError::Busy));
+        }
+        Request::Withdraw { reply, .. } => {
+            let _ = reply.send(Err("hook tasks are active".into()));
+        }
+        Request::Abort { reply } => {
+            let _ = reply.send(Err("hook tasks are active; abort their task ids".into()));
+        }
+        Request::Queue { reply } => {
+            let queue = controller
+                .queue()
+                .items()
+                .into_iter()
+                .map(queued_item)
+                .collect();
+            let _ = reply.send(queue);
+        }
+        Request::Events { reply } => {
+            let _ = reply.send(controller.host().events.take());
+        }
+        Request::TaskCreate { reply, .. } => {
+            let _ = reply.send(Err("hook tasks are active".into()));
+        }
+        Request::TaskWait { task_id, reply } => {
+            let record = controller
+                .runtime()
+                .session()
+                .tasks
+                .get(&task_id)
+                .map(crate::driver_tasks::public_record)
+                .unwrap_or_else(|| crate::TaskRecord::orphaned(&task_id));
+            let _ = reply.send(record);
+        }
+        Request::TaskAbort { task_id, reply } => {
+            let outcome = crate::driver_tasks::abort(controller, &task_id).await;
+            let _ = reply.send(outcome);
+        }
+        Request::TaskJoin { reply, .. } => {
+            let _ = reply.send(Vec::new());
+        }
+        Request::Inspect { reply } => {
+            let queued = controller.queue().items().len();
+            let registry = controller.host().tasks.clone();
+            let _ = reply.send(crate::driver_tasks::inspect(
+                controller.runtime().session(),
+                &registry,
+                queued,
+                false,
+            ));
+        }
+        Request::TaskGraph { reply } => {
+            let registry = controller.host().tasks.clone();
+            let _ = reply.send(crate::driver_tasks::task_graph(
+                controller.runtime().session(),
+                &registry,
+            ));
+        }
+        Request::TaskWake { reply } => {
+            let _ = reply.send(crate::driver_tasks::wake(controller));
+        }
+        Request::TaskSignal {
+            task_id,
+            signal,
+            key,
+            value,
+            reply,
+        } => {
+            let outcome = crate::driver_tasks::signal(controller, &task_id, &signal, &key, value);
+            let _ = reply.send(outcome);
+        }
+        Request::Resume => {}
+        Request::DocumentRead {
+            document,
+            key,
+            reply,
+        } => {
+            let value = controller
+                .runtime()
+                .session()
+                .documents
+                .get(&document)
+                .and_then(|document| document.get(&key))
+                .cloned();
+            let _ = reply.send(value);
+        }
+        Request::DocumentCommit { reply, .. } => {
+            let _ = reply.send(Err("hook tasks are active".into()));
+        }
+        Request::Close { reply } => {
+            let _ = reply.send(());
+            return false;
+        }
+    }
+    true
 }
 
 /// What arrived while the run worked, applied through `Busy` (the
@@ -690,6 +997,17 @@ fn busy_request(request: Request, run: &mut Busy<'_, SdkHost>) {
         }
         Request::TaskJoin { reply, .. } => {
             let _ = reply.send(Vec::new());
+        }
+        Request::Inspect { reply } => {
+            let queued = run.queue().items().len();
+            let registry = run.host().tasks.clone();
+            let inspection = crate::driver_tasks::inspect(run.session(), &registry, queued, false);
+            let _ = reply.send(inspection);
+        }
+        Request::TaskGraph { reply } => {
+            let registry = run.host().tasks.clone();
+            let graph = crate::driver_tasks::task_graph(run.session(), &registry);
+            let _ = reply.send(graph);
         }
         Request::TaskWake { reply } => {
             let wake = run

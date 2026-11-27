@@ -27,6 +27,8 @@ pub(super) struct SdkHost {
     pub(super) waiters: Mutex<Vec<tokio::sync::oneshot::Sender<Settled>>>,
     /// The durable task definitions (slice 3).
     pub(super) tasks: crate::tasks::TaskRegistry,
+    /// Durable work selected at generation boundaries.
+    pub(super) hooks: crate::HookRegistry,
 }
 
 impl ControllerHost for SdkHost {

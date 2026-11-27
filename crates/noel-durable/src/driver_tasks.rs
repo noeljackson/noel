@@ -925,7 +925,7 @@ pub(super) fn wake(controller: &SessionController<SdkHost>) -> Option<u64> {
         .min()
 }
 
-fn record_state(record: &DurableTaskRecord) -> RecordState {
+pub(crate) fn record_state(record: &DurableTaskRecord) -> RecordState {
     serde_json::from_value(record.state.clone()).unwrap_or(RecordState::Pending {
         checkpoint: Value::Null,
         wake: None,
@@ -964,4 +964,116 @@ fn public(record: &DurableTaskRecord, state: TaskState) -> TaskRecord {
         restarts: record.restarts,
         memos: record.memos.clone(),
     }
+}
+
+pub(super) fn public_record(record: &DurableTaskRecord) -> TaskRecord {
+    let state = match record_state(record) {
+        RecordState::Pending { checkpoint, wake } => TaskState::Pending {
+            checkpoint,
+            wake: wake.and_then(|wake| serde_json::from_value(wake).ok()),
+        },
+        RecordState::Running { checkpoint, wake } => TaskState::Running {
+            checkpoint,
+            wake: wake.and_then(|wake| serde_json::from_value(wake).ok()),
+        },
+        RecordState::Sleeping { checkpoint, until } => TaskState::Sleeping { checkpoint, until },
+        RecordState::WaitingOnSignals {
+            checkpoint,
+            until,
+            signals,
+        } => TaskState::WaitingOnSignals {
+            checkpoint,
+            until,
+            signals,
+        },
+        RecordState::Completing { outcome } => TaskState::Completing {
+            outcome: outcome_public(outcome),
+        },
+        RecordState::Terminal { outcome } => TaskState::Terminal {
+            outcome: outcome_public(outcome),
+        },
+    };
+    public(record, state)
+}
+
+pub(super) fn inspect(
+    session: &noel_core::SessionState,
+    registry: &crate::TaskRegistry,
+    queued_submissions: usize,
+    read_only: bool,
+) -> crate::HarnessInspection {
+    let tasks = session
+        .tasks
+        .values()
+        .filter_map(|record| {
+            let public = public_record(record);
+            if matches!(public.state, TaskState::Terminal { .. }) {
+                return None;
+            }
+            let state = if !registry.erased.contains_key(&record.kind)
+                && !record.kind.starts_with("pi.tool/")
+            {
+                crate::TaskInspectionState::Blocked {
+                    reason: crate::BlockedReason::MissingTask,
+                }
+            } else {
+                match public.state {
+                    TaskState::Pending { .. } => crate::TaskInspectionState::Pending,
+                    TaskState::Running { .. } => crate::TaskInspectionState::Running,
+                    TaskState::Sleeping { until, .. } => {
+                        crate::TaskInspectionState::Sleeping { until: Some(until) }
+                    }
+                    TaskState::WaitingOnSignals { until, .. } => {
+                        crate::TaskInspectionState::Sleeping { until }
+                    }
+                    TaskState::Completing { .. } => crate::TaskInspectionState::Completing,
+                    TaskState::Terminal { .. } => unreachable!(),
+                }
+            };
+            Some(crate::TaskInspection {
+                record: public,
+                state,
+            })
+        })
+        .collect();
+    crate::HarnessInspection {
+        scheduling: if read_only {
+            crate::SchedulingState::Paused
+        } else {
+            crate::SchedulingState::Running
+        },
+        tasks,
+        queued_submissions,
+    }
+}
+
+pub(super) fn task_graph(
+    session: &noel_core::SessionState,
+    registry: &crate::TaskRegistry,
+) -> crate::TaskGraph {
+    let tasks = session
+        .tasks
+        .values()
+        .filter_map(|record| {
+            let public = public_record(record);
+            let state = crate::inspection::graph_state(&public.state)?;
+            let blocked = (!registry.erased.contains_key(&record.kind)
+                && !record.kind.starts_with("pi.tool/"))
+            .then_some(crate::BlockedReason::MissingTask);
+            Some((
+                record.id.clone(),
+                crate::TaskGraphNode {
+                    id: record.id.clone(),
+                    kind: record.kind.clone(),
+                    conversation_id: public.conversation_id,
+                    owner: record.owner_task_id.clone(),
+                    background: record.background,
+                    abort_requested: record.abort_requested,
+                    state,
+                    blocked,
+                },
+            ))
+        })
+        .collect();
+    crate::TaskGraph { tasks }
 }

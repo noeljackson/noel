@@ -58,6 +58,27 @@ the source's saved state (`SessionStore::fork_into_storage`); upstream's
 fork-at-an-entry becomes fork-at-saved-state here — the rewind surface
 chooses the point first.
 
+**Built:** the rest of the embedded Durable SDK task model lives in
+`crates/noel-durable`. A task is a journaled state machine with a typed input,
+version, phase checkpoint, owner, background flag, restart count and durable
+memos. A checkpoint can remain runnable, sleep to an injected-clock deadline,
+wait on typed signals, wait for owned work, or publish an outcome after its
+ordinary children drain. Abort marks and settles owned subtrees bottom-up;
+joins implement `any`, `allSettled` and `failFast`. Suspendable tool calls are
+tasks keyed by call id, so signal/deadline parks, gates, nested calls, memos and
+cancellation recover after reopen.
+
+Embedder documents are typed names over JSON values. A task's staged document
+writes are stored in the same journal record as its checkpoint; an explicit
+`DocumentBatch` is one document record. Replay applies either batch atomically.
+`inspect` and `watch_task_graph` expose live work without running it, and
+`observe_commits` publishes a monotonic sequence only after the underlying
+`JournalStorage` accepts a record. `Harness::open_read_only` loads the same
+state but performs no recovery, scheduling or writes. `HookRegistry` selects
+durable tasks for `afterTools`, `onYield` and `afterRun`; the first two drain
+before the submission settles, while `afterRun` begins after the answer settles
+and keeps the harness driver busy until its tasks drain.
+
 ## 3. Submissions, the queue and abort
 
 ### 3.1 Submissions

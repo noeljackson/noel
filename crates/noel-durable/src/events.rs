@@ -35,6 +35,10 @@ pub enum OwnedEvent {
     DocumentsCommitted {
         writes: usize,
     },
+    HookTasksCompleted {
+        point: crate::HookPoint,
+        tasks: Vec<String>,
+    },
     /// A run starts, or an interrupted one continues.
     RunStarted {
         run_id: String,
@@ -113,6 +117,7 @@ impl OwnedEvent {
         match self {
             OwnedEvent::ConversationCreated { .. } => "conversation_created",
             OwnedEvent::DocumentsCommitted { .. } => "documents_committed",
+            OwnedEvent::HookTasksCompleted { .. } => "hook_tasks_completed",
             OwnedEvent::RunStarted { .. } => "run_started",
             OwnedEvent::CallStarted { .. } => "call_started",
             OwnedEvent::MessageAdded { .. } => "message_added",

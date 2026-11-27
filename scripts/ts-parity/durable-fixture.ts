@@ -35,7 +35,10 @@ const {
 	defineSignal,
 	defineTask,
 	defineTool,
+	GenerationTask,
 	Harness,
+	hook,
+	hookTask,
 	InboxDoc,
 	LiveDoc,
 	MemoryStorage,
@@ -680,6 +683,224 @@ async function childTasks(): Promise<Json> {
 	};
 }
 
+/** harness-task-graph: a live sleeping task appears in both inspection
+ * and the graph with its phase and deadline. */
+async function taskGraph(): Promise<Json> {
+	let clock = 1_000;
+	const Nap = defineTask<null, { phase: "start" } | { phase: "after" }, null>({
+		name: "test.graph-nap",
+		version: 1,
+		initial: () => ({ phase: "start" }),
+		phases: {
+			start: (_task: any, runtime: any, ctx: any) => runtime.sleepUntil(2_000, { phase: "after" }, ctx),
+			after: (_task: any, runtime: any, ctx: any) => runtime.commit(
+				() => ({ status: "terminal", outcome: { status: "completed", result: null } }), ctx),
+		},
+		abort: (_task: any, runtime: any, ctx: any) => runtime.commit(
+			() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
+	});
+	const registry = createRegistry();
+	registry.install(defineExtension({ name: "graph", tasks: [Nap] }));
+	const harness = await Harness.open(
+		new MemoryStorage(),
+		{ models: createModels(), registry, now: () => clock },
+		BACKGROUND_CONTEXT,
+	);
+	const root = await harness.root(BACKGROUND_CONTEXT);
+	const id = await root.commit(
+		(tx: any) => tx.createTask(Nap, null, { ownership: { kind: "conversation" } }),
+		BACKGROUND_CONTEXT,
+	);
+	harness.resume();
+	for (;;) {
+		if ((await harness.getTask(id, BACKGROUND_CONTEXT))?.state.status === "sleeping") break;
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	}
+	const inspection = await harness.inspect(BACKGROUND_CONTEXT);
+	const graph = await harness.watchTaskGraph(BACKGROUND_CONTEXT);
+	const outcome = {
+		inspection: inspection.tasks.find((task: any) => task.record.id === id)?.state,
+		graph: (graph.value.tasks as Record<string, any>)[String(id)]?.state,
+	};
+	await graph.stop();
+	await harness.close(BACKGROUND_CONTEXT);
+	void clock;
+	return outcome;
+}
+
+/** harness-observers: observeCommits publishes only stored commits. */
+async function observers(): Promise<Json> {
+	const session = createSession(new MemoryStorage());
+	const publications: string[][] = [];
+	const observation = session.observeCommits({
+		advance: (publication: any) => publications.push(
+			publication.changes.map((change: any) => change.type).sort(),
+		),
+		end: () => {},
+	});
+	const chat = await session.commit(
+		(tx) => tx.createConversation({ ownership: { kind: "ownerless" } }),
+		BACKGROUND_CONTEXT,
+	);
+	await session.commit(
+		(tx) => tx.appendEntry(chat.id, { kind: "note", data: "stored" }),
+		BACKGROUND_CONTEXT,
+	);
+	observation.detach();
+	await session.close(BACKGROUND_CONTEXT);
+	return { count: publications.length, changes: publications };
+}
+
+/** harness-read-only: inspection works while every mutation refuses. */
+async function readOnly(): Promise<Json> {
+	const storage = new MemoryStorage();
+	const writer = await Harness.open(
+		storage,
+		{ models: createModels(), registry: createRegistry() },
+		BACKGROUND_CONTEXT,
+	);
+	await writer.root(BACKGROUND_CONTEXT);
+	const viewer = await Harness.open(
+		storage,
+		{ models: createModels(), registry: createRegistry(), readOnly: true },
+		BACKGROUND_CONTEXT,
+	);
+	const root = await viewer.root(BACKGROUND_CONTEXT);
+	let refused = "";
+	try {
+		await root.commit((tx) => tx.appendEntry(root.id, { kind: "note" }), BACKGROUND_CONTEXT);
+	} catch (error) {
+		refused = (error as Error).constructor.name;
+	}
+	const inspection = await viewer.inspect(BACKGROUND_CONTEXT);
+	const wake = viewer.wake();
+	await viewer.close(BACKGROUND_CONTEXT);
+	await writer.close(BACKGROUND_CONTEXT);
+	return { scheduling: inspection.scheduling, wake, refused };
+}
+
+/** afterRun: an answer settles its input and the run remains busy until
+ * the hook task is terminal. */
+async function afterRun(): Promise<Json> {
+	let runs = 0;
+	const Check = defineTask<null, { phase: "run" }, null>({
+		name: "test.after-run",
+		version: 1,
+		initial: () => ({ phase: "run" }),
+		phases: {
+			run: (_task: any, runtime: any, ctx: any) => {
+				runs++;
+				return runtime.commit(
+					() => ({ status: "terminal", outcome: { status: "completed", result: null } }), ctx);
+			},
+		},
+		abort: (_task: any, runtime: any, ctx: any) => runtime.commit(
+			() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
+	});
+	const registry = createRegistry();
+	registry.install(defineExtension({
+		name: "after-run",
+		tasks: [Check],
+		hooks: [hook(GenerationTask, { afterRun: () => ({ tasks: [hookTask(Check, null)] }) })],
+	}));
+	const faux = fauxProvider();
+	faux.setResponses([fauxAssistantMessage("done")]);
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const harness = await Harness.open(new MemoryStorage(), { models, registry }, BACKGROUND_CONTEXT);
+	const root = await harness.root(BACKGROUND_CONTEXT, {
+		agent: { model: { provider: "faux", modelId: "faux-1" } },
+	});
+	const settled = await (await root.submit({ type: "input", content: "work" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+	await root.waitForIdle(BACKGROUND_CONTEXT);
+	await harness.close(BACKGROUND_CONTEXT);
+	return { status: settled.status, runs };
+}
+
+/** 45-review-on-yield, immediate-review variant: a task decides that the
+ * answer stands, so the input settles with that answer. */
+async function onYield(): Promise<Json> {
+	let runs = 0;
+	const Review = defineTask<null, { phase: "run" }, object>({
+		name: "test.review",
+		version: 1,
+		initial: () => ({ phase: "run" }),
+		phases: {
+			run: (_task: any, runtime: any, ctx: any) => {
+				runs++;
+				return runtime.commit(
+					() => ({ status: "terminal", outcome: { status: "completed", result: {} } }), ctx);
+			},
+		},
+		abort: (_task: any, runtime: any, ctx: any) => runtime.commit(
+			() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
+	});
+	const registry = createRegistry();
+	registry.install(defineExtension({
+		name: "review",
+		tasks: [Review],
+		hooks: [hook(GenerationTask, { onYield: () => ({ tasks: [hookTask(Review, null)] }) })],
+	}));
+	const faux = fauxProvider();
+	faux.setResponses([fauxAssistantMessage("reviewed answer")]);
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const harness = await Harness.open(new MemoryStorage(), { models, registry }, BACKGROUND_CONTEXT);
+	const root = await harness.root(BACKGROUND_CONTEXT, {
+		agent: { model: { provider: "faux", modelId: "faux-1" } },
+	});
+	const settled = await (await root.submit({ type: "input", content: "work" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+	await harness.close(BACKGROUND_CONTEXT);
+	return { status: settled.status, runs };
+}
+
+/** 46-after-tools-terminate, continue variant: an immediate task lets one
+ * tool round continue to the final answer. */
+async function afterTools(): Promise<Json> {
+	let runs = 0;
+	const Check = defineTask<null, { phase: "run" }, null>({
+		name: "test.after-tools",
+		version: 1,
+		initial: () => ({ phase: "run" }),
+		phases: {
+			run: (_task: any, runtime: any, ctx: any) => {
+				runs++;
+				return runtime.commit(
+					() => ({ status: "terminal", outcome: { status: "completed", result: null } }), ctx);
+			},
+		},
+		abort: (_task: any, runtime: any, ctx: any) => runtime.commit(
+			() => ({ status: "terminal", outcome: { status: "aborted" } }), ctx),
+	});
+	const step = defineTool({
+		name: "hook-step",
+		description: "one step",
+		parameters: obj({}),
+		execute: async () => ({ output: [{ type: "text", text: "done" }] }),
+	});
+	const registry = createRegistry();
+	registry.install(defineExtension({
+		name: "after-tools",
+		tools: [step],
+		tasks: [Check],
+		hooks: [hook(GenerationTask, { afterTools: () => ({ tasks: [hookTask(Check, null)] }) })],
+	}));
+	const faux = fauxProvider();
+	faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("hook-step", {}), { stopReason: "toolUse" }),
+		fauxAssistantMessage("done"),
+	]);
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const harness = await Harness.open(new MemoryStorage(), { models, registry }, BACKGROUND_CONTEXT);
+	const root = await harness.root(BACKGROUND_CONTEXT, {
+		agent: { model: { provider: "faux", modelId: "faux-1" } },
+	});
+	const settled = await (await root.submit({ type: "input", content: "work" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+	await harness.close(BACKGROUND_CONTEXT);
+	return { status: settled.status, runs, requests: faux.state.callCount };
+}
+
 const scenarios: Record<string, () => Promise<Json>> = {
 	chat,
 	print: printMode,
@@ -694,6 +915,12 @@ const scenarios: Record<string, () => Promise<Json>> = {
 	taskSignals,
 	toolParks,
 	childTasks,
+	taskGraph,
+	observers,
+	readOnly,
+	afterRun,
+	onYield,
+	afterTools,
 };
 
 const outDir = process.argv[2];
