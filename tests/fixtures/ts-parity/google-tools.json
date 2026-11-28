@@ -11,7 +11,7 @@
     "method": "POST",
     "headers": {
       "content-type": "application/json",
-      "user-agent": "pi/1.6.1 (linux; node/v26.13.1; x64)",
+      "user-agent": "pi/1.7.0 (linux; node/v26.13.1; x64)",
       "x-goog-api-client": "google-genai-sdk/3.6.1 gl-node/v26.13.1",
       "x-goog-api-key": "<redacted>"
     },
