@@ -202,6 +202,16 @@ fn rules(tools: &[PromptTool]) -> String {
     );
     rules.push("Be concise in your responses");
     rules.push("Show file paths clearly when working with files");
+    // noel's own rule, upstream has none: every round is one provider
+    // request that re-sends the conversation, so a one-tool-call-per-reply
+    // loop burns the round budget fast on models that do not batch on
+    // their own. The cap (`agent.maxToolRounds`) is the backstop; this
+    // rule is the fix.
+    if !tools.is_empty() {
+        rules.push(
+            "When several tool calls have no dependencies between them, make all of the independent calls in the same response",
+        );
+    }
 
     let mut kept: Vec<&str> = Vec::new();
     for rule in rules.into_iter().map(str::trim) {
@@ -327,8 +337,8 @@ mod tests {
 
     /// For every case of `system-prompt.json`, a runtime with upstream's
     /// inputs sends upstream's prompt, to the byte, apart from the names
-    /// noel changed (`noel_config::UPSTREAM_NAMES`) and the sections noel
-    /// leaves out.
+    /// noel changed (`noel_config::UPSTREAM_NAMES`), the sections noel
+    /// leaves out, and the rule noel adds.
     #[test]
     fn system_prompt_matches_ts_builder() {
         let fixture = fixture();
@@ -393,6 +403,22 @@ mod tests {
                 "{name}: stale exception in OMITTED_UPSTREAM_SECTIONS"
             );
             let expected = joined(&|section| !omitted(section));
+            // noel's own batching rule (see OMITTED_UPSTREAM_SECTIONS's
+            // sibling, the rule the register's Default System Prompt entry
+            // records) is appended to a rules section when any tool is
+            // active; upstream's text does not carry it.
+            let expected = if case["input"]["selectedTools"]
+                .as_array()
+                .is_some_and(|t| !t.is_empty())
+            {
+                expected
+                    .replace(
+                        "- Show file paths clearly when working with files\n</rules>",
+                        "- Show file paths clearly when working with files\n- When several tool calls have no dependencies between them, make all of the independent calls in the same response\n</rules>",
+                    )
+            } else {
+                expected
+            };
 
             let runtime = runtime_for(&case["input"], tmp, &dir);
             let declared = active_tool_definitions(&runtime)
@@ -446,6 +472,7 @@ Additional tools may be available.
 - Use write only for new files or complete rewrites.
 - Be concise in your responses
 - Show file paths clearly when working with files
+- When several tool calls have no dependencies between them, make all of the independent calls in the same response
 </rules>
 
 <cwd>

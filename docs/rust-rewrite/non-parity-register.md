@@ -559,11 +559,22 @@ differences:
   session without a journal; upstream generates an id for it.
 - The rules for the `powershell` tool are not ported (see Windows-Only
   PowerShell Tool).
+- One rule is noel's own: when any tool is active, the `<rules>` section
+  ends with "When several tool calls have no dependencies between them, make
+  all of the independent calls in the same response". Upstream's rules have
+  no batching instruction. The parity test drops exactly this line from
+  upstream's text when any tool is on.
 
 Reason: the prompt is how the model learns its role, its tools, and the
 project's instructions, so Rust keeps upstream's text and order and diverges
 only where it has nothing to point at (documentation, extension hooks) or has
-something upstream lacks (its own tools and settings).
+something upstream lacks (its own tools and settings). The batching rule is
+the exception that changes upstream's text: noel bounds a run's provider
+rounds (`agent.maxToolRounds`, the Configurable Agent Round Cap), and a
+model that answers one tool call per reply spends that budget on round
+trips rather than work. The rule tells the model to batch independent
+calls, which the turn loop already runs in one round; the cap stays the
+backstop when the model ignores it.
 
 ### Skills and Prompt Templates
 
