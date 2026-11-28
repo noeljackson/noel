@@ -22,6 +22,7 @@ pub trait PluginToolHost: Send + Sync {
         &self,
         plugin: &str,
         tool: &str,
+        call_id: &str,
         args: Value,
     ) -> Pin<Box<dyn Future<Output = PluginToolOutput> + Send>>;
 }

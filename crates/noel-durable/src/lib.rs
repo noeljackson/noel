@@ -13,10 +13,14 @@
 //! its handle methods are request/response over it.
 
 mod clock;
+mod commits;
+mod documents;
 mod driver;
 mod driver_tasks;
 mod events;
+mod hooks;
 mod host;
+mod inspection;
 mod multi;
 mod provider;
 mod sqlite;
@@ -25,7 +29,14 @@ mod tasks;
 mod tools;
 
 pub use clock::Clock;
+pub use commits::{CommitPublication, CommitSubscription};
+pub use documents::{define_doc, Document, DocumentBatch};
 pub use events::{Outcome, OwnedEvent};
+pub use hooks::{HookPoint, HookRegistry, HookTask, RunSummary};
+pub use inspection::{
+    BlockedReason, HarnessInspection, SchedulingState, SignalAddress, TaskGraph, TaskGraphNode,
+    TaskGraphState, TaskGraphWatch, TaskInspection, TaskInspectionState,
+};
 pub use multi::{Backend, MultiHarness, MultiOptions};
 pub use noel_providers::ModelSpec;
 pub use provider::{ProviderOptions, ProviderResolver, ProviderSource};
@@ -36,7 +47,10 @@ pub use tasks::{
     TaskContext, TaskDefinition, TaskOutcome, TaskRecord, TaskRegistry, TaskSettings, TaskState,
     WakeReason,
 };
-pub use tools::{Tool, ToolContext, ToolRegistry, ToolResult};
+pub use tools::{
+    GateDecision, JoinPolicy, NestedToolCall, Tool, ToolContext, ToolGate, ToolPark, ToolRegistry,
+    ToolResult, ToolWake,
+};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +70,8 @@ pub enum HarnessError {
     Storage(#[from] noel_core::SessionError),
     #[error("provider: {0}")]
     Provider(String),
+    #[error("a read-only harness requires an existing session")]
+    ReadOnly,
 }
 
 /// An input the conversation is asked to admit (Durable's
@@ -167,6 +183,10 @@ pub struct HarnessOptions {
     pub tasks: TaskRegistry,
     /// Task scheduling: the per-task restart limit.
     pub task_settings: TaskSettings,
+    /// Durable tasks selected at generation boundaries.
+    pub hooks: HookRegistry,
+    /// Open as a viewer: load state, but never recover, schedule, or write.
+    pub read_only: bool,
     /// The harness clock sleeps and deadlines are measured on (upstream
     /// `HarnessOptions.now`); the default is the system clock.
     pub clock: Clock,
@@ -189,6 +209,8 @@ impl HarnessOptions {
             tools: ToolRegistry::new(),
             tasks: TaskRegistry::new(),
             task_settings: TaskSettings::default(),
+            hooks: HookRegistry::new(),
+            read_only: false,
             clock: Clock::default(),
             model: None,
             cwd,
@@ -264,18 +286,35 @@ impl Harness {
     /// Opens a session on `storage` (a fresh one when it is empty, the
     /// session it holds otherwise), with `options`.
     pub async fn open(storage: Storage, options: HarnessOptions) -> Result<Harness, HarnessError> {
-        let empty = storage.read().is_ok_and(|bytes| bytes.is_empty())
-            || storage
-                .read()
-                .err()
-                .is_some_and(|error| matches!(error, noel_core::SessionError::Read { source, .. } if source.kind() == std::io::ErrorKind::NotFound));
+        let existing = storage.read();
+        let empty = existing.as_ref().is_ok_and(Vec::is_empty)
+            || existing.as_ref().err().is_some_and(|error| matches!(error, noel_core::SessionError::Read { source, .. } if source.kind() == std::io::ErrorKind::NotFound));
+        if empty && options.read_only {
+            return Err(HarnessError::ReadOnly);
+        }
+        let records = existing
+            .as_ref()
+            .map(|bytes| bytes.iter().filter(|byte| **byte == b'\n').count() as u64)
+            .unwrap_or(0);
+        let commits = commits::CommitFeed::new(records);
+        let storage = commits::ObservedStorage::wrap(storage, commits.clone());
         let (store, state) = if empty {
             let cwd = options.cwd.clone();
-            noel_core::SessionStore::create_in_storage(storage, cwd, "s1".to_string())?
+            noel_core::SessionStore::create_in_storage(storage.clone(), cwd, "s1".to_string())?
         } else {
-            noel_core::SessionStore::open_storage(storage)?
+            noel_core::SessionStore::open_storage(storage.clone())?
         };
-        Self::open_on(store, state, options).await
+        Self::open_on(store, state, options, storage, empty, commits).await
+    }
+
+    /// Opens an existing session as a viewer. Reads, inspection, graph
+    /// watches and commit observation work; scheduling and writes refuse.
+    pub async fn open_read_only(
+        storage: Storage,
+        mut options: HarnessOptions,
+    ) -> Result<Harness, HarnessError> {
+        options.read_only = true;
+        Self::open(storage, options).await
     }
 
     /// [`Harness::open`] with the session named `session_id` (the
@@ -285,36 +324,51 @@ impl Harness {
         session_id: String,
         options: HarnessOptions,
     ) -> Result<Harness, HarnessError> {
-        let empty = storage.read().is_ok_and(|bytes| bytes.is_empty())
-            || storage
-                .read()
-                .err()
-                .is_some_and(|error| matches!(error, noel_core::SessionError::Read { source, .. } if source.kind() == std::io::ErrorKind::NotFound));
+        let existing = storage.read();
+        let empty = existing.as_ref().is_ok_and(Vec::is_empty)
+            || existing.as_ref().err().is_some_and(|error| matches!(error, noel_core::SessionError::Read { source, .. } if source.kind() == std::io::ErrorKind::NotFound));
+        if empty && options.read_only {
+            return Err(HarnessError::ReadOnly);
+        }
+        let records = existing
+            .as_ref()
+            .map(|bytes| bytes.iter().filter(|byte| **byte == b'\n').count() as u64)
+            .unwrap_or(0);
+        let commits = commits::CommitFeed::new(records);
+        let storage = commits::ObservedStorage::wrap(storage, commits.clone());
         let (store, state) = if empty {
             let cwd = options.cwd.clone();
-            noel_core::SessionStore::create_in_storage(storage, cwd, session_id)?
+            noel_core::SessionStore::create_in_storage(storage.clone(), cwd, session_id)?
         } else {
-            noel_core::SessionStore::open_storage(storage)?
+            noel_core::SessionStore::open_storage(storage.clone())?
         };
-        Self::open_on(store, state, options).await
+        Self::open_on(store, state, options, storage, empty, commits).await
     }
 
     /// Starts a new session named `session_id` in an empty in-memory
     /// journal (`MemoryStorage`, upstream's tests' default).
     pub async fn in_memory(options: HarnessOptions) -> Result<Harness, HarnessError> {
+        if options.read_only {
+            return Err(HarnessError::ReadOnly);
+        }
         let storage: Storage = Arc::new(MemoryJournal::new(PathBuf::from("memory://session")));
+        let commits = commits::CommitFeed::new(0);
+        let storage = commits::ObservedStorage::wrap(storage, commits.clone());
         let (store, state) = noel_core::SessionStore::create_in_storage(
-            storage,
+            storage.clone(),
             options.cwd.clone(),
             "s1".to_string(),
         )?;
-        Self::open_on(store, state, options).await
+        Self::open_on(store, state, options, storage, true, commits).await
     }
 
     async fn open_on(
         store: noel_core::SessionStore,
         state: noel_core::SessionState,
         options: HarnessOptions,
+        storage: Storage,
+        created: bool,
+        commits: Arc<commits::CommitFeed>,
     ) -> Result<Harness, HarnessError> {
         let systems = noel_core::ReloadableSystems::from_config(&options.config, 1);
         let mut runtime = noel_core::Runtime::with_store(state, systems, store);
@@ -325,7 +379,7 @@ impl Harness {
                 .map_err(|error| HarnessError::Provider(error.to_string()))?;
         }
         let session_id = runtime.session().session_id.clone();
-        let driver = driver::spawn(runtime, options).await?;
+        let driver = driver::spawn(runtime, options, storage, created, commits).await?;
         Ok(Harness { driver, session_id })
     }
 
@@ -349,10 +403,41 @@ impl Harness {
         self.driver.subscribe()
     }
 
+    /// Observe each journal record after storage accepts it.
+    pub fn observe_commits(&self) -> CommitSubscription {
+        self.driver.observe_commits()
+    }
+
+    /// Point-in-time live work without running task code.
+    pub async fn inspect(&self) -> HarnessInspection {
+        self.driver.inspect().await
+    }
+
+    /// Point-in-time graph of every live task.
+    pub async fn task_graph(&self) -> TaskGraph {
+        self.driver.task_graph().await
+    }
+
+    /// A graph snapshot followed by one refreshed graph per stored commit.
+    pub async fn watch_task_graph(&self) -> TaskGraphWatch {
+        let commits = self.driver.observe_commits();
+        let value = self.driver.task_graph().await;
+        TaskGraphWatch {
+            value,
+            harness: self.driver.clone(),
+            commits,
+        }
+    }
+
     /// Stops the driver and closes the session. Any active run is closed
     /// (its resume counts no restart); nothing else is written.
     pub async fn close(self) -> Result<(), Error> {
         self.driver.close().await
+    }
+
+    /// Runs a scheduling pass after an injected clock or registry changed.
+    pub fn resume(&self) {
+        self.driver.resume();
     }
 }
 
@@ -388,6 +473,28 @@ impl Conversation<'_> {
         self.harness.driver.queue().await
     }
 
+    pub async fn read_document<T: serde::de::DeserializeOwned>(
+        &self,
+        document: &Document<T>,
+        key: &str,
+    ) -> Option<T> {
+        documents::decode(self.harness.driver.document_read(document.name, key).await)
+    }
+
+    pub async fn write_document<T: serde::Serialize>(
+        &self,
+        document: &Document<T>,
+        key: impl Into<String>,
+        value: &T,
+    ) -> Result<(), String> {
+        self.commit_documents(DocumentBatch::new().set(document, key, value))
+            .await
+    }
+
+    pub async fn commit_documents(&self, batch: DocumentBatch) -> Result<(), String> {
+        self.harness.driver.document_commit(batch.writes).await
+    }
+
     /// Creates a durable task of a registered `kind` with `input`
     /// (upstream `tx.createTask`): saved pending, nothing run. Returns
     /// its id.
@@ -407,6 +514,30 @@ impl Conversation<'_> {
         input: serde_json::Value,
     ) -> Result<String, String> {
         self.harness.driver.task_create(kind, input, true).await
+    }
+
+    /// Creates a task owned by another live task. An owner's abort reaches
+    /// its whole subtree, and its outcome is held until the subtree settles.
+    pub async fn create_child_task(
+        &mut self,
+        owner_task_id: &str,
+        kind: &str,
+        input: serde_json::Value,
+        background: bool,
+    ) -> Result<String, String> {
+        self.harness
+            .driver
+            .task_create_owned(kind, input, background, Some(owner_task_id.to_owned()))
+            .await
+    }
+
+    /// Waits for tasks according to Durable's join policies.
+    pub async fn join_tasks(
+        &mut self,
+        task_ids: Vec<String>,
+        policy: JoinPolicy,
+    ) -> Vec<TaskRecord> {
+        self.harness.driver.task_join(task_ids, policy).await
     }
 
     /// Waits for a task's terminal record, running it (upstream

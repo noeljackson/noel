@@ -3323,6 +3323,7 @@ async fn plugin_tools_run_through_their_host_and_survive_a_reload() {
             &self,
             plugin: &str,
             tool: &str,
+            _call_id: &str,
             args: Value,
         ) -> std::pin::Pin<Box<dyn Future<Output = plugins::PluginToolOutput> + Send>> {
             let output = format!("{plugin}/{tool}: {}", args["text"].as_str().unwrap_or(""));

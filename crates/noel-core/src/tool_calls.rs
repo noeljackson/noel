@@ -321,6 +321,7 @@ pub(crate) async fn execute_model_tool_call_with(
                         .call(
                             &extension_tool.extension_name,
                             &extension_tool.name,
+                            &tool_call.id,
                             serde_json::from_str(&tool_call.arguments)
                                 .unwrap_or(Value::Object(Default::default())),
                         )

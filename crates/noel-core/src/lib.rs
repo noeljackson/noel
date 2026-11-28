@@ -172,6 +172,10 @@ pub struct DurableTaskRecord {
     pub kind: String,
     pub version: u32,
     pub input: Value,
+    /// The live task that owns this one. `None` means the conversation
+    /// owns it directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_task_id: Option<String>,
     /// The task's state: its status and, while it can run, its checkpoint
     /// (a JSON value; the definition owns its shape).
     pub state: Value,
@@ -187,6 +191,40 @@ pub struct DurableTaskRecord {
     /// First-writer-wins values kept while the task can run.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub memos: BTreeMap<String, Value>,
+}
+
+/// One value written by an embedder-defined durable document. `None`
+/// deletes the key. A batch is applied in the journal record that carries
+/// it, including a task checkpoint record when both commit together.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DurableDocumentWrite {
+    pub document: String,
+    pub key: String,
+    pub value: Option<Value>,
+}
+
+pub(crate) fn apply_document_writes(
+    documents: &mut BTreeMap<String, BTreeMap<String, Value>>,
+    writes: Vec<DurableDocumentWrite>,
+) {
+    for write in writes {
+        match write.value {
+            Some(value) => {
+                documents
+                    .entry(write.document)
+                    .or_default()
+                    .insert(write.key, value);
+            }
+            None => {
+                if let Some(document) = documents.get_mut(&write.document) {
+                    document.remove(&write.key);
+                    if document.is_empty() {
+                        documents.remove(&write.document);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn is_zero_task_restarts(value: &u32) -> bool {
@@ -519,6 +557,9 @@ pub struct SessionState {
     /// complete-replacement. Older versions ignore the records.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tasks: BTreeMap<String, DurableTaskRecord>,
+    /// Embedder-defined documents, by document name and key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub documents: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(default)]
     pub usage: SessionUsage,
     /// The session's runs, oldest first.
@@ -778,6 +819,7 @@ impl SessionState {
             edited_files: Vec::new(),
             codemode_store: BTreeMap::new(),
             tasks: BTreeMap::new(),
+            documents: BTreeMap::new(),
             usage: SessionUsage::default(),
             runs: Vec::new(),
             partial: None,
@@ -948,6 +990,7 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         codemode_store: export.codemode_store,
         // An export carries no durable tasks.
         tasks: BTreeMap::new(),
+        documents: BTreeMap::new(),
         usage: export.usage,
         // Runs belong to the session that ran them.
         runs: Vec::new(),
@@ -1510,6 +1553,12 @@ enum SessionRecord {
     /// SDK). Older versions ignore it.
     Task {
         record: DurableTaskRecord,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        documents: Vec<DurableDocumentWrite>,
+    },
+    /// A document-only atomic batch.
+    Documents {
+        writes: Vec<DurableDocumentWrite>,
     },
     EditedFiles {
         paths: Vec<String>,
@@ -2163,7 +2212,19 @@ impl SessionStore {
     /// Saves a durable task's state, complete-replacement by id (the
     /// Durable SDK's task model).
     pub fn record_task(&self, record: DurableTaskRecord) -> Result<(), SessionError> {
-        self.append(&SessionRecord::Task { record })
+        self.record_task_with_documents(record, Vec::new())
+    }
+
+    pub fn record_task_with_documents(
+        &self,
+        record: DurableTaskRecord,
+        documents: Vec<DurableDocumentWrite>,
+    ) -> Result<(), SessionError> {
+        self.append(&SessionRecord::Task { record, documents })
+    }
+
+    pub fn record_documents(&self, writes: Vec<DurableDocumentWrite>) -> Result<(), SessionError> {
+        self.append(&SessionRecord::Documents { writes })
     }
 
     pub fn record_codemode_store(
@@ -2881,10 +2942,30 @@ impl Runtime {
     /// journal record, together (the Durable SDK, slice 3). A save that
     /// fails writes nothing.
     pub fn save_task(&mut self, record: DurableTaskRecord) -> Result<(), SessionError> {
+        self.save_task_with_documents(record, Vec::new())
+    }
+
+    pub fn save_task_with_documents(
+        &mut self,
+        record: DurableTaskRecord,
+        documents: Vec<DurableDocumentWrite>,
+    ) -> Result<(), SessionError> {
         if let Some(store) = &self.store {
-            store.record_task(record.clone())?;
+            store.record_task_with_documents(record.clone(), documents.clone())?;
         }
+        apply_document_writes(&mut self.session.documents, documents);
         self.session.tasks.insert(record.id.clone(), record);
+        Ok(())
+    }
+
+    pub fn save_documents(
+        &mut self,
+        writes: Vec<DurableDocumentWrite>,
+    ) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.record_documents(writes.clone())?;
+        }
+        apply_document_writes(&mut self.session.documents, writes);
         Ok(())
     }
 

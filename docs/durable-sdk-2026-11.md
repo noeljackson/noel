@@ -4,6 +4,11 @@ Asked by the owner (2026-11-14): a Rust SDK for building harnesses that are
 not the TUI, modelled on upstream's `packages/durable` (pi-durable). Tracked
 in #210.
 
+**Status: done (2026-11-27).** All nine slices are implemented in
+`crates/noel-durable`, with upstream-generated fixtures in
+`tests/fixtures/ts-parity/durable-*.json`. The journal remains the storage
+model, as decided below.
+
 ## Why Durable is the model
 
 Durable is a headless engine. It owns storage, conversations, runs, tools
@@ -137,6 +142,11 @@ goldens pass.
    tasks. Goldens: `harness-task-graph`, `harness-observers`,
    `harness-read-only`, `32-tests-after-edits`, `45-review-on-yield`,
    `46-after-tools-terminate`.
+
+All slices above are complete. The committed parity scenarios cover the
+embedding host, conversations and forks, task recovery, sleep, signals,
+suspendable tools, child ownership, documents, graph inspection, commit
+observation, read-only opening and all three generation hook points.
 
 ## First consumer
 

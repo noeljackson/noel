@@ -1176,6 +1176,7 @@ impl PluginToolHost for ServerPluginTools {
         &self,
         plugin: &str,
         tool: &str,
+        _call_id: &str,
         args: Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PluginToolOutput> + Send>> {
         let plugins = self.0.clone();

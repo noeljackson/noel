@@ -1,0 +1,15 @@
+{
+	"source": {
+		"repository": "https://github.com/earendil-works/pi",
+		"ref": "main",
+		"commit": "841dc6050b5f0014733ee40436f8ad7cf80c93fe",
+		"package": "packages/durable",
+		"script": "/ts-parity/durable-fixture.ts"
+	},
+	"scenario": "childTasks",
+	"outcome": {
+		"outcome": "completed",
+		"result": "parent done",
+		"ownedChildren": 0
+	}
+}

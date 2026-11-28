@@ -41,6 +41,15 @@ impl RuntimeMut<'_> {
         self.controller
             .configure(|runtime, _| runtime.save_task(record))
     }
+
+    pub(crate) fn save_task_with_documents(
+        &mut self,
+        record: DurableTaskRecord,
+        documents: Vec<noel_core::DurableDocumentWrite>,
+    ) -> Result<(), noel_core::SessionError> {
+        self.controller
+            .configure(|runtime, _| runtime.save_task_with_documents(record, documents))
+    }
 }
 
 /// The state's serde shape on the wire (the record's `state` value).
@@ -68,6 +77,9 @@ pub(crate) enum RecordState {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         signals: Vec<Value>,
     },
+    Completing {
+        outcome: RecordOutcome,
+    },
     Terminal {
         outcome: RecordOutcome,
     },
@@ -88,14 +100,23 @@ pub(crate) enum RecordOutcome {
 /// checkpoint as its first commit (its `initial` closure runs inside the
 /// erased definition's invoke path), so a crash before that leaves a
 /// task that cleanly restarts at the beginning.
-pub(super) fn create(
+pub(super) fn create_owned(
     controller: &mut SessionController<SdkHost>,
     kind: &str,
     input: Value,
     background: bool,
+    owner_task_id: Option<String>,
 ) -> Result<String, String> {
     if !controller.host().tasks.erased.contains_key(kind) {
         return Err(format!("no task named {kind} is registered"));
+    }
+    if let Some(owner) = &owner_task_id {
+        let Some(record) = controller.runtime().session().tasks.get(owner) else {
+            return Err(format!("no owner task {owner}"));
+        };
+        if matches!(record_state(record), RecordState::Terminal { .. }) {
+            return Err(format!("owner task {owner} is terminal"));
+        }
     }
     let id = noel_core::controller::new_id();
     let record = DurableTaskRecord {
@@ -103,6 +124,7 @@ pub(super) fn create(
         kind: kind.to_owned(),
         version: 1,
         input,
+        owner_task_id,
         state: serde_json::to_value(RecordState::Pending {
             checkpoint: Value::Null,
             wake: None,
@@ -117,6 +139,65 @@ pub(super) fn create(
         .save_task(record)
         .map_err(|error| error.to_string())?;
     Ok(id)
+}
+
+/// Waits under one of Durable's child join policies.
+pub(super) async fn join(
+    controller: &mut SessionController<SdkHost>,
+    task_ids: &[String],
+    policy: crate::tools::JoinPolicy,
+) -> Vec<TaskRecord> {
+    if task_ids.is_empty() {
+        return Vec::new();
+    }
+    match policy {
+        crate::tools::JoinPolicy::Any => {
+            if let Some(record) = task_ids.iter().find_map(|id| {
+                controller
+                    .runtime()
+                    .session()
+                    .tasks
+                    .get(id)
+                    .filter(|record| matches!(record_state(record), RecordState::Terminal { .. }))
+                    .cloned()
+            }) {
+                let outcome = match record_state(&record) {
+                    RecordState::Terminal { outcome } => outcome_public(outcome),
+                    _ => unreachable!(),
+                };
+                return vec![public(&record, TaskState::Terminal { outcome })];
+            }
+            vec![Box::pin(run_to_terminal(controller, &task_ids[0])).await]
+        }
+        crate::tools::JoinPolicy::AllSettled => {
+            let mut records = Vec::with_capacity(task_ids.len());
+            for id in task_ids {
+                records.push(Box::pin(run_to_terminal(controller, id)).await);
+            }
+            records
+        }
+        crate::tools::JoinPolicy::FailFast => {
+            let mut records = Vec::with_capacity(task_ids.len());
+            for (index, id) in task_ids.iter().enumerate() {
+                let record = Box::pin(run_to_terminal(controller, id)).await;
+                let failed = !matches!(
+                    record.state,
+                    TaskState::Terminal {
+                        outcome: TaskOutcome::Completed { .. }
+                    }
+                );
+                records.push(record);
+                if failed {
+                    for rest in &task_ids[index + 1..] {
+                        let _ = abort(controller, rest).await;
+                        records.push(Box::pin(run_to_terminal(controller, rest)).await);
+                    }
+                    break;
+                }
+            }
+            records
+        }
+    }
 }
 
 /// Runs `task_id` to its terminal record, phase after phase. A task
@@ -207,6 +288,24 @@ pub(super) async fn run_to_terminal(
                     );
                 }
             }
+            RecordState::Completing { outcome } => {
+                let children = child_ids(controller, &record.id, false);
+                for child in children {
+                    let _ = Box::pin(run_to_terminal(controller, &child)).await;
+                }
+                settle(controller, &record, outcome.clone());
+                return public(
+                    controller
+                        .runtime()
+                        .session()
+                        .tasks
+                        .get(task_id)
+                        .unwrap_or(&record),
+                    TaskState::Terminal {
+                        outcome: outcome_public(outcome),
+                    },
+                );
+            }
             RecordState::Pending { checkpoint, .. } | RecordState::Running { checkpoint, .. } => {
                 invoke(controller, &record, checkpoint, false).await;
             }
@@ -220,24 +319,42 @@ pub(super) async fn abort(
     controller: &mut SessionController<SdkHost>,
     task_id: &str,
 ) -> Result<(), String> {
+    if !controller.runtime().session().tasks.contains_key(task_id) {
+        return Err(format!("no task {task_id}"));
+    }
+    let mut tree = Vec::new();
+    let mut frontier = child_ids(controller, task_id, false);
+    while let Some(next) = frontier.pop() {
+        frontier.extend(child_ids(controller, &next, false));
+        tree.push(next);
+    }
+    for child in tree.into_iter().rev() {
+        abort_one(controller, &child).await?;
+    }
+    abort_one(controller, task_id).await
+}
+
+async fn abort_one(
+    controller: &mut SessionController<SdkHost>,
+    task_id: &str,
+) -> Result<(), String> {
     let Some(mut record) = controller.runtime().session().tasks.get(task_id).cloned() else {
         return Err(format!("no task {task_id}"));
     };
-    let state = record_state(&record);
-    match state {
-        RecordState::Terminal { .. } => Ok(()),
-        RecordState::Pending { checkpoint, .. }
-        | RecordState::Running { checkpoint, .. }
-        | RecordState::Sleeping { checkpoint, .. }
-        | RecordState::WaitingOnSignals { checkpoint, .. } => {
-            record.abort_requested = true;
-            controller_mut_of(controller)
-                .save_task(record.clone())
-                .map_err(|error| error.to_string())?;
-            invoke(controller, &record, checkpoint, true).await;
-            Ok(())
-        }
+    if matches!(record_state(&record), RecordState::Terminal { .. }) {
+        return Ok(());
     }
+    let checkpoint = record
+        .state
+        .get("checkpoint")
+        .cloned()
+        .unwrap_or(Value::Null);
+    record.abort_requested = true;
+    controller_mut_of(controller)
+        .save_task(record.clone())
+        .map_err(|error| error.to_string())?;
+    invoke(controller, &record, checkpoint, true).await;
+    Ok(())
 }
 
 /// Recovery at open (slice 3's rule): every task left `running` by a
@@ -254,6 +371,12 @@ pub(super) fn recover(controller: &mut SessionController<SdkHost>, restart_limit
         .cloned()
         .collect::<Vec<_>>();
     for record in records {
+        // Suspendable tool calls have their own recovery path: the model
+        // re-enters the call by call id and the tool registry resumes its
+        // committed park. A task definition never owns these records.
+        if record.kind.starts_with("pi.tool/") {
+            continue;
+        }
         if let RecordState::Running { checkpoint, .. } = record_state(&record) {
             let restarts = record.restarts + 1;
             if restarts >= restart_limit {
@@ -320,17 +443,29 @@ async fn invoke(
     // The commit channel: the engine applies each commit and answers
     // with the memos the record then holds, so the context's next memo
     // reads what was saved.
-    let (commits, mut committed) = mpsc::unbounded_channel::<(TaskCommit, OneshotReply)>();
+    let (actions, mut action) = mpsc::unbounded_channel::<InvocationAction>();
+    let owner = record.id.clone();
     let runtime = TaskRuntime::new(
-        Arc::new(move |commit: TaskCommit| {
-            let commits = commits.clone();
-            Box::pin(async move {
-                let (reply, done) = tokio::sync::oneshot::channel();
-                if commits.send((commit, reply)).is_ok() {
-                    let _ = done.await;
-                }
+        {
+            let actions = actions.clone();
+            Arc::new(move |commit: TaskCommit, memos, documents| {
+                let actions = actions.clone();
+                Box::pin(async move {
+                    let (reply, done) = tokio::sync::oneshot::channel();
+                    if actions
+                        .send(InvocationAction::Commit {
+                            commit,
+                            memos,
+                            documents,
+                            reply,
+                        })
+                        .is_ok()
+                    {
+                        let _ = done.await;
+                    }
+                })
             })
-        }),
+        },
         // Memos never go to the store on their own: the context holds
         // them and they are saved with the next commit. This channel
         // answers at once (the closure keeps its own copy).
@@ -348,7 +483,84 @@ async fn invoke(
                 }) as crate::tasks::ValueFuture
             })
         },
+        {
+            let actions = actions.clone();
+            let owner = owner.clone();
+            Arc::new(move |kind: String, input: Value, background: bool| {
+                let actions = actions.clone();
+                let owner = owner.clone();
+                Box::pin(async move {
+                    let (reply, done) = tokio::sync::oneshot::channel();
+                    actions
+                        .send(InvocationAction::Create {
+                            owner,
+                            kind,
+                            input,
+                            background,
+                            reply,
+                        })
+                        .map_err(|_| "the task invocation ended".to_string())?;
+                    done.await
+                        .map_err(|_| "the task invocation ended".to_string())?
+                }) as crate::tasks::CreateFuture
+            })
+        },
+        {
+            let actions = actions.clone();
+            Arc::new(move |task_id: String| {
+                let actions = actions.clone();
+                Box::pin(async move {
+                    let (reply, done) = tokio::sync::oneshot::channel();
+                    if actions
+                        .send(InvocationAction::Wait {
+                            task_id: task_id.clone(),
+                            reply,
+                        })
+                        .is_err()
+                    {
+                        return TaskRecord::orphaned(&task_id);
+                    }
+                    done.await
+                        .unwrap_or_else(|_| TaskRecord::orphaned(&task_id))
+                }) as crate::tasks::RecordFuture
+            })
+        },
+        {
+            let actions = actions.clone();
+            Arc::new(move |task_id: String| {
+                let actions = actions.clone();
+                Box::pin(async move {
+                    let (reply, done) = tokio::sync::oneshot::channel();
+                    actions
+                        .send(InvocationAction::Abort { task_id, reply })
+                        .map_err(|_| "the task invocation ended".to_string())?;
+                    done.await
+                        .map_err(|_| "the task invocation ended".to_string())?
+                }) as crate::tasks::UnitFuture
+            })
+        },
+        {
+            let actions = actions.clone();
+            Arc::new(move |document: String, key: String| {
+                let actions = actions.clone();
+                Box::pin(async move {
+                    let (reply, done) = tokio::sync::oneshot::channel();
+                    if actions
+                        .send(InvocationAction::ReadDocument {
+                            document,
+                            key,
+                            reply,
+                        })
+                        .is_err()
+                    {
+                        return None;
+                    }
+                    done.await.ok().flatten()
+                }) as crate::tasks::ReadFuture
+            })
+        },
     );
+    drop(actions);
 
     let invocation = {
         let record = Arc::new(running);
@@ -374,11 +586,48 @@ async fn invoke(
     // controller, and answer.
     let mut finished = false;
     while !finished {
-        let next = committed.recv().await;
+        let next = action.recv().await;
         match next {
-            Some((commit, reply)) => {
-                let memos = apply(controller, record, commit);
+            Some(InvocationAction::Commit {
+                commit,
+                memos,
+                documents,
+                reply,
+            }) => {
+                let memos = apply(controller, record, commit, memos, documents);
                 let _ = reply.send(memos);
+            }
+            Some(InvocationAction::Create {
+                owner,
+                kind,
+                input,
+                background,
+                reply,
+            }) => {
+                let result = create_owned(controller, &kind, input, background, Some(owner));
+                let _ = reply.send(result);
+            }
+            Some(InvocationAction::Wait { task_id, reply }) => {
+                let record = Box::pin(run_to_terminal(controller, &task_id)).await;
+                let _ = reply.send(record);
+            }
+            Some(InvocationAction::Abort { task_id, reply }) => {
+                let result = Box::pin(abort(controller, &task_id)).await;
+                let _ = reply.send(result);
+            }
+            Some(InvocationAction::ReadDocument {
+                document,
+                key,
+                reply,
+            }) => {
+                let value = controller
+                    .runtime()
+                    .session()
+                    .documents
+                    .get(&document)
+                    .and_then(|document| document.get(&key))
+                    .cloned();
+                let _ = reply.send(value);
             }
             None => finished = true,
         }
@@ -387,6 +636,35 @@ async fn invoke(
 }
 
 type OneshotReply = tokio::sync::oneshot::Sender<std::collections::BTreeMap<String, Value>>;
+
+enum InvocationAction {
+    Commit {
+        commit: TaskCommit,
+        memos: std::collections::BTreeMap<String, Value>,
+        documents: Vec<noel_core::DurableDocumentWrite>,
+        reply: OneshotReply,
+    },
+    Create {
+        owner: String,
+        kind: String,
+        input: Value,
+        background: bool,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    Wait {
+        task_id: String,
+        reply: tokio::sync::oneshot::Sender<TaskRecord>,
+    },
+    Abort {
+        task_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    ReadDocument {
+        document: String,
+        key: String,
+        reply: tokio::sync::oneshot::Sender<Option<Value>>,
+    },
+}
 
 async fn handler_phase(
     handler: crate::tasks::PhaseHandlerErased,
@@ -409,14 +687,10 @@ fn apply(
     controller: &mut SessionController<SdkHost>,
     record: &DurableTaskRecord,
     commit: TaskCommit,
+    memos: std::collections::BTreeMap<String, Value>,
+    documents: Vec<noel_core::DurableDocumentWrite>,
 ) -> std::collections::BTreeMap<String, Value> {
-    let memos = controller
-        .runtime()
-        .session()
-        .tasks
-        .get(&record.id)
-        .map(|record| record.memos.clone())
-        .unwrap_or_default();
+    let document_count = documents.len();
     let state = match commit {
         TaskCommit::Sleep { until, checkpoint } => RecordState::Sleeping { checkpoint, until },
         TaskCommit::Wait {
@@ -435,22 +709,58 @@ fn apply(
             checkpoint,
             wake: None,
         },
-        TaskCommit::Completed(result) => RecordState::Terminal {
-            outcome: RecordOutcome::Completed { result },
-        },
-        TaskCommit::Failed(error) => RecordState::Terminal {
-            outcome: RecordOutcome::Failed { error },
-        },
-        TaskCommit::Aborted => RecordState::Terminal {
-            outcome: RecordOutcome::Aborted,
-        },
+        TaskCommit::Completed(result) => {
+            terminal_or_completing(controller, &record.id, RecordOutcome::Completed { result })
+        }
+        TaskCommit::Failed(error) => {
+            terminal_or_completing(controller, &record.id, RecordOutcome::Failed { error })
+        }
+        TaskCommit::Aborted => {
+            terminal_or_completing(controller, &record.id, RecordOutcome::Aborted)
+        }
     };
     let state = serde_json::to_value(state).expect("a task state serializes");
-    let _ = controller_mut_of(controller).save_task(DurableTaskRecord {
-        state,
-        ..record.clone()
-    });
+    let _ = controller_mut_of(controller).save_task_with_documents(
+        DurableTaskRecord {
+            state,
+            memos: memos.clone(),
+            ..record.clone()
+        },
+        documents,
+    );
+    if document_count > 0 {
+        controller
+            .host()
+            .events
+            .record(crate::OwnedEvent::DocumentsCommitted {
+                writes: document_count,
+            });
+    }
     memos
+}
+
+fn terminal_or_completing(
+    controller: &SessionController<SdkHost>,
+    task_id: &str,
+    outcome: RecordOutcome,
+) -> RecordState {
+    if child_ids(controller, task_id, true).is_empty() {
+        RecordState::Terminal { outcome }
+    } else {
+        RecordState::Completing { outcome }
+    }
+}
+
+fn child_ids(controller: &SessionController<SdkHost>, owner: &str, live_only: bool) -> Vec<String> {
+    controller
+        .runtime()
+        .session()
+        .tasks
+        .values()
+        .filter(|task| task.owner_task_id.as_deref() == Some(owner))
+        .filter(|task| !live_only || !matches!(record_state(task), RecordState::Terminal { .. }))
+        .map(|task| task.id.clone())
+        .collect()
 }
 
 fn settle(
@@ -555,7 +865,7 @@ pub(super) fn signal(
     }
     let state = record_state(&record);
     match state {
-        RecordState::Terminal { .. } => SignalResult::Closed,
+        RecordState::Terminal { .. } | RecordState::Completing { .. } => SignalResult::Closed,
         RecordState::WaitingOnSignals { until, signals, .. } => {
             // A delivery after the deadline closed expires the key.
             let now = controller.host().clock.now();
@@ -615,7 +925,7 @@ pub(super) fn wake(controller: &SessionController<SdkHost>) -> Option<u64> {
         .min()
 }
 
-fn record_state(record: &DurableTaskRecord) -> RecordState {
+pub(crate) fn record_state(record: &DurableTaskRecord) -> RecordState {
     serde_json::from_value(record.state.clone()).unwrap_or(RecordState::Pending {
         checkpoint: Value::Null,
         wake: None,
@@ -647,10 +957,123 @@ fn public(record: &DurableTaskRecord, state: TaskState) -> TaskRecord {
         kind: record.kind.clone(),
         version: record.version,
         input: record.input.clone(),
+        owner_task_id: record.owner_task_id.clone(),
         state,
         background: record.background,
         abort_requested: record.abort_requested,
         restarts: record.restarts,
         memos: record.memos.clone(),
     }
+}
+
+pub(super) fn public_record(record: &DurableTaskRecord) -> TaskRecord {
+    let state = match record_state(record) {
+        RecordState::Pending { checkpoint, wake } => TaskState::Pending {
+            checkpoint,
+            wake: wake.and_then(|wake| serde_json::from_value(wake).ok()),
+        },
+        RecordState::Running { checkpoint, wake } => TaskState::Running {
+            checkpoint,
+            wake: wake.and_then(|wake| serde_json::from_value(wake).ok()),
+        },
+        RecordState::Sleeping { checkpoint, until } => TaskState::Sleeping { checkpoint, until },
+        RecordState::WaitingOnSignals {
+            checkpoint,
+            until,
+            signals,
+        } => TaskState::WaitingOnSignals {
+            checkpoint,
+            until,
+            signals,
+        },
+        RecordState::Completing { outcome } => TaskState::Completing {
+            outcome: outcome_public(outcome),
+        },
+        RecordState::Terminal { outcome } => TaskState::Terminal {
+            outcome: outcome_public(outcome),
+        },
+    };
+    public(record, state)
+}
+
+pub(super) fn inspect(
+    session: &noel_core::SessionState,
+    registry: &crate::TaskRegistry,
+    queued_submissions: usize,
+    read_only: bool,
+) -> crate::HarnessInspection {
+    let tasks = session
+        .tasks
+        .values()
+        .filter_map(|record| {
+            let public = public_record(record);
+            if matches!(public.state, TaskState::Terminal { .. }) {
+                return None;
+            }
+            let state = if !registry.erased.contains_key(&record.kind)
+                && !record.kind.starts_with("pi.tool/")
+            {
+                crate::TaskInspectionState::Blocked {
+                    reason: crate::BlockedReason::MissingTask,
+                }
+            } else {
+                match public.state {
+                    TaskState::Pending { .. } => crate::TaskInspectionState::Pending,
+                    TaskState::Running { .. } => crate::TaskInspectionState::Running,
+                    TaskState::Sleeping { until, .. } => {
+                        crate::TaskInspectionState::Sleeping { until: Some(until) }
+                    }
+                    TaskState::WaitingOnSignals { until, .. } => {
+                        crate::TaskInspectionState::Sleeping { until }
+                    }
+                    TaskState::Completing { .. } => crate::TaskInspectionState::Completing,
+                    TaskState::Terminal { .. } => unreachable!(),
+                }
+            };
+            Some(crate::TaskInspection {
+                record: public,
+                state,
+            })
+        })
+        .collect();
+    crate::HarnessInspection {
+        scheduling: if read_only {
+            crate::SchedulingState::Paused
+        } else {
+            crate::SchedulingState::Running
+        },
+        tasks,
+        queued_submissions,
+    }
+}
+
+pub(super) fn task_graph(
+    session: &noel_core::SessionState,
+    registry: &crate::TaskRegistry,
+) -> crate::TaskGraph {
+    let tasks = session
+        .tasks
+        .values()
+        .filter_map(|record| {
+            let public = public_record(record);
+            let state = crate::inspection::graph_state(&public.state)?;
+            let blocked = (!registry.erased.contains_key(&record.kind)
+                && !record.kind.starts_with("pi.tool/"))
+            .then_some(crate::BlockedReason::MissingTask);
+            Some((
+                record.id.clone(),
+                crate::TaskGraphNode {
+                    id: record.id.clone(),
+                    kind: record.kind.clone(),
+                    conversation_id: public.conversation_id,
+                    owner: record.owner_task_id.clone(),
+                    background: record.background,
+                    abort_requested: record.abort_requested,
+                    state,
+                    blocked,
+                },
+            ))
+        })
+        .collect();
+    crate::TaskGraph { tasks }
 }
